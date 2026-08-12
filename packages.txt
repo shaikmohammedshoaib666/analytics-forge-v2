@@ -1,0 +1,2 @@
+# Apt packages for Streamlit Cloud (Prophet / scientific stack)
+build-essential
