@@ -66,10 +66,10 @@ python smoke_test.py
 
 ### Option A — Hugging Face Spaces (preferred free link)
 
-1. https://huggingface.co/new-space → SDK **Streamlit** → link this GitHub repo  
-2. Branch `cursor/forge-v2-foundation-f3f9`, app file `app.py`  
-3. Secret: `GEMINI_API_KEY`  
-4. Details: **`deploy/HUGGINGFACE.md`**
+1. https://huggingface.co/new-space → SDK **Docker** → name `analytics-forge-v2`  
+2. Push this branch into the Space (see **`deploy/HUGGINGFACE.md`**) or connect GitHub branch `cursor/forge-v2-foundation-f3f9`  
+3. Secret: `GEMINI_API_KEY` (+ optional `GEMINI_MODEL=gemini-flash-latest`)  
+4. App URL: `https://<YOUR_HF_USER>-analytics-forge-v2.hf.space`
 
 ### Option B — Render Blueprint
 

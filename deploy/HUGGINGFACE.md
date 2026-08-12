@@ -1,89 +1,103 @@
 # Deploy Analytics Forge v2 on Hugging Face Spaces
 
-Repo is **Docker Space ready** (`sdk: docker` in README + light `requirements-cloud.txt` in Dockerfile).
+> **Important (2025+):** Hugging Face **deprecated the native Streamlit SDK**.  
+> New Spaces must use **Docker** (there is an official Streamlit-on-Docker template).  
+> Do **NOT** pick **Static** / Transformers / Gradio Lite / Svelte / React / Paper — those are wrong for this app.
 
-Your permanent URL will be:
+Your URL will be:
 
-- Space page: `https://huggingface.co/spaces/<YOUR_HF_USER>/analytics-forge-v2`
+- Space: `https://huggingface.co/spaces/<YOUR_HF_USER>/analytics-forge-v2`
 - App: `https://<YOUR_HF_USER>-analytics-forge-v2.hf.space`
+
+This repo is already Docker-Space ready (`sdk: docker`, `app_port: 8501`, light `requirements-cloud.txt`).
 
 ---
 
-## Do this now (you are logged into HF)
+## What you are seeing (and what to click)
 
-### 1) Create the Space from GitHub
+On **https://huggingface.co/new-space** you get:
 
-1. Open: **https://huggingface.co/new-space**
-2. **Owner:** your account  
-3. **Space name:** `analytics-forge-v2`  
-4. **License:** MIT (or any)  
-5. **Select the SDK:** **Docker**  
-6. **Hardware:** CPU basic (free)  
-7. **Visibility:** Public  
-8. Click **Create Space**
+| Field | Choose |
+|--------|--------|
+| Space name | `analytics-forge-v2` |
+| License | MIT (or any) |
+| **SDK** | **Docker** ← not Static |
+| Template (if asked) | **Blank** or **Streamlit** / `streamlit/streamlit-template-space` if listed under Docker |
+| Hardware | CPU basic (free) |
+| Visibility | Public |
 
-### 2) Connect this GitHub repo
+### If the page only shows “Static” templates
 
-On the new Space:
+1. Click the **SDK** dropdown again (above the templates).  
+2. Change **Static** → **Docker** (or **Gradio** will also appear — ignore Gradio).  
+3. Templates should switch away from Transformers / Svelte / React.  
+4. Pick **Blank Docker** / empty Docker Space (or Streamlit Docker template).
 
-1. **Settings** → **Repository** / **Connected services** / **Factory reboot** area  
-2. Or from the Space Files view: use **Add files → Import from Git repository** if shown  
-3. Easiest path used by most people:
-   - Space **Settings** → scroll to **GitHub** / clone instructions  
-   - Or: delete default README if HF created an empty Space, then:
+**Never choose:** Static, Transformers, Gradio Lite, Svelte, Paper project, React.
+
+---
+
+## Path A — Create empty Docker Space, then push this repo (recommended)
+
+### 1) Create Space
+https://huggingface.co/new-space → SDK **Docker** → name `analytics-forge-v2` → Create.
+
+### 2) On your Mac, push Forge into the Space
 
 ```bash
-# On YOUR Mac (after Space exists) — push this branch into the Space
-git remote add hf https://huggingface.co/spaces/<YOUR_HF_USER>/analytics-forge-v2
+cd /Users/sk.md.shoaib.raza/Projects/analytics-forge-v2
 git fetch origin
-git push hf cursor/forge-v2-foundation-f3f9:main
+git reset --hard origin/cursor/forge-v2-foundation-f3f9
+
+# YOUR_HF_USER = your Hugging Face username
+git remote remove hf 2>/dev/null
+git remote add hf https://huggingface.co/spaces/YOUR_HF_USER/analytics-forge-v2
+git push hf cursor/forge-v2-foundation-f3f9:main --force
 ```
 
-When prompted for password, use an **HF Access Token** (not account password):  
-https://huggingface.co/settings/tokens → **New token** → write access → paste as password.
+Password = **HF write token**: https://huggingface.co/settings/tokens  
+(Username = your HF username; password = `hf_...` token)
 
-### 3) Alternate: duplicate via HF “GitHub” template
-
-Some accounts see **Create from GitHub repository** on the new-space form:
-
-- Repository: `shaikmohammedshoaib666/analytics-forge-v2`
-- Branch: `cursor/forge-v2-foundation-f3f9`
-- SDK: Docker
-
-Use that if the button is visible — fewer steps.
-
-### 4) Add Gemini secret (Ask AI)
-
-Space → **Settings** → **Variables and secrets** → **New secret**:
+### 3) Secrets
+Space → **Settings** → **Variables and secrets**:
 
 | Name | Value |
 |------|--------|
-| `GEMINI_API_KEY` | your Gemini key |
+| `GEMINI_API_KEY` | your key |
 | `GEMINI_MODEL` | `gemini-flash-latest` |
 
-### 5) Wait for build
-
-Open the Space → **Logs** / **Build**. First Docker build can take **5–15 minutes** (Prophet/xgboost wheels). When status is **Running**, open the `.hf.space` URL.
-
-### 6) How to demo inside the Space
-
-- Mode: **MANUAL UPLOAD** → upload `data/samples/sample_predictive_maintenance.csv`
-- LIVE without PLC: connection **`buffer_only`** → Reload buffer (`data/live.csv` is seeded from the sample)
-
-Private plant Modbus (`192.168.x`) **will not work** from Hugging Face.
+### 4) Wait for Docker build
+Open the Space **App** / **Logs** tab. First build ~5–15 min. Then open the `.hf.space` URL.
 
 ---
 
-## If build fails / OOM
-
-- Confirm Dockerfile uses `requirements-cloud.txt` (default in this repo).
-- Hardware: stay on CPU basic; do not install PySpark on the Space.
-- Factory reboot: Space Settings → **Factory reboot**.
-
-## Local check before push (optional)
+## Path B — CLI create (if UI is confusing)
 
 ```bash
-docker build -t forge-hf .
-docker run --rm -p 8501:8501 forge-hf
-# http://127.0.0.1:8501
+pip install -U huggingface_hub
+huggingface-cli login   # paste write token
+
+# Create a Docker Space (no Static template)
+huggingface-cli repo create analytics-forge-v2 --type space --space_sdk docker
+
+cd /Users/sk.md.shoaib.raza/Projects/analytics-forge-v2
+git remote remove hf 2>/dev/null
+git remote add hf https://huggingface.co/spaces/YOUR_HF_USER/analytics-forge-v2
+git push hf cursor/forge-v2-foundation-f3f9:main --force
 ```
+
+---
+
+## Demo inside the Space
+
+- **MANUAL UPLOAD** → sample CSV under `data/samples/`
+- LIVE without PLC → connection **`buffer_only`**
+- Plant Modbus `192.168.x` will **not** work from Hugging Face
+
+---
+
+## If build fails
+
+- Confirm Space README YAML has `sdk: docker` and `app_port: 8501` (already in this repo).
+- Settings → **Factory rebuild**.
+- Do not install PySpark on the Space.
