@@ -117,6 +117,13 @@ def init_state() -> None:
         "chat_history": [],
         "pipeline_started": False,
         "prefer_clean_df": True,
+        "ml_result": None,
+        "dashboard_charts": [],
+        "dashboard_insights": [],
+        "llama_docs": None,
+        "llama_index_obj": None,
+        "llama_index_meta": None,
+        "selected_dash_kpis": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -2161,50 +2168,9 @@ def _gemini_answer(prompt: str) -> str:
 
 
 def rag_ask(question: str, df: pd.DataFrame) -> str:
-    """
-    Build LlamaIndex over current dataframe rows, then answer with Gemini grounded on context.
-    """
-    context_rows = []
-    sample = df.head(80)
-    for _, row in sample.iterrows():
-        context_rows.append(" | ".join(f"{c}={row[c]}" for c in sample.columns if pd.notna(row[c])))
-    context = "\n".join(context_rows[:80])
-
-    nodes_text = ""
-    try:
-        from llama_index.core import Document, VectorStoreIndex, Settings
-        from llama_index.core.embeddings import BaseEmbedding
-
-        # Lightweight local path: use simple keyword retrieval if embeddings unavailable
-        docs = [Document(text=t) for t in context_rows[:120]]
-        # Try building index; if embedding model missing, fall through
-        try:
-            index = VectorStoreIndex.from_documents(docs)
-            engine = index.as_query_engine(similarity_top_k=4)
-            retrieved = engine.query(question)
-            nodes_text = str(retrieved)
-        except Exception:
-            # keyword overlap retrieval
-            q_tokens = set(question.lower().split())
-            scored = []
-            for t in context_rows:
-                score = len(q_tokens & set(t.lower().split()))
-                scored.append((score, t))
-            scored.sort(reverse=True)
-            nodes_text = "\n".join(t for s, t in scored[:5] if s > 0) or context[:2000]
-    except Exception as exc:
-        nodes_text = context[:2500] + f"\n[LlamaIndex note: {exc}]"
-
-    prompt = (
-        "You are Analytics Forge industrial assistant. Answer ONLY from the data context.\n"
-        f"Question: {question}\n\nData context:\n{nodes_text}\n\n"
-        "Give a concise operational answer with numbers when present."
-    )
-    gem = _gemini_answer(prompt)
-    if gem:
-        return gem
-    # Offline fallback
-    return f"(Offline RAG) Top matching rows:\n{nodes_text[:1500]}"
+    """Backward-compatible wrapper → LlamaIndex search + Gemini. """
+    out = ask_llama_gemini(question, df)
+    return out.get("answer") or ""
 
 
 def send_email_report(to_addr: str, subject: str, body: str, df: Optional[pd.DataFrame] = None) -> str:
@@ -2268,6 +2234,675 @@ def require_data() -> Optional[pd.DataFrame]:
                 f"LIVE Modbus status: {st.session_state.live_status} — {st.session_state.live_error}"
             )
         return None
+
+
+# === FORGE ML / LLAMA / EMAIL HELPERS ===
+FORGE_MODEL_CATALOG: dict[str, dict[str, Any]] = {
+    # --- Classification (6-7+) ---
+    "LogisticRegression": {"task": "classification", "library": "sklearn", "class": "sklearn.linear_model.LogisticRegression", "params": {"max_iter": 1000}, "what": "Linear classifier for failure/churn labels.", "why": "Fast baseline, readable coefficients."},
+    "DecisionTreeClassifier": {"task": "classification", "library": "sklearn", "class": "sklearn.tree.DecisionTreeClassifier", "params": {"max_depth": 8, "random_state": 42}, "what": "Rule-based tree for class labels.", "why": "Easy to explain to non-data users."},
+    "RandomForestClassifier": {"task": "classification", "library": "sklearn", "class": "sklearn.ensemble.RandomForestClassifier", "params": {"n_estimators": 120, "max_depth": 10, "random_state": 42, "n_jobs": -1, "class_weight": "balanced"}, "what": "Ensemble of trees for failure/churn.", "why": "Strong accuracy on tabular plant/CRM data."},
+    "GradientBoostingClassifier": {"task": "classification", "library": "sklearn", "class": "sklearn.ensemble.GradientBoostingClassifier", "params": {"n_estimators": 100, "max_depth": 3, "random_state": 42}, "what": "Boosted trees for tough class boundaries.", "why": "Often beats RF on imbalanced labels."},
+    "KNeighborsClassifier": {"task": "classification", "library": "sklearn", "class": "sklearn.neighbors.KNeighborsClassifier", "params": {"n_neighbors": 5}, "what": "Classify by nearest similar rows.", "why": "Good for local sensor neighborhoods."},
+    "SVC": {"task": "classification", "library": "sklearn", "class": "sklearn.svm.SVC", "params": {"C": 1.0, "kernel": "rbf"}, "what": "Support-vector classifier.", "why": "Handles non-linear splits."},
+    "XGBClassifier": {"task": "classification", "library": "xgboost", "class": "xgboost.XGBClassifier", "params": {"n_estimators": 120, "max_depth": 5, "learning_rate": 0.08, "random_state": 42, "eval_metric": "logloss"}, "what": "XGBoost classifier (Forge favorite).", "why": "Top CV scores on industrial tabular data."},
+    # --- Regression (5-6+) ---
+    "LinearRegression": {"task": "regression", "library": "sklearn", "class": "sklearn.linear_model.LinearRegression", "params": {}, "what": "Straight-line predictor for RUL/revenue.", "why": "Simple baseline."},
+    "Ridge": {"task": "regression", "library": "sklearn", "class": "sklearn.linear_model.Ridge", "params": {"alpha": 1.0}, "what": "Regularized linear regressor.", "why": "Stable when columns correlate."},
+    "RandomForestRegressor": {"task": "regression", "library": "sklearn", "class": "sklearn.ensemble.RandomForestRegressor", "params": {"n_estimators": 120, "max_depth": 10, "random_state": 42, "n_jobs": -1}, "what": "RF regressor for RUL/sales.", "why": "Robust default for managers."},
+    "GradientBoostingRegressor": {"task": "regression", "library": "sklearn", "class": "sklearn.ensemble.GradientBoostingRegressor", "params": {"n_estimators": 100, "max_depth": 3, "random_state": 42}, "what": "Boosted regressor.", "why": "Strong holdout R²."},
+    "SVR": {"task": "regression", "library": "sklearn", "class": "sklearn.svm.SVR", "params": {"C": 1.0, "kernel": "rbf"}, "what": "Support-vector regressor.", "why": "Non-linear continuous targets."},
+    "XGBRegressor": {"task": "regression", "library": "xgboost", "class": "xgboost.XGBRegressor", "params": {"n_estimators": 140, "max_depth": 5, "learning_rate": 0.08, "random_state": 42}, "what": "XGBoost regressor.", "why": "Often best CV on RUL/revenue."},
+    "LGBMRegressor": {"task": "regression", "library": "lightgbm", "class": "lightgbm.LGBMRegressor", "params": {"n_estimators": 140, "max_depth": 6, "learning_rate": 0.08, "random_state": 42, "verbosity": -1}, "what": "LightGBM regressor.", "why": "Fast on mid/large CSVs."},
+    # --- Special ---
+    "Prophet": {"task": "forecast", "library": "prophet", "class": "prophet.Prophet", "params": {}, "what": "Business time-series forecast.", "why": "Shows rise/drop % for managers."},
+    "PCA": {"task": "dimensionality", "library": "sklearn", "class": "sklearn.decomposition.PCA", "params": {"n_components": 3}, "what": "Compress sensors into principal components.", "why": "Spot drift / dead sensors."},
+    "StatsmodelsOLS": {"task": "regression", "library": "statsmodels", "class": "statsmodels.api.OLS", "params": {}, "what": "Classical OLS with p-values.", "why": "Stats-course friendly explainability."},
+    "IsolationForest": {"task": "anomaly", "library": "sklearn", "class": "sklearn.ensemble.IsolationForest", "params": {"contamination": 0.08, "random_state": 42}, "what": "Unsupervised anomaly detector.", "why": "Flags weird sensor packets."},
+}
+
+DOMAIN_RECOMMENDED_MODELS: dict[str, list[str]] = {
+    "predictive_maintenance": ["XGBRegressor", "RandomForestRegressor", "XGBClassifier", "Prophet", "IsolationForest", "PCA"],
+    "sales_forecasting": ["Prophet", "XGBRegressor", "RandomForestRegressor", "Ridge"],
+    "telecom_churn": ["XGBClassifier", "RandomForestClassifier", "LogisticRegression"],
+    "healthcare": ["RandomForestClassifier", "XGBClassifier", "LogisticRegression"],
+    "finance_risk": ["XGBClassifier", "LogisticRegression", "RandomForestClassifier"],
+    "energy_utilities": ["Prophet", "XGBRegressor", "PCA"],
+    "warehouse_logistics": ["RandomForestRegressor", "XGBRegressor", "Prophet"],
+    "agriculture_iot": ["RandomForestRegressor", "Prophet", "IsolationForest"],
+    "hr_people": ["XGBClassifier", "LogisticRegression", "RandomForestClassifier"],
+    "generic": ["RandomForestRegressor", "RandomForestClassifier", "Prophet", "PCA"],
+}
+
+
+def _resolve_estimator(dotted: str, params: dict[str, Any]):
+    import importlib
+    module_path, _, cls_name = dotted.rpartition(".")
+    mod = importlib.import_module(module_path)
+    cls = getattr(mod, cls_name)
+    try:
+        return cls(**params)
+    except TypeError:
+        return cls()
+
+
+def _ml_pick_target(df: pd.DataFrame, task: str, preferred: Optional[str] = None) -> Optional[str]:
+    if preferred and preferred in df.columns:
+        return preferred
+    pri_clf = ["failure", "fault", "churn", "default", "readmission", "attrition", "label", "class"]
+    pri_reg = ["rul", "remaining_useful_life", "revenue", "sales", "amount", "gmv", "temperature", "load", "score"]
+    pri = pri_clf if task == "classification" else pri_reg
+    for n in pri:
+        hit = _col(df, n)
+        if hit:
+            return hit
+    nums = df.select_dtypes(include=[np.number]).columns.tolist()
+    if task == "classification":
+        for c in df.columns:
+            nun = df[c].nunique(dropna=True)
+            if 2 <= nun <= 8 and not str(c).lower().endswith("_id"):
+                return c
+        return None
+    return nums[-1] if nums else None
+
+
+def _ml_pick_features(df: pd.DataFrame, target: str) -> list[str]:
+    feats = []
+    n = len(df)
+    for c in df.columns:
+        if c == target:
+            continue
+        cl = str(c).lower()
+        if any(h in cl for h in ("timestamp", "datetime", "date", "time")) and not pd.api.types.is_numeric_dtype(df[c]):
+            continue
+        if cl in {"id", "uuid", "index"} or cl.endswith("_id") or "unnamed" in cl:
+            continue
+        if pd.api.types.is_datetime64_any_dtype(df[c]):
+            continue
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            if df[c].nunique(dropna=True) > min(40, max(15, int(n * 0.4))):
+                continue
+        feats.append(c)
+    return feats
+
+
+def run_forge_model(
+    df: pd.DataFrame,
+    model_id: str,
+    target: Optional[str] = None,
+    test_size: float = 0.2,
+    time_series_split: bool = False,
+) -> dict[str, Any]:
+    """Forge Analytics-style model runner (class/reg/prophet/pca/statsmodels/anomaly)."""
+    meta = FORGE_MODEL_CATALOG.get(model_id)
+    if not meta:
+        return {"ok": False, "error": f"Unknown model {model_id}", "model_id": model_id}
+    task = meta["task"]
+    library = meta["library"]
+
+    # PCA
+    if task == "dimensionality" or model_id == "PCA":
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import StandardScaler
+        num = df.select_dtypes(include=[np.number]).dropna()
+        if num.shape[1] < 2 or len(num) < 5:
+            return {"ok": False, "error": "PCA needs ≥2 numeric cols and 5 rows.", "model_id": model_id, "task": task}
+        X = StandardScaler().fit_transform(num.values)
+        ncomp = min(int(meta["params"].get("n_components", 3)), X.shape[1])
+        pca = PCA(n_components=ncomp, random_state=42)
+        pcs = pca.fit_transform(X)
+        preview = pd.DataFrame(pcs[:20], columns=[f"PC{i+1}" for i in range(ncomp)])
+        return {
+            "ok": True, "model_id": model_id, "task": task,
+            "metrics": {
+                "explained_variance_ratio": [round(float(x), 4) for x in pca.explained_variance_ratio_],
+                "total_explained": round(float(pca.explained_variance_ratio_.sum()), 4),
+            },
+            "predictions_preview": preview,
+            "target": None,
+        }
+
+    # Anomaly
+    if task == "anomaly" or model_id == "IsolationForest":
+        num = df.select_dtypes(include=[np.number]).dropna()
+        if num.shape[1] < 2 or len(num) < 10:
+            return {"ok": False, "error": "IsolationForest needs numeric data.", "model_id": model_id, "task": task}
+        est = _resolve_estimator(meta["class"], meta["params"])
+        labels = est.fit_predict(num.values)
+        rate = float((labels == -1).mean())
+        preview = num.copy()
+        preview["anomaly"] = labels
+        return {
+            "ok": True, "model_id": model_id, "task": task,
+            "metrics": {"anomaly_rate": round(rate, 4), "anomalies": int((labels == -1).sum())},
+            "predictions_preview": preview[preview["anomaly"] == -1].head(30),
+            "target": None,
+        }
+
+    # Prophet
+    if task == "forecast" or model_id == "Prophet":
+        tgt = target or _ml_pick_target(df, "regression")
+        if not tgt:
+            return {"ok": False, "error": "Prophet needs a numeric target.", "model_id": model_id}
+        text = prophet_forecast(df, tgt)
+        # also structured metrics
+        try:
+            from prophet import Prophet
+            date_col = _col(df, "timestamp", "date", "datetime", "time", "ds")
+            if date_col:
+                ds = pd.to_datetime(df[date_col], errors="coerce")
+            else:
+                ds = pd.date_range(end=datetime.utcnow(), periods=len(df), freq="D")
+            tmp = pd.DataFrame({"ds": ds, "y": pd.to_numeric(df[tgt], errors="coerce")}).dropna().sort_values("ds")
+            if len(tmp) < 10:
+                return {"ok": False, "error": "Need ≥10 dated rows for Prophet.", "model_id": model_id, "task": task, "target": tgt}
+            m = Prophet(uncertainty_samples=50)
+            m.fit(tmp)
+            future = m.make_future_dataframe(periods=30)
+            fc = m.predict(future)
+            last = float(tmp["y"].iloc[-1])
+            end = float(fc["yhat"].iloc[-1])
+            pct = (end - last) / abs(last or 1)
+            return {
+                "ok": True, "model_id": model_id, "task": "forecast", "target": tgt,
+                "metrics": {
+                    "last_actual": round(last, 3), "forecast_end": round(end, 3),
+                    "pct_change": round(pct, 4), "horizon": 30, "mae": None,
+                },
+                "manager_briefing": text,
+                "predictions_preview": fc[["ds", "yhat", "yhat_lower", "yhat_upper"]].tail(30),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": f"Prophet failed: {exc}", "model_id": model_id, "task": task, "target": tgt}
+
+    # Statsmodels OLS
+    if library == "statsmodels" or model_id == "StatsmodelsOLS":
+        try:
+            import statsmodels.api as sm
+        except ImportError as exc:
+            return {"ok": False, "error": f"statsmodels missing: {exc}", "model_id": model_id}
+        tgt = target or _ml_pick_target(df, "regression")
+        feats = _ml_pick_features(df, tgt)[:8]
+        work = df[feats + [tgt]].apply(pd.to_numeric, errors="coerce").dropna()
+        if len(work) < 15:
+            return {"ok": False, "error": "Need ≥15 rows for OLS.", "model_id": model_id}
+        y = work[tgt]
+        X = sm.add_constant(work[feats])
+        cut = int(len(work) * 0.8)
+        model = sm.OLS(y.iloc[:cut], X.iloc[:cut]).fit()
+        pred = model.predict(X.iloc[cut:])
+        yt = y.iloc[cut:]
+        metrics = {
+            "r2": round(float(r2_score(yt, pred)), 4),
+            "rmse": round(float(np.sqrt(mean_squared_error(yt, pred))), 4),
+            "mae": round(float(mean_absolute_error(yt, pred)), 4),
+            "aic": round(float(model.aic), 2),
+            "bic": round(float(model.bic), 2),
+        }
+        return {
+            "ok": True, "model_id": model_id, "task": "regression", "target": tgt,
+            "metrics": metrics, "summary": str(model.summary()),
+            "predictions_preview": pd.DataFrame({"y_true": yt.values, "y_pred": pred.values}).head(30),
+        }
+
+    # Supervised sklearn / xgboost / lightgbm
+    tgt = target or _ml_pick_target(df, "classification" if task == "classification" else "regression")
+    if not tgt:
+        return {"ok": False, "error": "Could not pick target.", "model_id": model_id, "task": task}
+    feats = _ml_pick_features(df, tgt)
+    if not feats:
+        return {"ok": False, "error": "No usable features.", "model_id": model_id, "target": tgt}
+    work = df[feats + [tgt]].copy().dropna(subset=[tgt])
+    if len(work) > 25000:
+        work = work.sample(25000, random_state=42)
+    if len(work) < 12:
+        return {"ok": False, "error": "Need ≥12 rows.", "model_id": model_id}
+
+    X = work[feats].copy()
+    for c in X.columns:
+        if not pd.api.types.is_numeric_dtype(X[c]):
+            X[c] = pd.factorize(X[c].astype(str))[0]
+        else:
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+    X = X.fillna(0)
+    y = work[tgt]
+    if task == "classification":
+        le = LabelEncoder()
+        y = pd.Series(le.fit_transform(y.astype(str)), index=y.index)
+    else:
+        y = pd.to_numeric(y, errors="coerce")
+        mask = y.notna()
+        X, y = X.loc[mask], y.loc[mask]
+
+    if time_series_split:
+        cut = max(1, min(len(X) - 1, int(len(X) * (1 - test_size))))
+        X_train, X_test = X.iloc[:cut], X.iloc[cut:]
+        y_train, y_test = y.iloc[:cut], y.iloc[cut:]
+    else:
+        strat = y if task == "classification" and y.nunique() > 1 and y.value_counts().min() >= 2 else None
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42, stratify=strat)
+        except ValueError:
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+
+    try:
+        est = _resolve_estimator(meta["class"], dict(meta["params"]))
+    except Exception as exc:
+        return {"ok": False, "error": f"Import/build failed: {exc}", "model_id": model_id}
+
+    # CV score
+    cv_score = None
+    try:
+        scoring = "accuracy" if task == "classification" else "r2"
+        cv_score = float(cross_val_score(est, X, y, cv=min(5, max(2, len(X) // 8)), scoring=scoring).mean())
+    except Exception:
+        pass
+
+    try:
+        est.fit(X_train, y_train)
+        preds = est.predict(X_test)
+    except Exception as exc:
+        return {"ok": False, "error": f"Fit failed: {exc}", "model_id": model_id, "target": tgt}
+
+    metrics: dict[str, Any] = {}
+    if task == "classification":
+        metrics["accuracy"] = round(float(accuracy_score(y_test, preds)), 4)
+        metrics["f1"] = round(float(f1_score(y_test, preds, average="weighted", zero_division=0)), 4)
+        if cv_score is not None:
+            metrics["cv_score"] = round(cv_score, 4)
+    else:
+        metrics["r2"] = round(float(r2_score(y_test, preds)), 4)
+        metrics["rmse"] = round(float(np.sqrt(mean_squared_error(y_test, preds))), 4)
+        metrics["mae"] = round(float(mean_absolute_error(y_test, preds)), 4)
+        if cv_score is not None:
+            metrics["cv_score"] = round(cv_score, 4)
+
+    preview = pd.DataFrame({"y_true": list(y_test)[:40], "y_pred": list(preds)[:40]})
+    briefing = build_manager_briefing({"ok": True, "model_id": model_id, "task": task, "target": tgt, "metrics": metrics})
+    return {
+        "ok": True, "model_id": model_id, "task": task, "target": tgt, "features": feats[:20],
+        "metrics": metrics, "predictions_preview": preview, "manager_briefing": briefing, "cv_score": cv_score,
+    }
+
+
+def build_manager_briefing(result: dict[str, Any]) -> str:
+    if not result.get("ok"):
+        return ""
+    model = result.get("model_id")
+    target = result.get("target") or "target"
+    m = result.get("metrics") or {}
+    task = result.get("task")
+    if task == "forecast":
+        return result.get("manager_briefing") or f"Prophet outlook on `{target}` ready."
+    if task == "classification":
+        return (
+            f"**Manager read — {model} on `{target}`**\n"
+            f"- Accuracy **{m.get('accuracy', 'n/a')}**, F1 **{m.get('f1', 'n/a')}**, "
+            f"CV **{m.get('cv_score', 'n/a')}**.\n"
+            f"- Use this score to prioritize interventions on high-risk rows."
+        )
+    if task == "dimensionality":
+        return f"**PCA** explains **{m.get('total_explained', 'n/a')}** of variance — check dead/correlated sensors."
+    if task == "anomaly":
+        return f"**IsolationForest** flagged **{m.get('anomaly_rate', 0)*100:.1f}%** anomaly rate ({m.get('anomalies')} rows)."
+    return (
+        f"**Manager read — {model} on `{target}`**\n"
+        f"- R² **{m.get('r2', 'n/a')}**, RMSE **{m.get('rmse', 'n/a')}**, MAE **{m.get('mae', 'n/a')}**, "
+        f"CV **{m.get('cv_score', 'n/a')}**.\n"
+        f"- Higher R² / lower RMSE = more trustworthy predictions for planning."
+    )
+
+
+def domain_default_target(df: pd.DataFrame, domain: str) -> Optional[str]:
+    mapping = {
+        "predictive_maintenance": ["rul", "failure", "temperature"],
+        "sales_forecasting": ["revenue", "sales", "gmv"],
+        "telecom_churn": ["churn"],
+        "healthcare": ["readmission", "bmi"],
+        "finance_risk": ["default", "loan_amount"],
+        "energy_utilities": ["load", "kwh", "mw"],
+        "warehouse_logistics": ["inventory", "lead_time"],
+        "agriculture_iot": ["yield", "moisture"],
+        "hr_people": ["attrition", "salary"],
+    }
+    for n in mapping.get(domain, ["rul", "failure", "revenue", "churn"]):
+        hit = _col(df, n)
+        if hit:
+            return hit
+    return _ml_pick_target(df, "regression") or _ml_pick_target(df, "classification")
+
+
+def field_best_model_card(df: pd.DataFrame, domain: str) -> dict[str, Any]:
+    """Auto-pick best model for domain target via quick CV bake-off (XGB preferred)."""
+    target = domain_default_target(df, domain)
+    if not target:
+        return {"ok": False, "error": "No target column found for this field."}
+    y = df[target]
+    y_num = pd.to_numeric(y, errors="coerce")
+    task = "regression" if y_num.notna().sum() >= max(10, int(0.7 * len(y))) and y_num.nunique() > 8 else "classification"
+    candidates = [m for m in DOMAIN_RECOMMENDED_MODELS.get(domain, []) if FORGE_MODEL_CATALOG.get(m, {}).get("task") == task]
+    if not candidates:
+        candidates = ["XGBRegressor", "RandomForestRegressor"] if task == "regression" else ["XGBClassifier", "RandomForestClassifier"]
+    # ensure available
+    avail = []
+    for mid in candidates:
+        lib = FORGE_MODEL_CATALOG[mid]["library"]
+        if lib == "xgboost":
+            try:
+                import xgboost  # noqa
+                avail.append(mid)
+            except ImportError:
+                continue
+        elif lib == "lightgbm":
+            try:
+                import lightgbm  # noqa
+                avail.append(mid)
+            except ImportError:
+                continue
+        else:
+            avail.append(mid)
+    if not avail:
+        avail = ["RandomForestRegressor"] if task == "regression" else ["RandomForestClassifier"]
+
+    results = []
+    for mid in avail[:4]:
+        res = run_forge_model(df, mid, target=target, time_series_split=True)
+        if res.get("ok"):
+            score = res.get("metrics", {}).get("cv_score")
+            if score is None:
+                score = res.get("metrics", {}).get("r2") or res.get("metrics", {}).get("accuracy") or 0
+            results.append((float(score), mid, res))
+    if not results:
+        return {"ok": False, "error": "All candidate models failed.", "target": target}
+    results.sort(key=lambda z: -z[0])
+    best_score, best_id, best_res = results[0]
+    actions = perspective_actions(df, domain, best_res)
+    return {
+        "ok": True,
+        "domain": domain,
+        "target": target,
+        "best_model": best_id,
+        "cv_score": round(best_score, 4),
+        "result": best_res,
+        "leaderboard": [{"model": m, "score": round(s, 4)} for s, m, _ in results],
+        "actions": actions,
+    }
+
+
+def perspective_actions(df: pd.DataFrame, domain: str, ml_result: dict[str, Any]) -> list[str]:
+    """Plain-language alerts / recommended actions / downtime-cost style lines."""
+    lines: list[str] = []
+    domain_label = DOMAIN_CATALOG.get(domain, {}).get("label", domain)
+    metrics = ml_result.get("metrics") or {}
+    model = ml_result.get("model_id")
+    target = ml_result.get("target")
+    lines.append(f"Field **{domain_label}** · best model **{model}** on `{target}` · CV/score **{metrics.get('cv_score') or metrics.get('r2') or metrics.get('accuracy')}**.")
+
+    if domain == "predictive_maintenance":
+        v = _col(df, "vibration", "vib")
+        t = _col(df, "temperature", "temp")
+        mid = _col(df, "machine_id", "machine", "asset_id", "asset")
+        alert_machine = None
+        vib_val = None
+        if v is not None:
+            vs = pd.to_numeric(df[v], errors="coerce")
+            thr = float(vs.mean() + 2 * (vs.std() or 1))
+            hot = df.loc[vs >= thr]
+            if len(hot) and mid:
+                alert_machine = hot[mid].astype(str).iloc[-1]
+                vib_val = float(vs.loc[hot.index[-1]])
+            elif len(hot):
+                vib_val = float(vs.loc[hot.index[-1]])
+        if alert_machine and vib_val is not None:
+            lines.append(f"🚨 **ALERT:** Bearing wear pattern on **{alert_machine}** — vibration spiked to **{vib_val:.2f}**.")
+        elif vib_val is not None:
+            lines.append(f"🚨 **ALERT:** Vibration spike detected at **{vib_val:.2f}** (sensor fault / bearing risk).")
+        else:
+            lines.append("Sensors within envelope — continue condition monitoring.")
+        lines.append("**Recommended actions:** Schedule maintenance team within 8–12h · inspect bearings · verify temp gradient.")
+        # downtime economics proxy
+        risk = float(field_predict(df))
+        downtime_hrs = round(2 + risk / 20.0, 1)
+        saved_lakh = round(max(0.5, (100 - risk) / 100 * 3.5), 2)
+        lines.append(f"**Expected downtime if ignored:** ~{downtime_hrs}h · **Downtime cost avoided if maintained:** ₹{saved_lakh}L (proxy).")
+        if t:
+            lines.append(f"Latest mean temperature context: **{_mean(df, 'temperature', 'temp')}**.")
+    elif domain == "sales_forecasting":
+        rev = _col(df, "revenue", "sales", "gmv")
+        loc = _col(df, "location", "region", "store")
+        if rev and loc:
+            g = df.groupby(loc)[rev].mean().sort_values()
+            lines.append(f"🚨 Revenue soft spot: **{g.index[0]}** (avg={g.iloc[0]:.2f}) vs leader **{g.index[-1]}** ({g.iloc[-1]:.2f}).")
+        lines.append("**Recommended actions:** Promo push on weak region · re-check stockouts · run Prophet 30-day outlook in ML Studio.")
+        pct = metrics.get("pct_change")
+        if pct is not None:
+            direction = "drop" if float(pct) < 0 else "rise"
+            lines.append(f"**Forecast:** `{target}` likely to **{direction} ~{abs(float(pct))*100:.1f}%**.")
+    elif domain == "telecom_churn":
+        churn = _col(df, "churn")
+        rate = float(pd.to_numeric(df[churn], errors="coerce").fillna(0).mean()) if churn else 0
+        lines.append(f"🚨 Churn rate **{rate*100:.1f}%** — prioritize high-tenure / low-ARPU cohort.")
+        lines.append("**Recommended actions:** Retention offers · call-drop RCA · win-back campaign on top-risk subscribers.")
+        lines.append(f"**Revenue protected (proxy):** ₹{round(rate*2.5, 2)}L if churn cut 50%.")
+    elif domain == "healthcare":
+        lines.append("**Recommended actions:** Flag high BMI / glucose cohort · schedule follow-ups · monitor readmission risk.")
+        lines.append("Model supports triage — not a medical diagnosis.")
+    else:
+        lines.append("**Recommended actions:** Review KPIs → pin charts to Dashboard → email weekly pack to stakeholders.")
+    return lines
+
+
+# -----------------------------------------------------------------------------
+# LlamaIndex — build once per upload fingerprint
+# -----------------------------------------------------------------------------
+
+def _df_fingerprint(df: pd.DataFrame) -> str:
+    name = str(st.session_state.get("manual_name") or st.session_state.get("mode") or "buf")
+    return f"{name}|{len(df)}x{df.shape[1]}|{hash(tuple(df.columns))}"
+
+
+def _row_documents(df: pd.DataFrame, max_rows: int = 400) -> list[str]:
+    sample = df.head(max_rows)
+    docs = []
+    for i, row in sample.iterrows():
+        parts = [f"row_id={i}"]
+        for c in sample.columns:
+            val = row[c]
+            if pd.notna(val):
+                parts.append(f"{c}={val}")
+        docs.append(" | ".join(parts))
+    return docs
+
+
+def ensure_llama_index(df: pd.DataFrame, force: bool = False) -> dict[str, Any]:
+    """Build LlamaIndex (or keyword corpus) once per upload."""
+    fp = _df_fingerprint(df)
+    cached = st.session_state.get("llama_index_meta") or {}
+    if not force and cached.get("fingerprint") == fp and st.session_state.get("llama_docs"):
+        return {"ok": True, "cached": True, **cached}
+
+    docs = _row_documents(df)
+    index_obj = None
+    mode = "keyword"
+    try:
+        from llama_index.core import Document, VectorStoreIndex
+        documents = [Document(text=t) for t in docs]
+        try:
+            index_obj = VectorStoreIndex.from_documents(documents)
+            mode = "llama_vector"
+        except Exception:
+            # no embedding model — keep docs for keyword search
+            mode = "keyword"
+    except Exception:
+        mode = "keyword"
+
+    meta = {
+        "ok": True,
+        "fingerprint": fp,
+        "n_docs": len(docs),
+        "mode": mode,
+        "built_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    st.session_state.llama_docs = docs
+    st.session_state.llama_index_obj = index_obj
+    st.session_state.llama_index_meta = meta
+    return meta
+
+
+def llama_search(query: str, top_k: int = 6) -> list[dict[str, Any]]:
+    """Search indexed CSV rows — works offline (keyword) or via LlamaIndex retriever."""
+    docs: list[str] = st.session_state.get("llama_docs") or []
+    index_obj = st.session_state.get("llama_index_obj")
+    hits: list[dict[str, Any]] = []
+    if index_obj is not None:
+        try:
+            engine = index_obj.as_query_engine(similarity_top_k=top_k)
+            resp = engine.query(query)
+            text = str(resp)
+            hits.append({"score": 1.0, "text": text, "source": "llama_query_engine"})
+            # also pull source nodes if present
+            src = getattr(resp, "source_nodes", None) or []
+            for n in src[:top_k]:
+                hits.append({"score": float(getattr(n, "score", 0) or 0), "text": str(getattr(n, "node", n).get_content() if hasattr(getattr(n, "node", None), "get_content") else n), "source": "llama_node"})
+            if hits:
+                return hits[:top_k]
+        except Exception:
+            pass
+    # keyword offline search
+    q_tokens = set(re.findall(r"[a-zA-Z0-9_.]+", (query or "").lower()))
+    scored = []
+    for t in docs:
+        toks = set(re.findall(r"[a-zA-Z0-9_.]+", t.lower()))
+        score = len(q_tokens & toks)
+        # boost numeric mentions when question asks why/fail/vibration
+        if any(w in (query or "").lower() for w in ("fail", "vibration", "temp", "why", "spike")):
+            if "vibration" in t.lower() or "fail" in t.lower():
+                score += 2
+        scored.append((score, t))
+    scored.sort(key=lambda z: -z[0])
+    for s, t in scored[:top_k]:
+        if s > 0:
+            hits.append({"score": float(s), "text": t, "source": "keyword"})
+    if not hits:
+        hits = [{"score": 0.0, "text": t, "source": "fallback"} for t in docs[:3]]
+    return hits
+
+
+def ask_llama_gemini(question: str, df: pd.DataFrame) -> dict[str, Any]:
+    """Index → Search → Answer. Offline Llama/keyword first, Gemini grounded on hits."""
+    ensure_llama_index(df, force=False)
+    hits = llama_search(question, top_k=6)
+    context = "\n".join(f"- {h['text']}" for h in hits)
+    # Offline extractive answer: pull key numbers from hits
+    offline = _offline_answer_from_hits(question, hits, df)
+    gemini_ans = ""
+    if get_gemini_api_key():
+        prompt = (
+            "You are Analytics Forge industrial OS. Answer ONLY using the retrieved CSV rows.\n"
+            "Cite concrete numbers (vibration, temperature, machine_id, revenue, etc.).\n"
+            f"Question: {question}\n\nRetrieved rows:\n{context}\n\n"
+            "Give a short operational answer with recommended action."
+        )
+        gemini_ans = _gemini_answer(prompt)
+        if gemini_ans.startswith("[Gemini error]"):
+            gemini_ans = ""
+    final = gemini_ans.strip() if gemini_ans and not gemini_ans.startswith("[Gemini") else offline
+    return {
+        "answer": final,
+        "offline_answer": offline,
+        "gemini_answer": gemini_ans,
+        "hits": hits,
+        "index_meta": st.session_state.get("llama_index_meta"),
+    }
+
+
+def _offline_answer_from_hits(question: str, hits: list[dict[str, Any]], df: pd.DataFrame) -> str:
+    q = (question or "").lower()
+    # machine failure style
+    mid = _col(df, "machine_id", "machine", "asset_id")
+    v = _col(df, "vibration", "vib")
+    t = _col(df, "temperature", "temp")
+    machine_ask = None
+    m = re.search(r"machine\s*([a-zA-Z0-9_-]+)", q)
+    if m:
+        machine_ask = m.group(1)
+    if ("fail" in q or "why" in q) and (mid or v):
+        subset = df
+        if machine_ask and mid:
+            subset = df[df[mid].astype(str).str.contains(machine_ask, case=False, na=False)]
+            if subset.empty:
+                subset = df
+        vib_txt = ""
+        temp_txt = ""
+        if v is not None and len(subset):
+            vv = float(pd.to_numeric(subset[v], errors="coerce").max())
+            vib_txt = f"vibration reached **{vv:.2f}**"
+        if t is not None and len(subset):
+            tt = float(pd.to_numeric(subset[t], errors="coerce").max())
+            temp_txt = f"temperature peaked at **{tt:.2f}**"
+        who = f"Machine **{machine_ask}**" if machine_ask else "The asset"
+        bits = ", ".join(x for x in (vib_txt, temp_txt) if x) or "sensor anomalies in retrieved rows"
+        # enrich from hit text
+        hit_snip = hits[0]["text"] if hits else ""
+        return (
+            f"{who} likely failed because {bits}. "
+            f"LlamaIndex search evidence: `{hit_snip[:220]}`. "
+            "Recommended: inspect bearings / schedule maintenance."
+        )
+    if hits:
+        return f"Based on indexed CSV rows: {hits[0]['text'][:300]}"
+    return f"Dataset has {len(df):,} rows. Ask about a machine, KPI, or column."
+
+
+def build_html_report(
+    domain: str,
+    source_name: str,
+    kpis: dict,
+    insights: list,
+    ml_result: Optional[dict],
+    briefing: str,
+) -> str:
+    rows = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in (kpis or {}).items())
+    insight_html = "".join(f"<li>{i}</li>" for i in (insights or []))
+    ml = ml_result or {}
+    return f"""<!DOCTYPE html><html><head><meta charset='utf-8'><title>Analytics Forge Report</title>
+    <style>body{{font-family:Segoe UI,Arial;margin:24px}} table{{border-collapse:collapse}} td,th{{border:1px solid #ccc;padding:6px 10px}}</style>
+    </head><body>
+    <h1>Analytics Forge v2 Report</h1>
+    <p><b>Field:</b> {domain} · <b>Source:</b> {source_name}</p>
+    <h2>Briefing</h2><p>{briefing}</p>
+    <h2>KPIs</h2><table>{rows}</table>
+    <h2>Insights</h2><ul>{insight_html}</ul>
+    <h2>ML</h2><pre>{json.dumps({k: ml.get(k) for k in ('model_id','task','target','metrics')}, indent=2, default=str)}</pre>
+    </body></html>"""
+
+
+def send_forge_email_report(
+    to_addr: str,
+    subject: str,
+    body: str,
+    df: Optional[pd.DataFrame] = None,
+    html_report: Optional[str] = None,
+) -> str:
+    if not EMAIL_USER or not EMAIL_PASSWORD:
+        raise RuntimeError(
+            "Email not configured. Set EMAIL_USER and EMAIL_PASSWORD (Gmail App Password) in `.env`."
+        )
+    msg = EmailMessage()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg.set_content(body)
+    if html_report:
+        msg.add_attachment(html_report.encode("utf-8"), maintype="text", subtype="html", filename="forge_report.html")
+    if df is not None:
+        msg.add_attachment(df.to_csv(index=False).encode("utf-8"), maintype="text", subtype="csv", filename="forge_data.csv")
+    context = ssl.create_default_context()
+    with smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=30) as server:
+        server.starttls(context=context)
+        server.login(EMAIL_USER, EMAIL_PASSWORD)
+        server.send_message(msg)
+    return f"Sent to {to_addr}"
 
 
 # =============================================================================
@@ -2445,84 +3080,76 @@ def page_clean() -> None:
         st.dataframe(clean_df.head(30), use_container_width=True)
 
 
+
 def page_field() -> None:
     st.header("Field")
     st.caption(
-        "Accurate domain detection: exclusive keywords + value ranges + Optuna-tuned ML "
-        "schema classifier + Gemini. Then domain risk explainability."
+        "Industry detection + LlamaIndex build-once + best predictive model (XGB/RF bake-off) "
+        "+ perspective alerts (bearing wear, downtime ₹ saved)."
     )
     gemini_key_ui("field")
     df = require_data()
     if df is None:
         return
 
-    use_gem = st.checkbox("Use Gemini in ensemble", value=bool(get_gemini_api_key()))
-    trials = st.slider("Optuna trials for field model", 8, 40, 25)
-    if st.button("Detect field (Optuna + ensemble)", type="primary") or st.session_state.field_result is None:
-        with st.spinner("Optuna tuning field classifier + ensemble voting..."):
+    use_gem = st.checkbox("Use Gemini in domain ensemble", value=bool(get_gemini_api_key()))
+    trials = st.slider("Optuna trials for field detect", 8, 40, 20)
+    run = st.button("Detect field + build LlamaIndex + best model", type="primary")
+    if run or st.session_state.field_result is None:
+        with st.spinner("Domain detect → LlamaIndex → XGB/RF bake-off..."):
             meta = detect_field(df, use_gemini=use_gem, optuna_trials=trials)
             st.session_state.domain = meta["domain"]
             st.session_state.domain_meta = meta
+            llama_meta = ensure_llama_index(df, force=True)
             engineered = apply_domain_feature_engineering(df, meta["domain"])
             explain = field_risk_explain(engineered)
+            card = field_best_model_card(df, meta["domain"])
+            if card.get("ok"):
+                st.session_state.ml_result = card["result"]
+                st.session_state.dashboard_insights = list(
+                    dict.fromkeys((st.session_state.get("dashboard_insights") or []) + card.get("actions", []))
+                )
             st.session_state.field_result = {
                 "meta": meta,
                 "explain": explain,
+                "llama": llama_meta,
+                "model_card": card,
                 "engineered_cols": [c for c in engineered.columns if c not in df.columns],
             }
 
     res = st.session_state.field_result
-    meta = res["meta"]
-    explain = res["explain"]
+    meta, explain, card = res["meta"], res["explain"], res.get("model_card") or {}
     st.subheader(f"Detected: {meta.get('label')} (`{meta.get('domain')}`)")
     m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.metric("Ensemble confidence", f"{float(meta.get('confidence', 0))*100:.1f}%")
-    with m2:
-        st.metric("Optuna pick", meta.get("optuna", {}).get("domain") or "—")
-    with m3:
-        st.metric("Optuna CV acc", f"{float(meta.get('optuna', {}).get('cv_accuracy') or 0)*100:.1f}%")
-    with m4:
-        st.metric("Risk", f"{explain.get('risk_pct')}%")
+    m1.metric("Domain confidence", f"{float(meta.get('confidence', 0))*100:.1f}%")
+    m2.metric("Risk", f"{explain.get('risk_pct')}%")
+    m3.metric("LlamaIndex docs", (res.get("llama") or {}).get("n_docs", "—"))
+    m4.metric("Index mode", (res.get("llama") or {}).get("mode", "—"))
+
+    if card.get("ok"):
+        st.success(
+            f"Selected target **`{card.get('target')}`** · best model **{card.get('best_model')}** · "
+            f"CV score **{card.get('cv_score')}**"
+        )
+        st.dataframe(pd.DataFrame(card.get("leaderboard") or []), use_container_width=True)
+        st.subheader("Perspective actions")
+        for line in card.get("actions") or []:
+            st.markdown(f"- {line}")
+        with st.expander("Model metrics"):
+            st.json(card.get("result", {}).get("metrics") or {})
+    else:
+        st.warning(card.get("error") or "Model card unavailable")
 
     st.info(explain.get("explanation", ""))
-    if meta.get("reasons"):
-        st.write("Signals: " + ", ".join(str(x) for x in meta["reasons"]))
-    if meta.get("gemini_why"):
-        st.write("Gemini: " + str(meta["gemini_why"]))
-
-    st.subheader("Detection scoreboards (numbers + dataframes)")
     c1, c2 = st.columns(2)
     with c1:
-        st.caption("Heuristic scoreboard")
         if isinstance(meta.get("scoreboard"), pd.DataFrame):
+            st.caption("Domain scoreboard")
             st.dataframe(meta["scoreboard"], use_container_width=True)
     with c2:
-        st.caption("Ensemble votes")
         if isinstance(meta.get("vote_table"), pd.DataFrame):
+            st.caption("Ensemble votes")
             st.dataframe(meta["vote_table"], use_container_width=True)
-    if isinstance(meta.get("optuna_proba_table"), pd.DataFrame):
-        st.caption("Optuna class probabilities")
-        st.dataframe(meta["optuna_proba_table"], use_container_width=True)
-        st.caption(f"Optuna best params: `{meta.get('optuna', {}).get('best_params')}`")
-
-    if res.get("engineered_cols"):
-        st.write("Domain features: " + ", ".join(res["engineered_cols"]))
-    risk = float(explain.get("risk_pct") or 0)
-    if risk >= 70:
-        st.error(f"CRITICAL risk {risk}%")
-    elif risk >= 40:
-        st.warning(f"Elevated risk {risk}%")
-    else:
-        st.success(f"Risk {risk}% — normal envelope")
-    with st.expander("Full payload"):
-        # convert frames for json
-        payload = {
-            k: (v.to_dict(orient="records") if isinstance(v, pd.DataFrame) else v)
-            for k, v in {**meta, "explain": explain}.items()
-            if k not in ("scoreboard", "vote_table", "optuna_proba_table")
-        }
-        st.json(payload)
     render_kpi_boxes(get_kpis(df))
 
 
@@ -2570,9 +3197,10 @@ def page_kpis() -> None:
     st.write(explain["explanation"])
 
 
+
 def page_charts() -> None:
     st.header("Charts")
-    st.caption("Adaptive analytics pipeline — choose Plotly / Seaborn / Matplotlib, X/Y, chart type, filters, and auto insights.")
+    st.caption("Adaptive charts — pin any view to Dashboard (Power BI style).")
     df0 = require_data()
     if df0 is None:
         return
@@ -2589,17 +3217,14 @@ def page_charts() -> None:
     cols = list(filtered.columns)
     num_cols = filtered.select_dtypes(include=[np.number]).columns.tolist()
     cat_cols = [c for c in cols if c not in num_cols]
-
-    # smart defaults by domain
-    domain = st.session_state.get("domain")
     default_y = num_cols[0] if num_cols else cols[0]
-    default_x = cat_cols[0] if cat_cols else (cols[0] if cols else default_y)
-    for pref_y in ("revenue", "sales", "temperature", "churn", "vibration", "load", "salary", "glucose"):
+    default_x = cat_cols[0] if cat_cols else cols[0]
+    for pref_y in ("revenue", "sales", "temperature", "vibration", "churn", "load"):
         hit = _col(filtered, pref_y)
         if hit:
             default_y = hit
             break
-    for pref_x in ("location", "region", "store", "date", "timestamp", "department", "customer"):
+    for pref_x in ("location", "region", "machine_id", "date", "timestamp", "store"):
         hit = _col(filtered, pref_x)
         if hit:
             default_x = hit
@@ -2613,12 +3238,11 @@ def page_charts() -> None:
     with c3:
         x = st.selectbox("X axis", cols, index=cols.index(default_x) if default_x in cols else 0)
     with c4:
-        y = st.selectbox("Y axis", cols if chart_type == "pie" else (num_cols or cols),
-                         index=(num_cols or cols).index(default_y) if default_y in (num_cols or cols) else 0)
+        y_opts = cols if chart_type == "pie" else (num_cols or cols)
+        y = st.selectbox("Y axis", y_opts, index=y_opts.index(default_y) if default_y in y_opts else 0)
     color = st.selectbox("Color / group (optional)", ["(none)"] + cat_cols, index=0)
     color_col = None if color == "(none)" else color
 
-    # aggregate for bar/pie when X is high-cardinality categorical
     plot_df = filtered
     if chart_type in ("bar", "pie") and x in filtered.columns and y in filtered.columns:
         if filtered[x].nunique() > 30 and not pd.api.types.is_numeric_dtype(filtered[x]):
@@ -2628,181 +3252,274 @@ def page_charts() -> None:
     insight = chart_business_insight(filtered, x, y)
     st.success(insight)
 
-    # optional Prophet-style note when y is revenue-like
-    if any(h in str(y).lower() for h in ("revenue", "sales", "gmv", "load", "temperature")):
-        try:
-            st.caption(prophet_forecast(filtered, y))
-        except Exception:
-            pass
+    title = f"{chart_type}: {y} by {x}"
+    if st.button("📌 Add to Dashboard", type="primary"):
+        entry = {
+            "title": title,
+            "chart_type": chart_type,
+            "lib": library,
+            "x": x,
+            "y": y,
+            "color": color_col,
+            "insight": insight,
+        }
+        charts = list(st.session_state.get("dashboard_charts") or [])
+        charts.append(entry)
+        st.session_state.dashboard_charts = charts
+        insights = list(st.session_state.get("dashboard_insights") or [])
+        if insight not in insights:
+            insights.append(insight)
+        st.session_state.dashboard_insights = insights
+        st.success(f"Pinned to Dashboard ({len(charts)} charts)")
 
 
 def page_ml() -> None:
     st.header("ML Studio")
-    st.caption("Optuna AutoML selects the model — no manual model pick. Prophet adds 90-day business forecast.")
+    st.caption(
+        "Forge Analytics catalog — choose model + target. "
+        "Classifiers · Regressors · XGBoost · Prophet · PCA · StatsmodelsOLS · IsolationForest."
+    )
     df = require_data()
     if df is None:
         return
+    domain = st.session_state.get("domain") or detect_field(df, use_gemini=False, optuna_trials=8)["domain"]
+    st.session_state.domain = domain
+    recommended = DOMAIN_RECOMMENDED_MODELS.get(domain, [])
+    model_ids = [m for m in recommended if m in FORGE_MODEL_CATALOG] + [
+        m for m in FORGE_MODEL_CATALOG if m not in recommended
+    ]
+    model_id = st.selectbox(
+        "Model",
+        model_ids,
+        format_func=lambda m: f"{m} [{FORGE_MODEL_CATALOG[m]['task']}]" + (" ★" if m in recommended else ""),
+    )
+    meta = FORGE_MODEL_CATALOG[model_id]
+    st.info(f"**What:** {meta.get('what')}\n\n**Why:** {meta.get('why')}\n\nLibrary: `{meta.get('library')}`")
+
     cols = list(df.columns)
-    default_i = 0
-    for preferred in ("rul", "failure", "temperature", "revenue", "sales"):
-        hit = _col(df, preferred)
-        if hit and hit in cols:
-            default_i = cols.index(hit)
-            break
-    target = st.selectbox("Target", cols, index=default_i)
-    trials = st.slider("Optuna trials", 10, 50, 50)
-    ts_split = st.checkbox("Time-series split (no shuffle — last 20% holdout)", value=True)
-    imb = st.checkbox("Imbalanced class_weight=balanced (classification)", value=True)
-    if st.button("Run AutoML + Forecast", type="primary"):
-        with st.spinner("Optuna searching best model..."):
-            try:
-                best_model, metrics = run_automl(df, target, n_trials=trials, time_series_split=ts_split, balanced=imb)
-                forecast_text = prophet_forecast(df, target)
-                st.session_state.automl_result = {"best_model": best_model, "metrics": metrics}
-                st.session_state.forecast_text = forecast_text
-            except Exception as exc:
-                st.error(str(exc))
-                st.code(traceback.format_exc())
-                return
-    res = st.session_state.get("automl_result")
-    if res:
-        st.success(f"Best Model: **{res['best_model']}** (Optuna auto-selected)")
-        st.json(res["metrics"])
-    if st.session_state.get("forecast_text"):
-        st.write(st.session_state.forecast_text)
+    auto_tgt = domain_default_target(df, domain)
+    default_i = cols.index(auto_tgt) + 1 if auto_tgt in cols else 0
+    target_sel = st.selectbox("Target (the number/label to predict)", ["(auto)"] + cols, index=default_i)
+    target_arg = None if target_sel == "(auto)" else target_sel
+    ts_split = st.checkbox("Time-series split (last 20% holdout)", value=True)
+    compare = st.checkbox("Also run Optuna AutoML bake-off on same target", value=False)
+
+    if st.button("Run model", type="primary"):
+        with st.spinner(f"Training {model_id}..."):
+            result = run_forge_model(df, model_id, target=target_arg, time_series_split=ts_split)
+            if result.get("ok") and not result.get("manager_briefing"):
+                result["manager_briefing"] = build_manager_briefing(result)
+            st.session_state.ml_result = result
+            if result.get("ok") and result.get("manager_briefing"):
+                st.session_state.dashboard_insights = list(
+                    dict.fromkeys((st.session_state.get("dashboard_insights") or []) + [result["manager_briefing"]])
+                )
+            if compare and result.get("ok") and result.get("target"):
+                try:
+                    best, metrics = run_automl(df, result["target"], n_trials=20, time_series_split=ts_split)
+                    st.session_state.automl_result = {"best_model": best, "metrics": metrics}
+                except Exception as exc:
+                    st.session_state.automl_result = {"error": str(exc)}
+
+    result = st.session_state.get("ml_result")
+    if result:
+        if result.get("ok"):
+            st.success(f"Finished: **{result.get('model_id')}** on `{result.get('target')}`")
+            metrics = result.get("metrics") or {}
+            cols_m = st.columns(min(4, max(1, len(metrics))))
+            for i, (k, v) in enumerate(list(metrics.items())[:4]):
+                cols_m[i].metric(str(k), v)
+            if result.get("manager_briefing"):
+                st.markdown(result["manager_briefing"])
+            preview = result.get("predictions_preview")
+            if preview is not None:
+                st.subheader("Predictions preview")
+                st.dataframe(preview, use_container_width=True)
+            if result.get("summary"):
+                with st.expander("Statsmodels summary"):
+                    st.text(result["summary"])
+        else:
+            st.error(result.get("error", "Failed"))
+
+    if st.session_state.get("automl_result"):
+        st.subheader("Optuna AutoML bake-off")
+        st.json(st.session_state.automl_result)
 
 
 def page_ask() -> None:
     st.header("Ask / AI")
+    st.caption("LlamaIndex search on your CSV (offline) + Gemini grounded answer. Index builds once per upload (Field).")
     gem_ok = bool(get_gemini_api_key())
-    st.write(f"Gemini: **{'Connected' if gem_ok else 'No key'}** ({GEMINI_MODEL})")
-    st.write("RAG: LlamaIndex on current data buffer + Gemini grounded answers")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Gemini", "Ready" if gem_ok else "No key")
+    c2.metric("LlamaIndex", "Ready" if st.session_state.get("llama_docs") else "Build in Field")
+    c3.metric("Offline search", "Always on")
     if not gem_ok:
-        st.warning("Set GEMINI_API_KEY in Upload/Field or `.env`.")
         gemini_key_ui("ask")
 
     df = require_data()
     if df is None:
         return
 
+    if st.button("Rebuild LlamaIndex now"):
+        with st.spinner("Indexing rows..."):
+            meta = ensure_llama_index(df, force=True)
+        st.success(f"Indexed {meta.get('n_docs')} docs · mode={meta.get('mode')}")
+    elif not st.session_state.get("llama_docs"):
+        ensure_llama_index(df, force=False)
+        st.caption(f"Auto-indexed {(st.session_state.get('llama_index_meta') or {}).get('n_docs')} rows")
+
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+            if msg.get("hits"):
+                with st.expander("Retrieved rows"):
+                    for h in msg["hits"][:4]:
+                        st.code(h.get("text", "")[:400])
 
-    q = st.chat_input("Ask about your plant / buffer data…")
+    q = st.chat_input("e.g. Why did machine 3 fail? What is avg vibration?")
     if q:
         st.session_state.chat_history.append({"role": "user", "content": q})
         with st.chat_message("user"):
             st.markdown(q)
         with st.chat_message("assistant"):
-            with st.spinner("RAG + Gemini..."):
-                ans = rag_ask(q, df)
-            st.markdown(ans)
-        st.session_state.chat_history.append({"role": "assistant", "content": ans})
+            with st.spinner("LlamaIndex search → Gemini answer..."):
+                out = ask_llama_gemini(q, df)
+            st.markdown(out["answer"])
+            with st.expander("Search hits (LlamaIndex / keyword)"):
+                for h in out.get("hits") or []:
+                    st.write(f"[{h.get('source')} · score={h.get('score')}] {h.get('text')[:350]}")
+            if out.get("gemini_answer") and out.get("offline_answer") and out["gemini_answer"] != out["answer"]:
+                st.caption("Offline fallback was also computed.")
+        st.session_state.chat_history.append(
+            {"role": "assistant", "content": out["answer"], "hits": out.get("hits")}
+        )
 
 
 def page_dashboard() -> None:
-    """Dashboard — NO raw HTML. Metrics + charts + alerts only."""
     st.header("Dashboard")
-    st.caption("SCADA-style board for LIVE · same KPIs for MANUAL. Filter-gated buffer view.")
-    df = require_data()
-    if df is None:
+    st.caption("Power BI / Tableau style — filters change the whole board. Select KPIs + pinned charts from Charts page.")
+    df0 = require_data()
+    if df0 is None:
+        return
+    if not st.session_state.get("domain"):
+        st.session_state.domain = detect_field(df0, use_gemini=False, optuna_trials=8)["domain"]
+
+    filtered = render_filter_bar(df0, key_prefix="dash")
+    if filtered.empty:
+        st.warning("Filters removed all rows — clear location/people filters.")
         return
 
-    # Power-BI-like slicers
-    st.subheader("Filters")
-    cat_cols = [c for c in df.select_dtypes(include=["object", "category"]).columns if df[c].nunique() <= 40]
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    view = df.copy()
-    fc1, fc2 = st.columns(2)
-    with fc1:
-        for c in cat_cols[:3]:
-            opts = sorted(view[c].dropna().astype(str).unique().tolist())
-            sel = st.multiselect(f"Filter {c}", opts, default=[], key=f"dash_f_{c}")
-            if sel:
-                view = view[view[c].astype(str).isin(sel)]
-    with fc2:
-        for c in num_cols[:2]:
-            s = pd.to_numeric(view[c], errors="coerce").dropna()
-            if s.empty or s.min() == s.max():
-                continue
-            lo, hi = float(s.min()), float(s.max())
-            rng = st.slider(f"Range {c}", lo, hi, (lo, hi), key=f"dash_r_{c}")
-            series = pd.to_numeric(view[c], errors="coerce")
-            view = view[(series >= rng[0]) & (series <= rng[1])]
+    kpis_all = get_kpis(filtered)
+    kpi_keys = [k for k in kpis_all.keys() if k != "Domain"]
+    pick = st.multiselect("KPIs to show", kpi_keys, default=kpi_keys[:8], key="dash_kpi_pick")
+    render_kpi_boxes({k: kpis_all[k] for k in pick} | {"Domain": kpis_all.get("Domain")}, per_row=4)
 
-    st.caption(f"Buffer rows in view: **{len(view):,}** / {len(df):,}")
+    left, right = st.columns([3, 1])
+    with right:
+        st.subheader("Insights")
+        for insight in st.session_state.get("dashboard_insights") or []:
+            st.markdown(f"- {insight}")
+        ml = st.session_state.get("ml_result")
+        if ml and ml.get("ok"):
+            st.caption(f"Last ML: {ml.get('model_id')} · {ml.get('metrics')}")
+        risk = field_predict(filtered if len(filtered) >= 10 else df0)
+        st.metric("Live risk", f"{risk}%")
 
-    kpis = get_kpis(view)
-    risk = field_predict(view if len(view) >= 10 else df)
+    with left:
+        st.subheader("Pinned charts")
+        charts = st.session_state.get("dashboard_charts") or []
+        if not charts:
+            st.info("Go to **Charts**, build a view, click **Add to Dashboard**.")
+        for i, meta in enumerate(charts):
+            st.markdown(f"**{meta.get('title')}**")
+            try:
+                render_adaptive_chart(
+                    filtered,
+                    meta.get("x"),
+                    meta.get("y"),
+                    meta.get("chart_type", "bar"),
+                    meta.get("lib", "plotly"),
+                    meta.get("color"),
+                )
+            except Exception as exc:
+                st.warning(f"Chart {i+1} failed on filtered data: {exc}")
+            if meta.get("insight"):
+                st.caption(meta["insight"])
+            if st.button(f"Remove chart {i+1}", key=f"rm_chart_{i}"):
+                charts.pop(i)
+                st.session_state.dashboard_charts = charts
+                st.rerun()
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Rows in Buffer", kpis["Rows"])
-    c2.metric("Virtual Plant Cap", "1,250,000")
-    c3.metric("Failure Risk", f"{risk}%")
-    c4.metric("Forecasted", "Yes" if st.session_state.get("forecast_text") else "Run ML Studio")
-
-    st.subheader("KPI scoreboard")
-    metric_grid(kpis, per_row=4)
-
-    tcol = _col(view, "temperature", "temp")
-    vcol = _col(view, "vibration", "vib")
-    if tcol:
-        st.subheader("Temperature — last 48")
-        st.line_chart(pd.to_numeric(view[tcol], errors="coerce").tail(48))
-    if vcol:
-        st.subheader("Vibration")
-        st.scatter_chart(pd.to_numeric(view[vcol], errors="coerce").tail(200))
-
-    if tcol and vcol:
-        plot_df = view[[vcol, tcol]].apply(pd.to_numeric, errors="coerce").dropna().tail(400)
-        fig = px.scatter(plot_df, x=vcol, y=tcol, title="Vibration vs Temperature")
-        st.plotly_chart(fig, use_container_width=True)
-
-    if risk > 70:
-        st.error(f"ALERT: Failure risk {risk}% in 8h — dispatch maintenance.")
-    elif risk > 40:
-        st.warning(f"Watchlist: Failure risk {risk}% — review sensors.")
-    else:
-        st.success(f"Operating normally — failure risk {risk}%.")
-
-    if st.session_state.get("forecast_text"):
-        st.info(st.session_state.forecast_text)
+    st.divider()
+    if st.button("Clear dashboard charts"):
+        st.session_state.dashboard_charts = []
+        st.rerun()
 
 
 def page_email() -> None:
     st.header("Email")
-    st.write(f"Operator account: **{OPERATOR_EMAIL}**")
-    st.caption("Send current buffer + KPIs / risk briefing. Requires EMAIL_USER + EMAIL_PASSWORD in .env.")
+    st.caption("Forge Analytics style — send HTML report pack + CSV to any inbox (Gmail App Password).")
+    status_ok = bool(EMAIL_USER and EMAIL_PASSWORD)
+    if status_ok:
+        st.success(f"SMTP ready · {EMAIL_SMTP_HOST}:{EMAIL_SMTP_PORT} · from {EMAIL_FROM or EMAIL_USER}")
+    else:
+        st.warning(
+            "Set `EMAIL_USER` + `EMAIL_PASSWORD` (Gmail App Password) in `.env`.\n\n"
+            "```\nEMAIL_USER=you@gmail.com\nEMAIL_PASSWORD=xxxx xxxx xxxx xxxx\nEMAIL_FROM=you@gmail.com\n```"
+        )
+
     df = None
     try:
         df = get_data()
-    except Exception as exc:
-        st.warning(str(exc))
+    except Exception:
+        st.info("Load data (Upload / LIVE) to attach CSV + KPI report.")
 
-    to_addr = st.text_input("Recipient", value=OPERATOR_EMAIL)
-    subject = st.text_input("Subject", value="[Analytics Forge v2] Industrial report")
-    if st.button("Send report + CSV", type="primary"):
-        if df is None:
-            st.error("No data buffer available.")
-            return
-        try:
-            kpis = get_kpis(df)
-            risk = field_predict(df)
-            body = (
-                f"Analytics Forge v2 report\nMode: {st.session_state.mode}\n"
-                f"Rows: {kpis['Rows']}\nFailure risk: {risk}%\nKPIs: {json.dumps(kpis)}\n"
-                f"Forecast: {st.session_state.get('forecast_text') or 'n/a'}\n"
-            )
-            msg = send_email_report(to_addr, subject, body, df=df)
-            st.success(msg)
-        except Exception as exc:
-            st.error(str(exc))
+    domain = st.session_state.get("domain") or "generic"
+    kpis = get_kpis(df) if df is not None else {}
+    insights = st.session_state.get("dashboard_insights") or []
+    ml = st.session_state.get("ml_result")
+    briefing = ""
+    if st.session_state.get("field_result") and st.session_state.field_result.get("model_card", {}).get("actions"):
+        briefing = " | ".join(st.session_state.field_result["model_card"]["actions"][:3])
+    elif ml and ml.get("manager_briefing"):
+        briefing = ml["manager_briefing"]
+    else:
+        briefing = f"Analytics Forge report for {DOMAIN_CATALOG.get(domain, {}).get('label', domain)}."
 
+    with st.form("email_send_form"):
+        to_addr = st.text_input("Recipient", value=OPERATOR_EMAIL)
+        subject = st.text_input("Subject", value=f"[Analytics Forge v2] {DOMAIN_CATALOG.get(domain, {}).get('label', domain)} report")
+        note = st.text_area("Extra note", value="Attached: HTML pack + current data CSV.")
+        send_clicked = st.form_submit_button("Send report now", type="primary")
+        if send_clicked:
+            if not to_addr.strip():
+                st.error("Enter recipient email.")
+            elif df is None:
+                st.error("No data loaded.")
+            else:
+                try:
+                    html = build_html_report(
+                        domain=domain,
+                        source_name=str(st.session_state.get("manual_name") or "live.csv"),
+                        kpis=kpis,
+                        insights=insights,
+                        ml_result=ml,
+                        briefing=briefing,
+                    )
+                    body = note + "\n\n" + briefing
+                    msg = send_forge_email_report(to_addr.strip(), subject, body, df=df, html_report=html)
+                    st.success(msg)
+                except Exception as exc:
+                    st.error(str(exc))
 
-# =============================================================================
-# SIDEBAR + MAIN
-# =============================================================================
+    st.subheader("Report preview KPIs")
+    if kpis:
+        render_kpi_boxes(kpis)
+    st.subheader("Insights that will be emailed")
+    for i in insights[:8]:
+        st.markdown(f"- {i}")
+
 
 PAGES = [
     "Upload",
