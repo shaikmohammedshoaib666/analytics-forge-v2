@@ -1,8 +1,26 @@
+---
+title: Analytics Forge v2
+emoji: 🏭
+colorFrom: gray
+colorTo: blue
+sdk: docker
+app_port: 8501
+pinned: false
+license: mit
+short_description: Dual-mode industrial analytics — Manual upload + LIVE SCADA buffer
+---
+
 # Analytics Forge v2
 
 Industry dual-mode analytics OS — **Manual upload** + **LIVE SCADA** — shared core for clean → field → KPIs → charts → ML → Ask AI → dashboard → email.
 
 Repo: `shaikmohammedshoaib666/analytics-forge-v2` (keep separate from `analytics-forge` v1 demo).
+
+> **Hugging Face Space:** this repo is Docker-Space ready (`sdk: docker`, light `requirements-cloud.txt`).  
+> After you create the Space from this GitHub repo, URL looks like:  
+> `https://huggingface.co/spaces/<YOUR_HF_USER>/analytics-forge-v2`  
+> App: `https://<YOUR_HF_USER>-analytics-forge-v2.hf.space`  
+> Full click path: **`deploy/HUGGINGFACE.md`**
 
 ## Try now (localhost)
 

@@ -1,6 +1,10 @@
 services:
   analytics-forge:
-    build: .
+    build:
+      context: .
+      args:
+        # Full stack on VM; HF Spaces Dockerfile defaults to requirements-cloud.txt
+        REQUIREMENTS_FILE: requirements.txt
     image: analytics-forge:latest
     container_name: analytics-forge
     restart: unless-stopped
@@ -9,7 +13,6 @@ services:
     env_file:
       - .env
     volumes:
-      # Keep users, projects, and clean CSVs across redeploys
       - ./data:/app/data
     environment:
       - STREAMLIT_SERVER_HEADLESS=true
