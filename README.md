@@ -20,7 +20,7 @@ streamlit run app.py
 ## .env
 ```
 GEMINI_API_KEY=...
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL=gemini-flash-latest
 MODBUS_HOST=192.168.1.100
 MODBUS_PORT=502
 EMAIL_USER=
