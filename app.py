@@ -5,6 +5,7 @@ Single-file app: LIVE Modbus SCADA buffer + MANUAL upload, shared analytics core
 from __future__ import annotations
 
 import json
+import re
 import logging
 import os
 import smtplib
@@ -129,71 +130,109 @@ DOMAIN_CATALOG: dict[str, dict[str, Any]] = {
         "label": "Predictive Maintenance / OPC-UA Sensors",
         "keywords": [
             "temperature", "temp", "vibration", "pressure", "rul", "failure", "machine",
-            "sensor", "torque", "rpm", "current", "voltage", "opc", "modbus", "asset",
+            "sensor", "torque", "rpm", "opc", "modbus", "asset", "bearing", "fault",
         ],
+        "exclusive": ["vibration", "rul", "torque", "bearing", "modbus", "opc"],
+        "negative": ["patient", "bmi", "churn", "revenue", "sku", "loan", "crop", "arpu"],
         "dtypes_hint": "numeric_sensors",
+        "value_hints": {"vibration": (0, 50), "temperature": (-40, 500), "rul": (0, 100000)},
     },
     "healthcare": {
         "label": "Healthcare / Hospital",
         "keywords": [
             "patient", "age", "bmi", "bp", "blood", "glucose", "heart", "diagnosis",
             "admit", "ward", "doctor", "hospital", "readmission", "weight", "height",
-            "cholesterol", "pulse", "spo2",
+            "cholesterol", "pulse", "spo2", "systolic", "diastolic", "icd",
         ],
+        "exclusive": ["patient", "bmi", "glucose", "readmission", "spo2", "cholesterol", "ward"],
+        "negative": ["vibration", "rul", "sku", "churn", "kwh", "modbus"],
         "dtypes_hint": "mixed_clinical",
+        "value_hints": {"age": (0, 120), "bmi": (10, 60), "glucose": (40, 600)},
     },
     "sales_forecasting": {
         "label": "Sales / Retail / Revenue",
         "keywords": [
             "revenue", "sales", "units", "order", "price", "sku", "customer", "region",
-            "channel", "store", "campaign", "discount", "gmv", "asp",
+            "channel", "store", "campaign", "discount", "gmv", "asp", "product", "qty",
         ],
+        "exclusive": ["revenue", "sales", "gmv", "sku", "discount", "campaign", "asp"],
+        "negative": ["vibration", "patient", "churn", "soil", "modbus", "loan"],
         "dtypes_hint": "commerce",
+        "value_hints": {},
     },
     "warehouse_logistics": {
         "label": "Warehouse / Supply Chain",
         "keywords": [
             "warehouse", "sku", "inventory", "stock", "shipment", "delivery", "carrier",
-            "aisle", "bin", "lead_time", "defect", "pick", "pack",
+            "aisle", "bin", "lead_time", "defect", "pick", "pack", "supplier", "po",
         ],
+        "exclusive": ["warehouse", "inventory", "shipment", "aisle", "lead_time", "pick"],
+        "negative": ["patient", "vibration", "churn", "bmi", "glucose"],
         "dtypes_hint": "ops",
+        "value_hints": {},
     },
     "energy_utilities": {
         "label": "Energy / Utilities",
         "keywords": [
-            "kwh", "mw", "power", "voltage", "current", "grid", "load", "consumption",
-            "solar", "wind", "frequency", "pf",
+            "kwh", "mw", "power", "grid", "load", "consumption", "solar", "wind",
+            "frequency", "pf", "transformer", "feeder", "demand_mw",
         ],
+        "exclusive": ["kwh", "mw", "solar", "wind", "grid", "feeder", "transformer"],
+        "negative": ["patient", "churn", "bmi", "sku", "vibration", "rul"],
         "dtypes_hint": "numeric_sensors",
+        "value_hints": {},
     },
     "finance_risk": {
         "label": "Finance / Credit Risk",
         "keywords": [
             "loan", "credit", "score", "default", "interest", "balance", "emi", "income",
-            "fraud", "transaction", "amount", "apr",
+            "fraud", "transaction", "amount", "apr", "collateral", "delinquent",
         ],
+        "exclusive": ["loan", "credit", "default", "emi", "apr", "fraud", "delinquent"],
+        "negative": ["vibration", "patient", "soil", "modbus", "warehouse"],
         "dtypes_hint": "tabular_finance",
+        "value_hints": {},
     },
     "telecom_churn": {
         "label": "Telecom / Churn",
         "keywords": [
             "churn", "tenure", "plan", "minutes", "data_usage", "arpu", "subscriber",
-            "complaint", "call_drop", "sim",
+            "complaint", "call_drop", "sim", "contract", "monthly_charges",
         ],
+        "exclusive": ["churn", "arpu", "tenure", "call_drop", "sim", "subscriber"],
+        "negative": ["vibration", "patient", "bmi", "soil", "rul", "warehouse"],
         "dtypes_hint": "crm",
+        "value_hints": {"tenure": (0, 120), "arpu": (0, 5000)},
     },
     "agriculture_iot": {
         "label": "Agriculture / Agri-IoT",
         "keywords": [
             "soil", "moisture", "humidity", "rainfall", "crop", "yield", "ph", "npk",
-            "irrigation", "farm",
+            "irrigation", "farm", "nitrogen", "pesticide",
         ],
+        "exclusive": ["soil", "crop", "yield", "npk", "irrigation", "farm"],
+        "negative": ["patient", "churn", "loan", "sku", "modbus", "vibration"],
         "dtypes_hint": "numeric_sensors",
+        "value_hints": {"ph": (3, 10), "moisture": (0, 100)},
+    },
+    "hr_people": {
+        "label": "HR / People Analytics",
+        "keywords": [
+            "employee", "salary", "department", "attrition", "hire", "performance",
+            "manager", "job", "satisfaction", "overtime", "hr", "headcount",
+        ],
+        "exclusive": ["employee", "attrition", "salary", "department", "headcount"],
+        "negative": ["vibration", "patient", "soil", "modbus", "kwh"],
+        "dtypes_hint": "hrm",
+        "value_hints": {},
     },
     "generic": {
         "label": "Generic Analytics",
         "keywords": [],
+        "exclusive": [],
+        "negative": [],
         "dtypes_hint": "generic",
+        "value_hints": {},
     },
 }
 
@@ -867,51 +906,494 @@ def clean_data(df: pd.DataFrame, engine: Optional[str] = None) -> tuple[pd.DataF
     return clean_df, table
 
 
+
+def _token_set(cols: list[str]) -> set[str]:
+    toks: set[str] = set()
+    for c in cols:
+        for part in re.split(r"[^a-z0-9]+", str(c).lower()):
+            if part:
+                toks.add(part)
+                toks.add(str(c).lower())
+    return toks
+
+
+def _heuristic_field_scores(df: pd.DataFrame) -> tuple[dict[str, float], dict[str, list[str]], pd.DataFrame]:
+    cols = [str(c).lower() for c in df.columns]
+    col_join = " ".join(cols)
+    toks = _token_set(cols)
+    num_ratio = df.select_dtypes(include=[np.number]).shape[1] / max(1, df.shape[1])
+    rows = []
+    scores: dict[str, float] = {}
+    reasons: dict[str, list[str]] = {}
+    for dom, meta in DOMAIN_CATALOG.items():
+        if dom == "generic":
+            continue
+        hit: list[str] = []
+        sc = 0.0
+        kw = meta.get("keywords") or []
+        for k in kw:
+            if k in toks or k in col_join:
+                sc += 1.2
+                hit.append(k)
+        for k in meta.get("exclusive") or []:
+            if k in toks or k in col_join:
+                sc += 3.5
+                hit.append(f"EXCL:{k}")
+        for k in meta.get("negative") or []:
+            if k in toks or k in col_join:
+                sc -= 2.5
+                hit.append(f"NEG:{k}")
+        # dtype / schema hints
+        if meta.get("dtypes_hint") == "numeric_sensors" and num_ratio > 0.55:
+            sc += 0.8
+        if meta.get("dtypes_hint") == "commerce" and any(k in toks for k in ("revenue", "sales", "order", "gmv")):
+            sc += 1.5
+        if meta.get("dtypes_hint") == "mixed_clinical" and any(k in toks for k in ("patient", "bmi", "glucose")):
+            sc += 1.5
+        if meta.get("dtypes_hint") == "crm" and any(k in toks for k in ("churn", "arpu", "tenure")):
+            sc += 1.5
+        # value-range fingerprints
+        for hint_col, (lo, hi) in (meta.get("value_hints") or {}).items():
+            real = _col(df, hint_col)
+            if real:
+                s = pd.to_numeric(df[real], errors="coerce").dropna()
+                if len(s) >= 5:
+                    m = float(s.median())
+                    if lo <= m <= hi:
+                        sc += 1.8
+                        hit.append(f"RANGE:{hint_col}~{m:.2f}")
+                    else:
+                        sc -= 0.8
+        scores[dom] = max(0.0, sc)
+        reasons[dom] = hit[:14]
+        rows.append({"domain": dom, "label": meta["label"], "heuristic_score": round(scores[dom], 3), "hits": ", ".join(hit[:8])})
+    scoreboard = pd.DataFrame(rows).sort_values("heuristic_score", ascending=False).reset_index(drop=True)
+    return scores, reasons, scoreboard
+
+
+def _schema_feature_vector(df: pd.DataFrame) -> np.ndarray:
+    """Numeric feature vector used by Optuna-tuned domain classifier."""
+    cols = [str(c).lower() for c in df.columns]
+    col_join = " ".join(cols)
+    toks = _token_set(cols)
+    feats: list[float] = []
+    domain_keys = [d for d in DOMAIN_CATALOG if d != "generic"]
+    for dom in domain_keys:
+        meta = DOMAIN_CATALOG[dom]
+        kw_hits = sum(1 for k in meta["keywords"] if k in toks or k in col_join)
+        ex_hits = sum(1 for k in meta.get("exclusive", []) if k in toks or k in col_join)
+        neg_hits = sum(1 for k in meta.get("negative", []) if k in toks or k in col_join)
+        feats.extend([kw_hits, ex_hits, neg_hits, kw_hits / max(1, len(meta["keywords"]))])
+    num_ratio = df.select_dtypes(include=[np.number]).shape[1] / max(1, df.shape[1])
+    cat_ratio = df.select_dtypes(include=["object", "category"]).shape[1] / max(1, df.shape[1])
+    has_dt = 1.0 if _col(df, "timestamp", "date", "datetime", "time") else 0.0
+    feats.extend([num_ratio, cat_ratio, has_dt, float(df.shape[0]), float(df.shape[1])])
+    return np.asarray(feats, dtype=float)
+
+
+def _synthetic_domain_training_set(n_per: int = 40) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Build synthetic schema vectors so Optuna can tune a domain classifier without labels."""
+    rng = np.random.default_rng(42)
+    domain_keys = [d for d in DOMAIN_CATALOG if d != "generic"]
+    X_rows: list[np.ndarray] = []
+    y: list[str] = []
+    for dom in domain_keys:
+        meta = DOMAIN_CATALOG[dom]
+        for _ in range(n_per):
+            # fake dataframe with domain-ish columns
+            chosen = list(rng.choice(meta["keywords"], size=min(8, len(meta["keywords"])), replace=False))
+            for ex in meta.get("exclusive", [])[:3]:
+                if ex not in chosen:
+                    chosen.append(ex)
+            # occasional noise columns from other domains
+            other = [d for d in domain_keys if d != dom]
+            noise_dom = rng.choice(other)
+            noise = list(rng.choice(DOMAIN_CATALOG[noise_dom]["keywords"], size=2, replace=False))
+            cols = chosen + noise + ["id", "notes"]
+            data = {}
+            for c in cols:
+                if c in ("id", "notes"):
+                    data[c] = [f"{c}{i}" for i in range(30)]
+                else:
+                    data[c] = rng.normal(50, 10, 30)
+            fake = pd.DataFrame(data)
+            X_rows.append(_schema_feature_vector(fake))
+            y.append(dom)
+    return np.vstack(X_rows), np.asarray(y), domain_keys
+
+
+@st.cache_resource(show_spinner=False)
+def _fit_optuna_field_model(n_trials: int = 25) -> dict[str, Any]:
+    """Optuna-tunes RF/GBM for domain classification on synthetic schema fingerprints."""
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    X, y, domains = _synthetic_domain_training_set(40)
+    le = LabelEncoder()
+    y_enc = le.fit_transform(y)
+
+    def objective(trial: Any) -> float:
+        model_name = trial.suggest_categorical("model", ["RandomForest", "GradientBoosting"])
+        if model_name == "RandomForest":
+            model = RandomForestClassifier(
+                n_estimators=trial.suggest_int("n_estimators", 80, 250),
+                max_depth=trial.suggest_int("max_depth", 3, 16),
+                min_samples_leaf=trial.suggest_int("min_samples_leaf", 1, 5),
+                random_state=42,
+                n_jobs=-1,
+            )
+        else:
+            model = GradientBoostingClassifier(
+                n_estimators=trial.suggest_int("n_estimators", 60, 180),
+                max_depth=trial.suggest_int("max_depth", 2, 6),
+                learning_rate=trial.suggest_float("learning_rate", 0.03, 0.25, log=True),
+                random_state=42,
+            )
+        scores = cross_val_score(model, X, y_enc, cv=4, scoring="accuracy")
+        return float(scores.mean())
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=int(n_trials), show_progress_bar=False)
+    best = study.best_params
+    model_name = best.pop("model")
+    if model_name == "RandomForest":
+        model = RandomForestClassifier(random_state=42, n_jobs=-1, **best)
+    else:
+        model = GradientBoostingClassifier(random_state=42, **best)
+    model.fit(X, y_enc)
+    return {
+        "ok": True,
+        "model": model,
+        "label_encoder": le,
+        "domains": domains,
+        "best_params": {"model": model_name, **best},
+        "cv_accuracy": round(float(study.best_value), 4),
+        "n_trials": n_trials,
+    }
+
+
+def _optuna_predict_field(df: pd.DataFrame, n_trials: int = 25) -> dict[str, Any]:
+    pack = _fit_optuna_field_model(n_trials=n_trials)
+    if not pack.get("ok"):
+        return {"ok": False, "error": pack.get("error", "optuna field model failed")}
+    vec = _schema_feature_vector(df).reshape(1, -1)
+    model = pack["model"]
+    le: LabelEncoder = pack["label_encoder"]
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(vec)[0]
+        order = np.argsort(-proba)
+        top_i = int(order[0])
+        ranking = [
+            {"domain": le.classes_[i], "prob": round(float(proba[i]), 4)}
+            for i in order[:5]
+        ]
+        return {
+            "ok": True,
+            "domain": str(le.classes_[top_i]),
+            "confidence": round(float(proba[top_i]), 4),
+            "ranking": ranking,
+            "best_params": pack["best_params"],
+            "cv_accuracy": pack["cv_accuracy"],
+            "proba_table": pd.DataFrame(ranking),
+        }
+    pred = model.predict(vec)[0]
+    dom = str(le.inverse_transform([pred])[0])
+    return {"ok": True, "domain": dom, "confidence": 0.7, "ranking": [{"domain": dom, "prob": 0.7}], "best_params": pack["best_params"], "cv_accuracy": pack["cv_accuracy"], "proba_table": pd.DataFrame([{"domain": dom, "prob": 0.7}])}
+
+
+def detect_field(df: pd.DataFrame, use_gemini: bool = True, optuna_trials: int = 25) -> dict[str, Any]:
+    """
+    Multi-signal field detection:
+    1) keyword/exclusive/negative + value-range heuristics
+    2) Optuna-tuned RF/GBM on schema fingerprints
+    3) Gemini LLM schema classify (optional)
+    Ensemble votes → final domain + confidence + scoreboard dataframes.
+    """
+    scores, reasons, scoreboard = _heuristic_field_scores(df)
+    if scores:
+        heur = max(scores, key=scores.get)
+        heur_conf = scores[heur] / max(1.0, max(scores.values()) or 1.0)
+    else:
+        heur, heur_conf = "generic", 0.2
+
+    opt = _optuna_predict_field(df, n_trials=optuna_trials)
+    opt_domain = opt.get("domain") if opt.get("ok") else None
+    opt_conf = float(opt.get("confidence") or 0.0) if opt.get("ok") else 0.0
+
+    gemini_domain = None
+    gemini_raw = ""
+    gemini_why = ""
+    gconf = 0.0
+    if use_gemini and get_gemini_api_key():
+        schema = [
+            {"column": str(c), "dtype": str(df[c].dtype), "sample": [str(x) for x in df[c].dropna().head(3).tolist()]}
+            for c in df.columns[:40]
+        ]
+        prompt = (
+            "Classify this dataset into ONE domain key from: "
+            + ", ".join(DOMAIN_CATALOG.keys())
+            + ".\nPrefer exclusive signals (e.g. churn→telecom_churn, patient/bmi→healthcare, "
+            "revenue/sku→sales_forecasting, vibration/rul→predictive_maintenance).\n"
+            "Return JSON only: {\"domain\": \"...\", \"confidence\": 0-1, \"why\": \"...\"}\n"
+            f"Columns/dtypes/samples: {json.dumps(schema)[:4500]}"
+        )
+        gemini_raw = _gemini_answer(prompt)
+        try:
+            start = gemini_raw.find("{")
+            end = gemini_raw.rfind("}") + 1
+            if start >= 0 and end > start:
+                payload = json.loads(gemini_raw[start:end])
+                gd = str(payload.get("domain", "")).strip()
+                if gd in DOMAIN_CATALOG:
+                    gemini_domain = gd
+                    gconf = float(payload.get("confidence", 0.85))
+                    gemini_why = str(payload.get("why", ""))
+        except Exception:
+            pass
+
+    # Weighted ensemble (exclusive heuristic hard-wins when strong)
+    vote: dict[str, float] = {}
+    for d, sc in scores.items():
+        vote[d] = vote.get(d, 0.0) + 0.35 * (sc / max(1.0, max(scores.values()) or 1.0))
+    if opt_domain and opt_domain in DOMAIN_CATALOG:
+        vote[opt_domain] = vote.get(opt_domain, 0.0) + 0.40 * opt_conf
+    if gemini_domain and gemini_domain in DOMAIN_CATALOG:
+        vote[gemini_domain] = vote.get(gemini_domain, 0.0) + 0.25 * gconf
+
+    # Hard boost: if exclusive hits ≥2 for a domain, lock preference
+    for d, hits in reasons.items():
+        excl = sum(1 for h in hits if str(h).startswith("EXCL:"))
+        if excl >= 2:
+            vote[d] = vote.get(d, 0.0) + 0.35
+
+    if vote:
+        final = max(vote, key=vote.get)
+        conf = float(min(0.99, max(0.3, vote[final])))
+    else:
+        final, conf = "generic", 0.25
+
+    # If heuristic exclusive clearly beats optuna (sales vs energy confusion), trust exclusive
+    if scores.get(heur, 0) >= 6 and (not opt_domain or scores.get(opt_domain, 0) < scores.get(heur, 0) * 0.6):
+        if any(str(h).startswith("EXCL:") for h in reasons.get(heur, [])):
+            final = heur
+            conf = max(conf, min(0.97, 0.55 + 0.05 * scores[heur]))
+
+    vote_df = pd.DataFrame(
+        [{"domain": d, "ensemble_vote": round(v, 4), "label": DOMAIN_CATALOG[d]["label"]} for d, v in vote.items()]
+    ).sort_values("ensemble_vote", ascending=False).reset_index(drop=True)
+
+    return {
+        "domain": final,
+        "label": DOMAIN_CATALOG[final]["label"],
+        "confidence": round(conf, 3),
+        "heuristic": heur,
+        "heuristic_scores": scores,
+        "reasons": reasons.get(final) or reasons.get(heur) or [],
+        "gemini_domain": gemini_domain,
+        "gemini_why": gemini_why,
+        "gemini_raw": gemini_raw[:500],
+        "optuna": {
+            "domain": opt_domain,
+            "confidence": opt_conf,
+            "cv_accuracy": opt.get("cv_accuracy"),
+            "best_params": opt.get("best_params"),
+            "ranking": opt.get("ranking"),
+        },
+        "scoreboard": scoreboard,
+        "vote_table": vote_df,
+        "optuna_proba_table": opt.get("proba_table"),
+    }
+
+def discover_filter_columns(df: pd.DataFrame) -> dict[str, Optional[str]]:
+    """Find loc / date / time / people columns across any domain."""
+    loc = _col(df, "location", "loc", "region", "city", "store", "warehouse", "site", "plant", "branch", "state", "country", "ward", "department")
+    date = _col(df, "date", "timestamp", "datetime", "day", "order_date", "admit_date", "hire_date")
+    time_c = _col(df, "time", "hour", "timestamp", "datetime")
+    people = _col(df, "customer", "customer_id", "patient", "patient_id", "employee", "employee_id", "user", "user_id", "subscriber", "person", "name")
+    return {"location": loc, "date": date, "time": time_c, "people": people}
+
+
+def apply_analytic_filters(
+    df: pd.DataFrame,
+    location_vals: Optional[list[Any]] = None,
+    people_vals: Optional[list[Any]] = None,
+    date_start: Any = None,
+    date_end: Any = None,
+) -> tuple[pd.DataFrame, dict[str, Optional[str]]]:
+    cols = discover_filter_columns(df)
+    out = df.copy()
+    if cols["location"] and location_vals:
+        out = out[out[cols["location"]].astype(str).isin([str(v) for v in location_vals])]
+    if cols["people"] and people_vals:
+        out = out[out[cols["people"]].astype(str).isin([str(v) for v in people_vals])]
+    dcol = cols["date"] or cols["time"]
+    if dcol and (date_start is not None or date_end is not None):
+        parsed = pd.to_datetime(out[dcol], errors="coerce")
+        if date_start is not None:
+            out = out[parsed >= pd.to_datetime(date_start)]
+            parsed = pd.to_datetime(out[dcol], errors="coerce")
+        if date_end is not None:
+            out = out[parsed <= pd.to_datetime(date_end)]
+    return out, cols
+
+
+def render_filter_bar(df: pd.DataFrame, key_prefix: str = "kpi") -> pd.DataFrame:
+    """Shared loc/date/time/people filters for KPIs and Charts."""
+    cols = discover_filter_columns(df)
+    st.markdown("##### Filters (loc · date · time · people)")
+    c1, c2, c3, c4 = st.columns(4)
+    location_vals = None
+    people_vals = None
+    date_start = date_end = None
+    with c1:
+        if cols["location"]:
+            opts = sorted(df[cols["location"]].dropna().astype(str).unique().tolist())[:200]
+            location_vals = st.multiselect("Location", opts, default=[], key=f"{key_prefix}_loc")
+        else:
+            st.caption("No location column")
+    with c2:
+        dcol = cols["date"] or cols["time"]
+        if dcol:
+            parsed = pd.to_datetime(df[dcol], errors="coerce").dropna()
+            if len(parsed):
+                mn, mx = parsed.min().date(), parsed.max().date()
+                picked = st.date_input("Date range", value=(mn, mx), key=f"{key_prefix}_dates")
+                if isinstance(picked, (list, tuple)) and len(picked) == 2:
+                    date_start, date_end = picked[0], picked[1]
+            else:
+                st.caption("Date unparsable")
+        else:
+            st.caption("No date/time column")
+    with c3:
+        if cols["time"] and cols["time"] != cols["date"]:
+            st.caption(f"Time col: `{cols['time']}`")
+        else:
+            st.caption("Time uses date/timestamp")
+    with c4:
+        if cols["people"]:
+            opts = sorted(df[cols["people"]].dropna().astype(str).unique().tolist())[:200]
+            people_vals = st.multiselect("People", opts, default=[], key=f"{key_prefix}_people")
+        else:
+            st.caption("No people column")
+    filtered, _ = apply_analytic_filters(df, location_vals or None, people_vals or None, date_start, date_end)
+    st.caption(f"Filtered rows: **{len(filtered):,}** / {len(df):,}")
+    return filtered
+
+
+def _mean(df: pd.DataFrame, *names: str) -> Any:
+    c = _col(df, *names)
+    if not c:
+        return "—"
+    s = pd.to_numeric(df[c], errors="coerce")
+    return round(float(s.mean()), 3) if s.notna().any() else "—"
+
+
+def _sum(df: pd.DataFrame, *names: str) -> Any:
+    c = _col(df, *names)
+    if not c:
+        return "—"
+    s = pd.to_numeric(df[c], errors="coerce")
+    return round(float(s.sum()), 2) if s.notna().any() else "—"
+
 def get_kpis(df: pd.DataFrame) -> dict[str, Any]:
+    """Domain-aware KPI dictionary (numbers for square metric boxes)."""
     n_rows, n_cols = df.shape
     miss = round(float(df.isna().sum().sum() / max(1, df.size) * 100), 2)
-    domain = st.session_state.get("domain") or "generic"
-    tcol = _col(df, "temperature", "temp")
-    vcol = _col(df, "vibration", "vib")
-    pcol = _col(df, "pressure")
-    rcol = _col(df, "rul", "remaining_useful_life")
-    fcol = _col(df, "failure", "fault", "alarm")
+    domain = st.session_state.get("domain") or detect_field(df, use_gemini=False, optuna_trials=8).get("domain", "generic")
+    base = {"Rows": int(n_rows), "Cols": int(n_cols), "Missing%": miss, "Domain": DOMAIN_CATALOG.get(domain, {}).get("label", domain)}
 
-    def mean_of(col: Optional[str]) -> Any:
-        if not col:
-            return "—"
-        s = pd.to_numeric(df[col], errors="coerce")
-        if s.notna().sum() == 0:
-            return "—"
-        return round(float(s.mean()), 3)
-
-    kpis = {
-        "Rows": int(n_rows),
-        "Cols": int(n_cols),
-        "Missing%": miss,
-        "Mean_temp": mean_of(tcol),
-        "Mean_vib": mean_of(vcol),
-        "Mean_pressure": mean_of(pcol),
-        "Mean_RUL": mean_of(rcol),
-        "Failure_Count": int(pd.to_numeric(df[fcol], errors="coerce").fillna(0).sum()) if fcol else 0,
-        "Min_RUL": (
-            round(float(pd.to_numeric(df[rcol], errors="coerce").min()), 2)
-            if rcol and pd.to_numeric(df[rcol], errors="coerce").notna().any()
-            else "—"
-        ),
-    }
-    if domain == "healthcare":
+    if domain == "predictive_maintenance":
+        fcol = _col(df, "failure", "fault", "alarm")
+        rcol = _col(df, "rul", "remaining_useful_life")
+        base.update({
+            "Mean_temp": _mean(df, "temperature", "temp"),
+            "Mean_vib": _mean(df, "vibration", "vib"),
+            "Mean_pressure": _mean(df, "pressure"),
+            "Failure_Count": int(pd.to_numeric(df[fcol], errors="coerce").fillna(0).sum()) if fcol else 0,
+            "Min_RUL": round(float(pd.to_numeric(df[rcol], errors="coerce").min()), 2) if rcol and pd.to_numeric(df[rcol], errors="coerce").notna().any() else "—",
+        })
+    elif domain == "healthcare":
+        base.update({
+            "Mean_Age": _mean(df, "age"),
+            "Mean_BP": _mean(df, "bp", "blood_pressure", "systolic"),
+            "Mean_Glucose": _mean(df, "glucose", "blood_sugar"),
+            "Patients": int(df[_col(df, "patient", "patient_id")].nunique()) if _col(df, "patient", "patient_id") else n_rows,
+        })
         w, h = _col(df, "weight"), _col(df, "height")
         if w and h:
             ww = pd.to_numeric(df[w], errors="coerce")
-            hh = pd.to_numeric(df[h], errors="coerce") / 100.0
-            bmi = ww / (hh.replace(0, np.nan) ** 2)
-            kpis["Mean_BMI"] = round(float(bmi.mean()), 2) if bmi.notna().any() else "—"
-    if domain == "sales_forecasting":
-        rev = _col(df, "revenue", "sales", "gmv", "amount")
-        kpis["Total_Revenue"] = round(float(pd.to_numeric(df[rev], errors="coerce").sum()), 2) if rev else "—"
-    return kpis
-
+            hh = pd.to_numeric(df[h], errors="coerce")
+            hh_m = np.where(hh > 3, hh / 100.0, hh)
+            bmi = ww / np.square(np.where(hh_m == 0, np.nan, hh_m))
+            base["Mean_BMI"] = round(float(np.nanmean(bmi)), 2) if np.isfinite(np.nanmean(bmi)) else "—"
+        readm = _col(df, "readmission")
+        if readm:
+            base["Readmission%"] = round(float(pd.to_numeric(df[readm], errors="coerce").fillna(0).mean() * 100), 1)
+    elif domain == "sales_forecasting":
+        base.update({
+            "Total_Revenue": _sum(df, "revenue", "sales", "gmv", "amount"),
+            "Avg_Order": _mean(df, "revenue", "sales", "amount"),
+            "Units": _sum(df, "units", "qty", "quantity"),
+            "Customers": int(df[_col(df, "customer", "customer_id")].nunique()) if _col(df, "customer", "customer_id") else "—",
+            "SKUs": int(df[_col(df, "sku", "product")].nunique()) if _col(df, "sku", "product") else "—",
+        })
+    elif domain == "telecom_churn":
+        churn = _col(df, "churn")
+        base.update({
+            "Churn%": round(float(pd.to_numeric(df[churn], errors="coerce").fillna(0).mean() * 100), 2) if churn else "—",
+            "Mean_Tenure": _mean(df, "tenure"),
+            "Mean_ARPU": _mean(df, "arpu", "monthly_charges", "revenue"),
+            "Subscribers": int(df[_col(df, "subscriber", "customer", "customer_id")].nunique()) if _col(df, "subscriber", "customer", "customer_id") else n_rows,
+        })
+    elif domain == "finance_risk":
+        default_c = _col(df, "default", "delinquent", "fraud")
+        base.update({
+            "Default%": round(float(pd.to_numeric(df[default_c], errors="coerce").fillna(0).mean() * 100), 2) if default_c else "—",
+            "Mean_Loan": _mean(df, "loan", "loan_amount", "amount", "balance"),
+            "Mean_Income": _mean(df, "income", "annual_income"),
+            "Mean_Score": _mean(df, "credit_score", "score"),
+        })
+    elif domain == "warehouse_logistics":
+        base.update({
+            "Total_Stock": _sum(df, "inventory", "stock", "on_hand"),
+            "Mean_LeadTime": _mean(df, "lead_time", "leadtime"),
+            "Shipments": _sum(df, "shipment", "shipments", "orders"),
+            "SKUs": int(df[_col(df, "sku")].nunique()) if _col(df, "sku") else "—",
+        })
+    elif domain == "energy_utilities":
+        base.update({
+            "Mean_Load": _mean(df, "load", "consumption", "kwh", "mw", "power"),
+            "Peak_Load": (
+                round(float(pd.to_numeric(df[_col(df, "load", "consumption", "kwh", "mw", "power")], errors="coerce").max()), 2)
+                if _col(df, "load", "consumption", "kwh", "mw", "power") else "—"
+            ),
+            "Mean_Voltage": _mean(df, "voltage"),
+            "Mean_Current": _mean(df, "current"),
+        })
+    elif domain == "agriculture_iot":
+        base.update({
+            "Mean_Moisture": _mean(df, "moisture", "soil_moisture"),
+            "Mean_Rainfall": _mean(df, "rainfall", "rain"),
+            "Mean_pH": _mean(df, "ph"),
+            "Mean_Yield": _mean(df, "yield", "crop_yield"),
+        })
+    elif domain == "hr_people":
+        attr = _col(df, "attrition", "churn")
+        base.update({
+            "Headcount": int(df[_col(df, "employee", "employee_id")].nunique()) if _col(df, "employee", "employee_id") else n_rows,
+            "Mean_Salary": _mean(df, "salary", "compensation", "pay"),
+            "Attrition%": round(float(pd.to_numeric(df[attr], errors="coerce").fillna(0).mean() * 100), 2) if attr else "—",
+            "Departments": int(df[_col(df, "department")].nunique()) if _col(df, "department") else "—",
+        })
+    else:
+        # generic numeric summary
+        nums = df.select_dtypes(include=[np.number]).columns.tolist()[:4]
+        for c in nums:
+            base[f"Mean_{c}"] = round(float(pd.to_numeric(df[c], errors="coerce").mean()), 3)
+    return base
 
 def apply_domain_feature_engineering(df: pd.DataFrame, domain: str) -> pd.DataFrame:
     out = df.copy()
@@ -1003,85 +1485,230 @@ def apply_domain_feature_engineering(df: pd.DataFrame, domain: str) -> pd.DataFr
             )
         if ph:
             out["ph_dev_neutral"] = (pd.to_numeric(out[ph], errors="coerce") - 7.0).abs()
+    elif domain == "hr_people":
+        sal = _col(out, "salary", "compensation", "pay")
+        if sal:
+            out["salary_z"] = (
+                pd.to_numeric(out[sal], errors="coerce") - pd.to_numeric(out[sal], errors="coerce").mean()
+            ) / (pd.to_numeric(out[sal], errors="coerce").std() or 1)
+        attr = _col(out, "attrition")
+        if attr:
+            out["attrition_flag"] = pd.to_numeric(out[attr], errors="coerce").fillna(0)
     return out
 
 
-def detect_field(df: pd.DataFrame, use_gemini: bool = True) -> dict[str, Any]:
-    cols = [str(c).lower() for c in df.columns]
-    col_join = " ".join(cols)
-    scores: dict[str, float] = {}
-    reasons: dict[str, list[str]] = {}
-    for dom, meta in DOMAIN_CATALOG.items():
-        if dom == "generic":
-            continue
-        hit = []
-        sc = 0.0
-        for kw in meta["keywords"]:
-            if kw in col_join:
-                sc += 1.0
-                hit.append(kw)
-        num_ratio = df.select_dtypes(include=[np.number]).shape[1] / max(1, df.shape[1])
-        if meta["dtypes_hint"] == "numeric_sensors" and num_ratio > 0.6:
-            sc += 1.5
-            hit.append("numeric_sensor_schema")
-        if meta["dtypes_hint"] == "commerce" and any(k in col_join for k in ("revenue", "sales", "order")):
-            sc += 1.0
-        scores[dom] = sc
-        reasons[dom] = hit[:12]
-    if scores:
-        heur = max(scores, key=scores.get)
-        heur_conf = scores[heur] / max(1.0, max(scores.values()))
-    else:
-        heur, heur_conf = "generic", 0.2
 
-    gemini_domain = None
-    gemini_raw = ""
-    if use_gemini and get_gemini_api_key():
-        schema = [{"column": str(c), "dtype": str(df[c].dtype), "sample": [str(x) for x in df[c].dropna().head(3).tolist()]} for c in df.columns[:40]]
-        prompt = (
-            "Classify this industrial/business dataset into ONE domain key from: "
-            + ", ".join(DOMAIN_CATALOG.keys())
-            + ".\nReturn JSON only: {\"domain\": \"...\", \"confidence\": 0-1, \"why\": \"...\"}\n"
-            f"Columns/dtypes/samples: {json.dumps(schema)[:4000]}"
-        )
-        gemini_raw = _gemini_answer(prompt)
-        try:
-            start = gemini_raw.find("{")
-            end = gemini_raw.rfind("}") + 1
-            if start >= 0 and end > start:
-                payload = json.loads(gemini_raw[start:end])
-                gd = str(payload.get("domain", "")).strip()
-                if gd in DOMAIN_CATALOG:
-                    gemini_domain = gd
-                    gconf = float(payload.get("confidence", 0.9))
-                    final = gemini_domain
-                    conf = min(0.98, 0.55 * heur_conf + 0.45 * gconf + (0.2 if gemini_domain == heur else 0))
-                    return {
-                        "domain": final,
-                        "label": DOMAIN_CATALOG[final]["label"],
-                        "confidence": round(conf, 3),
-                        "heuristic": heur,
-                        "heuristic_scores": scores,
-                        "reasons": reasons.get(final) or reasons.get(heur) or [],
-                        "gemini_domain": gemini_domain,
-                        "gemini_why": payload.get("why", ""),
-                        "gemini_raw": gemini_raw[:500],
-                    }
-        except Exception:
-            pass
-
-    final = heur if scores.get(heur, 0) > 0 else "generic"
-    return {
-        "domain": final,
-        "label": DOMAIN_CATALOG[final]["label"],
-        "confidence": round(float(min(0.92, max(0.25, heur_conf))), 3),
-        "heuristic": heur,
-        "heuristic_scores": scores,
-        "reasons": reasons.get(final, []),
-        "gemini_domain": gemini_domain,
-        "gemini_why": "",
-        "gemini_raw": gemini_raw[:500],
+def kpi_group_comparisons(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Loc-to-loc and time-to-time average tables for Auto KPIs."""
+    out: dict[str, pd.DataFrame] = {}
+    cols = discover_filter_columns(df)
+    domain = st.session_state.get("domain") or "generic"
+    metric_candidates = {
+        "sales_forecasting": ["revenue", "sales", "gmv", "amount", "units"],
+        "healthcare": ["age", "bmi", "glucose", "bp", "systolic", "readmission"],
+        "telecom_churn": ["churn", "arpu", "tenure", "monthly_charges"],
+        "predictive_maintenance": ["temperature", "vibration", "pressure", "rul", "failure"],
+        "finance_risk": ["loan_amount", "amount", "default", "credit_score", "income"],
+        "warehouse_logistics": ["inventory", "stock", "lead_time", "shipments"],
+        "energy_utilities": ["load", "kwh", "mw", "power", "voltage"],
+        "agriculture_iot": ["moisture", "yield", "rainfall", "ph"],
+        "hr_people": ["salary", "attrition", "performance"],
     }
+    names = metric_candidates.get(domain, [])
+    metric = None
+    for n in names:
+        metric = _col(df, n)
+        if metric:
+            break
+    if metric is None:
+        nums = df.select_dtypes(include=[np.number]).columns.tolist()
+        metric = nums[0] if nums else None
+    if metric is None:
+        return out
+
+    if cols["location"]:
+        g = df.groupby(cols["location"], dropna=False)[metric].agg(["mean", "sum", "count"]).reset_index()
+        g.columns = [cols["location"], f"avg_{metric}", f"sum_{metric}", "rows"]
+        g = g.sort_values(f"avg_{metric}", ascending=False)
+        out["loc_to_loc"] = g
+    dcol = cols["date"] or cols["time"]
+    if dcol:
+        tmp = df.copy()
+        tmp["_period"] = pd.to_datetime(tmp[dcol], errors="coerce").dt.to_period("M").astype(str)
+        g2 = tmp.dropna(subset=["_period"]).groupby("_period")[metric].agg(["mean", "sum", "count"]).reset_index()
+        g2.columns = ["period", f"avg_{metric}", f"sum_{metric}", "rows"]
+        out["time_to_time"] = g2
+    return out
+
+
+def kpi_model_insight(df: pd.DataFrame, comparisons: dict[str, pd.DataFrame]) -> str:
+    """Simple model insight: weakest location / trend direction."""
+    bits = []
+    domain = st.session_state.get("domain") or "generic"
+    if "loc_to_loc" in comparisons and len(comparisons["loc_to_loc"]) >= 2:
+        tab = comparisons["loc_to_loc"]
+        avg_col = [c for c in tab.columns if c.startswith("avg_")][0]
+        worst = tab.iloc[-1]
+        best = tab.iloc[0]
+        bits.append(
+            f"Loc-to-loc: **{best.iloc[0]}** leads ({avg_col}={best[avg_col]:.2f}); "
+            f"**{worst.iloc[0]}** is lowest ({avg_col}={worst[avg_col]:.2f})."
+        )
+    if "time_to_time" in comparisons and len(comparisons["time_to_time"]) >= 3:
+        tab = comparisons["time_to_time"]
+        avg_col = [c for c in tab.columns if c.startswith("avg_")][0]
+        y = pd.to_numeric(tab[avg_col], errors="coerce").dropna()
+        if len(y) >= 3:
+            slope = float(np.polyfit(np.arange(len(y)), y.to_numpy(), 1)[0])
+            direction = "rising" if slope > 0 else "falling"
+            bits.append(f"Time-to-time trend for `{avg_col}` is **{direction}** (slope={slope:.4f} per period).")
+            # quick RF level check on last vs predicted next
+            try:
+                X = np.arange(len(y)).reshape(-1, 1)
+                rf = RandomForestRegressor(n_estimators=80, random_state=42)
+                rf.fit(X, y)
+                nxt = float(rf.predict([[len(y)]])[0])
+                pct = (nxt - float(y.iloc[-1])) / abs(float(y.iloc[-1]) or 1) * 100
+                bits.append(f"RF next-period forecast ≈ **{nxt:.2f}** ({pct:+.1f}% vs last).")
+            except Exception:
+                pass
+    if not bits:
+        bits.append(f"Domain **{DOMAIN_CATALOG.get(domain, {}).get('label', domain)}** — add location/date columns for loc/time KPIs.")
+    return " ".join(bits)
+
+
+def render_kpi_boxes(kpis: dict[str, Any], per_row: int = 4) -> None:
+    """Square-ish bordered metric boxes."""
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stMetric"] {
+            background: linear-gradient(180deg, #f7fafc 0%, #eef2f7 100%);
+            border: 1px solid #d0d7de;
+            border-radius: 12px;
+            padding: 14px 16px;
+            box-shadow: 0 1px 2px rgba(16,24,40,.04);
+            min-height: 96px;
+        }
+        div[data-testid="stMetric"] label { font-weight: 600; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    items = [(k, v) for k, v in kpis.items() if k != "Domain"]
+    if "Domain" in kpis:
+        st.caption(f"KPI pack for: **{kpis['Domain']}**")
+    for i in range(0, len(items), per_row):
+        cols = st.columns(per_row)
+        for j, (k, v) in enumerate(items[i : i + per_row]):
+            with cols[j]:
+                st.metric(str(k).replace("_", " "), v)
+
+
+def chart_business_insight(df: pd.DataFrame, x: str, y: str) -> str:
+    """Plain-language insight under charts (e.g. revenue by location will drop)."""
+    work = df[[x, y]].copy() if x in df.columns and y in df.columns else df.copy()
+    if x not in work.columns or y not in work.columns:
+        return "Select valid X/Y columns for insights."
+    ynum = pd.to_numeric(work[y], errors="coerce")
+    if ynum.notna().sum() < 3:
+        return f"Not enough numeric values in `{y}` for prediction."
+
+    # categorical X → compare groups
+    if not pd.api.types.is_numeric_dtype(work[x]) or work[x].nunique() < max(3, len(work) // 10):
+        g = work.assign(_y=ynum).groupby(x, dropna=False)["_y"].mean().sort_values()
+        if len(g) >= 2:
+            low, high = g.index[0], g.index[-1]
+            msg = (
+                f"**{y}** is lowest for **{low}** (avg={g.iloc[0]:.2f}) and highest for **{high}** "
+                f"(avg={g.iloc[-1]:.2f}). Gap={g.iloc[-1]-g.iloc[0]:.2f}."
+            )
+            # forecast overall
+            try:
+                s = ynum.dropna()
+                slope = float(np.polyfit(np.arange(len(s)), s.to_numpy(), 1)[0])
+                future = float(s.iloc[-1] + slope * max(5, len(s) // 10))
+                pct = (future - float(s.iloc[-1])) / abs(float(s.iloc[-1]) or 1) * 100
+                direction = "increase" if pct >= 0 else "drop"
+                msg += f" Overall `{y}` is likely to **{direction} ~{abs(pct):.1f}%** in the near future (trend model)."
+            except Exception:
+                pass
+            return msg
+
+    # numeric X/Y — correlation + trend
+    tmp = pd.DataFrame({"x": pd.to_numeric(work[x], errors="coerce"), "y": ynum}).dropna()
+    if len(tmp) < 5:
+        return "Need more points for numeric insight."
+    corr = float(tmp["x"].corr(tmp["y"]))
+    slope = float(np.polyfit(tmp["x"], tmp["y"], 1)[0])
+    direction = "rise" if slope > 0 else "fall"
+    return (
+        f"`{y}` vs `{x}`: correlation={corr:.2f}. As `{x}` grows, `{y}` tends to **{direction}** "
+        f"(slope={slope:.4f})."
+    )
+
+
+def render_adaptive_chart(df: pd.DataFrame, x: str, y: str, chart_type: str, library: str, color: Optional[str] = None) -> None:
+    plot_df = df.copy()
+    if library == "plotly":
+        if chart_type == "line":
+            fig = px.line(plot_df, x=x, y=y, color=color, title=f"{y} by {x}")
+        elif chart_type == "bar":
+            fig = px.bar(plot_df, x=x, y=y, color=color, title=f"{y} by {x}")
+        elif chart_type == "scatter":
+            fig = px.scatter(plot_df, x=x, y=y, color=color, title=f"{y} vs {x}")
+        elif chart_type == "pie":
+            fig = px.pie(plot_df, names=x, values=y, title=f"{y} share by {x}")
+        else:
+            # heatmap via pivot if possible
+            if color and color in plot_df.columns:
+                piv = plot_df.pivot_table(index=x, columns=color, values=y, aggfunc="mean")
+                fig = px.imshow(piv, title=f"Heatmap {y}", aspect="auto")
+            else:
+                fig = px.density_heatmap(plot_df, x=x, y=y, title=f"Density {y} vs {x}")
+        st.plotly_chart(fig, use_container_width=True)
+        return
+
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    try:
+        if library == "seaborn":
+            if chart_type == "line":
+                sns.lineplot(data=plot_df, x=x, y=y, hue=color, ax=ax)
+            elif chart_type == "bar":
+                sns.barplot(data=plot_df, x=x, y=y, hue=color, ax=ax, errorbar=None)
+            elif chart_type == "scatter":
+                sns.scatterplot(data=plot_df, x=x, y=y, hue=color, ax=ax)
+            elif chart_type == "pie":
+                pie = plot_df.groupby(x, dropna=False)[y].sum()
+                ax.pie(pie.values, labels=pie.index.astype(str), autopct="%1.1f%%")
+                ax.set_ylabel("")
+            else:
+                if color and color in plot_df.columns:
+                    piv = plot_df.pivot_table(index=x, columns=color, values=y, aggfunc="mean")
+                    sns.heatmap(piv, ax=ax, cmap="mako")
+                else:
+                    sns.histplot(data=plot_df, x=y, ax=ax)
+        else:  # matplotlib
+            if chart_type == "line":
+                ax.plot(plot_df[x], pd.to_numeric(plot_df[y], errors="coerce"))
+            elif chart_type == "bar":
+                g = plot_df.groupby(x, dropna=False)[y].mean()
+                ax.bar(g.index.astype(str), g.values)
+                ax.tick_params(axis="x", rotation=45)
+            elif chart_type == "scatter":
+                ax.scatter(pd.to_numeric(plot_df[x], errors="coerce"), pd.to_numeric(plot_df[y], errors="coerce"), alpha=0.7)
+            elif chart_type == "pie":
+                pie = plot_df.groupby(x, dropna=False)[y].sum()
+                ax.pie(pie.values, labels=pie.index.astype(str), autopct="%1.1f%%")
+            else:
+                ax.hist(pd.to_numeric(plot_df[y], errors="coerce").dropna(), bins=20)
+        ax.set_title(f"{y} by {x}")
+        st.pyplot(fig, clear_figure=True)
+    finally:
+        plt.close(fig)
 
 
 def _numeric_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, Optional[str]]:
@@ -1100,7 +1727,7 @@ def field_predict(df: pd.DataFrame) -> float:
 
 
 def field_risk_explain(df: pd.DataFrame) -> dict[str, Any]:
-    domain = st.session_state.get("domain") or detect_field(df, use_gemini=False)["domain"]
+    domain = st.session_state.get("domain") or detect_field(df, use_gemini=False, optuna_trials=12)["domain"]
     work = apply_domain_feature_engineering(df, domain)
     X, label_col = _numeric_xy(work)
     explanations: list[str] = []
@@ -1175,6 +1802,14 @@ def field_risk_explain(df: pd.DataFrame) -> dict[str, Any]:
             explanations.append(f"churn_rate={rate*100:.1f}%")
         if "lifetime_value_proxy" in work.columns and pd.notna(work["lifetime_value_proxy"].iloc[-1]):
             explanations.append(f"LTV_proxy={float(work['lifetime_value_proxy'].iloc[-1]):.1f}")
+    if domain == "hr_people":
+        attr = _col(work, "attrition", "churn")
+        if attr is not None:
+            rate = float(pd.to_numeric(work[attr], errors="coerce").fillna(0).mean())
+            risk = max(risk, rate * 100)
+            explanations.append(f"attrition_rate={rate*100:.1f}%")
+        if "salary_z" in work.columns and pd.notna(work["salary_z"].iloc[-1]):
+            explanations.append(f"salary_z={float(work['salary_z'].iloc[-1]):.2f}")
     if domain == "agriculture_iot":
         if "irrigation_stress" in work.columns and pd.notna(work["irrigation_stress"].iloc[-1]):
             stress = float(work["irrigation_stress"].iloc[-1])
@@ -1809,115 +2444,196 @@ def page_clean() -> None:
         st.subheader("Clean head (engineered cols)")
         st.dataframe(clean_df.head(30), use_container_width=True)
 
+
 def page_field() -> None:
     st.header("Field")
     st.caption(
-        "Auto-detect domain (column names + dtypes + Gemini) across 8–9 fields, "
-        "then domain feature engineering + Optuna/ensemble risk with explainability."
+        "Accurate domain detection: exclusive keywords + value ranges + Optuna-tuned ML "
+        "schema classifier + Gemini. Then domain risk explainability."
     )
     gemini_key_ui("field")
     df = require_data()
     if df is None:
         return
 
-    use_gem = st.checkbox("Use Gemini for domain classification", value=bool(get_gemini_api_key()))
-    if st.button("Detect field + explain risk", type="primary") or st.session_state.field_result is None:
-        with st.spinner("Field detect + domain FE + Optuna/ensemble..."):
-            meta = detect_field(df, use_gemini=use_gem)
+    use_gem = st.checkbox("Use Gemini in ensemble", value=bool(get_gemini_api_key()))
+    trials = st.slider("Optuna trials for field model", 8, 40, 25)
+    if st.button("Detect field (Optuna + ensemble)", type="primary") or st.session_state.field_result is None:
+        with st.spinner("Optuna tuning field classifier + ensemble voting..."):
+            meta = detect_field(df, use_gemini=use_gem, optuna_trials=trials)
             st.session_state.domain = meta["domain"]
             st.session_state.domain_meta = meta
             engineered = apply_domain_feature_engineering(df, meta["domain"])
-            explain = field_risk_explain(engineered if engineered is not None else df)
-            st.session_state.field_result = {"meta": meta, "explain": explain, "engineered_cols": [c for c in engineered.columns if c not in df.columns]}
+            explain = field_risk_explain(engineered)
+            st.session_state.field_result = {
+                "meta": meta,
+                "explain": explain,
+                "engineered_cols": [c for c in engineered.columns if c not in df.columns],
+            }
 
     res = st.session_state.field_result
     meta = res["meta"]
     explain = res["explain"]
-    st.subheader(f"Detected: {meta.get('label')} ({meta.get('domain')})")
-    m1, m2, m3 = st.columns(3)
+    st.subheader(f"Detected: {meta.get('label')} (`{meta.get('domain')}`)")
+    m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric("Confidence", f"{float(meta.get('confidence', 0))*100:.1f}%")
+        st.metric("Ensemble confidence", f"{float(meta.get('confidence', 0))*100:.1f}%")
     with m2:
-        st.metric("Risk", f"{explain.get('risk_pct')}%")
+        st.metric("Optuna pick", meta.get("optuna", {}).get("domain") or "—")
     with m3:
-        st.metric("Gemini", meta.get("gemini_domain") or "heuristic only")
+        st.metric("Optuna CV acc", f"{float(meta.get('optuna', {}).get('cv_accuracy') or 0)*100:.1f}%")
+    with m4:
+        st.metric("Risk", f"{explain.get('risk_pct')}%")
+
     st.info(explain.get("explanation", ""))
     if meta.get("reasons"):
-        st.write("Heuristic hits: " + ", ".join(meta["reasons"]))
+        st.write("Signals: " + ", ".join(str(x) for x in meta["reasons"]))
     if meta.get("gemini_why"):
-        st.write("Gemini why: " + str(meta["gemini_why"]))
+        st.write("Gemini: " + str(meta["gemini_why"]))
+
+    st.subheader("Detection scoreboards (numbers + dataframes)")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.caption("Heuristic scoreboard")
+        if isinstance(meta.get("scoreboard"), pd.DataFrame):
+            st.dataframe(meta["scoreboard"], use_container_width=True)
+    with c2:
+        st.caption("Ensemble votes")
+        if isinstance(meta.get("vote_table"), pd.DataFrame):
+            st.dataframe(meta["vote_table"], use_container_width=True)
+    if isinstance(meta.get("optuna_proba_table"), pd.DataFrame):
+        st.caption("Optuna class probabilities")
+        st.dataframe(meta["optuna_proba_table"], use_container_width=True)
+        st.caption(f"Optuna best params: `{meta.get('optuna', {}).get('best_params')}`")
+
     if res.get("engineered_cols"):
-        st.write("Domain features added: " + ", ".join(res["engineered_cols"]))
+        st.write("Domain features: " + ", ".join(res["engineered_cols"]))
     risk = float(explain.get("risk_pct") or 0)
     if risk >= 70:
-        st.error(f"CRITICAL: risk {risk}% — act within the domain playbook window.")
+        st.error(f"CRITICAL risk {risk}%")
     elif risk >= 40:
-        st.warning(f"Elevated risk {risk}% — review top factors.")
+        st.warning(f"Elevated risk {risk}%")
     else:
-        st.success(f"Risk {risk}% — within normal envelope.")
-    with st.expander("Full detection payload"):
-        st.json(res)
-    kpis = get_kpis(df)
-    metric_grid(kpis)
-
+        st.success(f"Risk {risk}% — normal envelope")
+    with st.expander("Full payload"):
+        # convert frames for json
+        payload = {
+            k: (v.to_dict(orient="records") if isinstance(v, pd.DataFrame) else v)
+            for k, v in {**meta, "explain": explain}.items()
+            if k not in ("scoreboard", "vote_table", "optuna_proba_table")
+        }
+        st.json(payload)
+    render_kpi_boxes(get_kpis(df))
 
 
 def page_kpis() -> None:
     st.header("Auto KPIs")
+    st.caption("Domain-specific square KPI boxes + loc/date/people filters + model comparisons (loc↔loc, time↔time).")
     df = require_data()
     if df is None:
         return
-    if not st.session_state.get("domain") or st.session_state.domain == "generic":
-        meta = detect_field(df, use_gemini=bool(get_gemini_api_key()))
-        st.session_state.domain = meta["domain"]
-        st.session_state.domain_meta = meta
-    kpis = get_kpis(df)
-    metric_grid(kpis, per_row=4)
-    explain = field_risk_explain(df)
-    st.subheader(f"{DOMAIN_CATALOG.get(explain['domain'], {}).get('label', 'Domain')} briefing")
+    if not st.session_state.get("domain") or st.session_state.domain == "generic" or not st.session_state.get("domain_meta"):
+        with st.spinner("Detecting field for KPI pack..."):
+            meta = detect_field(df, use_gemini=bool(get_gemini_api_key()), optuna_trials=15)
+            st.session_state.domain = meta["domain"]
+            st.session_state.domain_meta = meta
+    else:
+        meta = st.session_state.domain_meta
+
+    st.write(f"Active field: **{DOMAIN_CATALOG.get(st.session_state.domain, {}).get('label')}** "
+             f"(confidence {float(meta.get('confidence', 0))*100:.1f}%)")
+
+    filtered = render_filter_bar(df, key_prefix="kpi")
+    kpis = get_kpis(filtered)
+    render_kpi_boxes(kpis, per_row=4)
+
+    comparisons = kpi_group_comparisons(filtered)
+    st.subheader("Comparisons")
+    insight = kpi_model_insight(filtered, comparisons)
+    st.info(insight)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Location → location averages**")
+        if "loc_to_loc" in comparisons:
+            st.dataframe(comparisons["loc_to_loc"], use_container_width=True)
+        else:
+            st.caption("No location column detected.")
+    with c2:
+        st.markdown("**Time → time averages**")
+        if "time_to_time" in comparisons:
+            st.dataframe(comparisons["time_to_time"], use_container_width=True)
+        else:
+            st.caption("No date/time column detected.")
+
+    explain = field_risk_explain(filtered)
+    st.subheader("Model briefing")
     st.write(explain["explanation"])
-    st.write(f"Buffer holds **{kpis['Rows']}** rows. Domain KPIs above reflect field-specific metrics when available.")
 
 
 def page_charts() -> None:
     st.header("Charts")
-    df = require_data()
-    if df is None:
+    st.caption("Adaptive analytics pipeline — choose Plotly / Seaborn / Matplotlib, X/Y, chart type, filters, and auto insights.")
+    df0 = require_data()
+    if df0 is None:
         return
-    tcol = _col(df, "temperature", "temp")
-    vcol = _col(df, "vibration", "vib")
-    pcol = _col(df, "pressure")
-    cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if not st.session_state.get("domain") or st.session_state.domain == "generic":
+        meta = detect_field(df0, use_gemini=False, optuna_trials=10)
+        st.session_state.domain = meta["domain"]
+        st.session_state.domain_meta = meta
 
-    if tcol:
-        st.subheader("Temperature (last 48)")
-        series = pd.to_numeric(df[tcol], errors="coerce").tail(48)
-        st.line_chart(series)
-        fig = px.line(series.reset_index(), y=tcol if tcol in series.reset_index().columns else series.name,
-                      title="Temperature trend")
-        # simpler plotly
-        fig = go.Figure(go.Scatter(y=series.values, mode="lines", name=tcol))
-        fig.update_layout(title=f"{tcol} — last 48", height=360)
-        st.plotly_chart(fig, use_container_width=True)
+    filtered = render_filter_bar(df0, key_prefix="chart")
+    if filtered.empty:
+        st.warning("Filters removed all rows.")
+        return
 
-    if tcol and vcol:
-        st.subheader("Vibration vs Temperature")
-        plot_df = df[[vcol, tcol]].apply(pd.to_numeric, errors="coerce").dropna().tail(500)
-        st.scatter_chart(plot_df.rename(columns={vcol: "vibration", tcol: "temperature"}))
-        fig2 = px.scatter(plot_df, x=vcol, y=tcol, title="Vibration vs Temperature")
-        st.plotly_chart(fig2, use_container_width=True)
+    cols = list(filtered.columns)
+    num_cols = filtered.select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = [c for c in cols if c not in num_cols]
 
-    if cat_cols and num_cols:
-        st.subheader("Pie distribution")
-        names, values = cat_cols[0], num_cols[0]
-        pie_df = df.groupby(names, dropna=False)[values].mean().reset_index()
-        fig3 = px.pie(pie_df, names=names, values=values, title=f"{values} by {names}")
-        st.plotly_chart(fig3, use_container_width=True)
+    # smart defaults by domain
+    domain = st.session_state.get("domain")
+    default_y = num_cols[0] if num_cols else cols[0]
+    default_x = cat_cols[0] if cat_cols else (cols[0] if cols else default_y)
+    for pref_y in ("revenue", "sales", "temperature", "churn", "vibration", "load", "salary", "glucose"):
+        hit = _col(filtered, pref_y)
+        if hit:
+            default_y = hit
+            break
+    for pref_x in ("location", "region", "store", "date", "timestamp", "department", "customer"):
+        hit = _col(filtered, pref_x)
+        if hit:
+            default_x = hit
+            break
 
-    if pcol:
-        st.subheader("Pressure")
-        st.line_chart(pd.to_numeric(df[pcol], errors="coerce").tail(48))
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        library = st.selectbox("Library", ["plotly", "seaborn", "matplotlib"], index=0)
+    with c2:
+        chart_type = st.selectbox("Chart type", ["bar", "line", "scatter", "pie", "heatmap"], index=0)
+    with c3:
+        x = st.selectbox("X axis", cols, index=cols.index(default_x) if default_x in cols else 0)
+    with c4:
+        y = st.selectbox("Y axis", cols if chart_type == "pie" else (num_cols or cols),
+                         index=(num_cols or cols).index(default_y) if default_y in (num_cols or cols) else 0)
+    color = st.selectbox("Color / group (optional)", ["(none)"] + cat_cols, index=0)
+    color_col = None if color == "(none)" else color
+
+    # aggregate for bar/pie when X is high-cardinality categorical
+    plot_df = filtered
+    if chart_type in ("bar", "pie") and x in filtered.columns and y in filtered.columns:
+        if filtered[x].nunique() > 30 and not pd.api.types.is_numeric_dtype(filtered[x]):
+            plot_df = filtered.groupby(x, dropna=False)[y].mean().reset_index()
+
+    render_adaptive_chart(plot_df, x, y, chart_type, library, color_col)
+    insight = chart_business_insight(filtered, x, y)
+    st.success(insight)
+
+    # optional Prophet-style note when y is revenue-like
+    if any(h in str(y).lower() for h in ("revenue", "sales", "gmv", "load", "temperature")):
+        try:
+            st.caption(prophet_forecast(filtered, y))
+        except Exception:
+            pass
 
 
 def page_ml() -> None:
