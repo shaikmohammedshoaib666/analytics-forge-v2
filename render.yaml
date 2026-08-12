@@ -1,6 +1,7 @@
-# Render Blueprint — faster free/public host than Streamlit Cloud for this app.
-# Deploy: https://dashboard.render.com/select-repo?type=blueprint
-# Connect repo shaikmohammedshoaib666/analytics-forge-v2 → apply this file.
+# Render Blueprint — free public host for Analytics Forge v2
+# Deploy: https://dashboard.render.com/blueprints → New Blueprint Instance
+# Repo: shaikmohammedshoaib666/analytics-forge-v2
+# Branch MUST be: cursor/forge-v2-foundation-f3f9  (main is old v1-style layout)
 # LIVE Modbus to private plant IPs will NOT work from Render — use MANUAL or buffer_only.
 
 services:
@@ -9,6 +10,7 @@ services:
     runtime: python
     plan: free
     region: oregon
+    branch: cursor/forge-v2-foundation-f3f9
     buildCommand: pip install -r requirements-cloud.txt
     startCommand: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true
     healthCheckPath: /_stcore/health
