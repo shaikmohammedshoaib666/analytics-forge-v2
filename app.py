@@ -4038,24 +4038,31 @@ def main() -> None:
         name = st.session_state.manual_name or "none"
         st.info(f"MODE: MANUAL UPLOAD — all pages read uploaded file (`{name}`)")
 
-    if page == "Upload":
-        page_upload()
-    elif page == "Clean":
-        page_clean()
-    elif page == "Field":
-        page_field()
-    elif page == "Auto KPIs":
-        page_kpis()
-    elif page == "Charts":
-        page_charts()
-    elif page == "ML Studio":
-        page_ml()
-    elif page == "Ask / AI":
-        page_ask()
-    elif page == "Dashboard":
-        page_dashboard()
-    elif page == "Email":
-        page_email()
+    routers = {
+        "Upload": page_upload,
+        "Clean": page_clean,
+        "Field": page_field,
+        "Auto KPIs": page_kpis,
+        "Charts": page_charts,
+        "ML Studio": page_ml,
+        "Ask / AI": page_ask,
+        "Dashboard": page_dashboard,
+        "Email": page_email,
+    }
+    try:
+        handlers = routers.get(page)
+        if handlers is None:
+            st.error(f"Unknown page: {page}")
+        else:
+            handlers()
+    except Exception as exc:
+        st.error(f"Page `{page}` failed: {exc}")
+        with st.expander("Technical details (for debugging)"):
+            st.code(traceback.format_exc())
+        st.info(
+            "Tip: switch Mode (LIVE ↔ MANUAL), reload buffer/file, or check `config.yaml` / `.env`. "
+            "Manual path does not need OCP-U."
+        )
 
 
 if __name__ == "__main__":
