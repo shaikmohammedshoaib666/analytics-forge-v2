@@ -35,6 +35,14 @@ from modules.ml_registry import list_models
 from modules.ml_runner import run_model
 from modules.optuna_tuner import optuna_available, tune_model
 from modules.rag import build_index, query_rag, rag_available
+from modules.dashboard_slicers import apply_slicers, auto_chart_specs, suggest_slicer_columns
+from modules.email_automation import (
+    EmailConfigError,
+    config_status,
+    email_configured,
+    process_inbound_mailbox,
+    send_current_report,
+)
 from ui.auth_gate import render_user_sidebar, require_login
 from ui.components import (
     download_df_button,
@@ -608,7 +616,7 @@ def page_kpis() -> None:
 def page_charts() -> None:
     page_hero(
         "Charts",
-        "Build colorful views, download one chart, or pin several into your final dashboard.",
+        "Build colorful views including Pie · download one chart · or pin several into your dashboard.",
         st.session_state.get("domain"),
     )
     if st.session_state.clean_df is None:
@@ -618,7 +626,12 @@ def page_charts() -> None:
     df = st.session_state.clean_df
     catalog = load_charts_catalog()
     chart_types = list(catalog.keys())
+    # Prefer pie near the top so it's easy to find
+    if "pie" in chart_types:
+        chart_types = ["pie"] + [t for t in chart_types if t != "pie"]
     cols = list(df.columns)
+
+    st.success("Tip: choose **Pie Chart**, set Names (e.g. city/region) + Values (e.g. revenue), then **Add to dashboard**.")
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -995,155 +1008,250 @@ def page_ai() -> None:
 def page_dashboard() -> None:
     page_hero(
         "Dashboard",
-        "Your selected charts + insights. Auto KPIs stay on the right. Download the final pack anytime.",
+        "Power BI-style slicers · professional KPI boxes · pie/bar/line · Live auto or Manual build.",
         st.session_state.get("domain"),
     )
     if st.session_state.clean_df is None:
         st.warning("Upload or load a sample first.")
         return
 
-    # Auto SCADA dashboard for live mode
-    if st.session_state.get("data_mode") == "live":
-        st.subheader("🏭 Auto SCADA Dashboard (Live)")
-        auto = build_auto_dashboard(st.session_state.clean_df, st.session_state.domain)
-        # KPI cards
-        kcols = st.columns(min(6, len(auto["kpi_cards"])) or 1)
-        for i, kpi in enumerate(auto["kpi_cards"]):
-            kcols[i % len(kcols)].metric(kpi["label"], kpi["value"])
-        # Alerts
-        if auto["alerts"]:
-            for a in auto["alerts"]:
-                st.warning(a)
-        # Auto charts
-        for chart_cfg in auto["charts"]:
-            try:
-                fig = build_chart(st.session_state.clean_df, **chart_cfg)
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception:
-                pass
-        st.divider()
+    base_df = st.session_state.clean_df
+    is_live = st.session_state.get("data_mode") == "live"
 
-    # Business alerts
-    alerts = generate_alerts(st.session_state.clean_df, st.session_state.domain, st.session_state.ml_result)
+    # --- Build mode: Live auto vs Manual ---
+    mode_label = "Live auto-generate" if is_live else "Manual / one-click auto"
+    dash_mode = st.radio(
+        "Dashboard mode",
+        ["Auto-generate (recommended)", "Manual pinned charts only"],
+        horizontal=True,
+        help="Live data auto-builds KPIs + pie/bar/line. Manual keeps Charts you pinned, or click Auto once.",
+        key="dash_build_mode",
+    )
+
+    if dash_mode.startswith("Auto") and st.button("Generate / refresh auto dashboard", type="primary"):
+        auto = build_auto_dashboard(base_df, st.session_state.domain or "generic")
+        st.session_state["auto_dash"] = auto
+        # also pin auto charts into dashboard_charts for pack download
+        st.session_state.dashboard_charts = list(auto.get("charts") or [])
+        st.success(f"Auto dashboard ready ({auto.get('rows', 0):,} rows){' — live' if is_live else ''}")
+
+    # Keep auto for live by default
+    if is_live and "auto_dash" not in st.session_state:
+        st.session_state["auto_dash"] = build_auto_dashboard(base_df, st.session_state.domain or "generic")
+        if not st.session_state.dashboard_charts:
+            st.session_state.dashboard_charts = list(st.session_state["auto_dash"].get("charts") or [])
+
+    # --- Power BI-style slicers ---
+    st.markdown("#### Filters (like Power BI — dashboard updates live)")
+    suggestions = suggest_slicer_columns(base_df)
+    cat_cols = suggestions["categorical"]
+    num_cols = suggestions["numeric"]
+
+    cat_filters: dict = {}
+    num_ranges: dict = {}
+    if cat_cols or num_cols:
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            for col in cat_cols[:4]:
+                opts = sorted(base_df[col].dropna().astype(str).unique().tolist())
+                selected = st.multiselect(
+                    f"Filter: {col}",
+                    opts,
+                    default=[],
+                    key=f"slicer_cat_{col}",
+                    help="Pick one or more values (e.g. city, region, product)",
+                )
+                if selected:
+                    cat_filters[col] = selected
+        with sc2:
+            for col in num_cols[:3]:
+                series = pd.to_numeric(base_df[col], errors="coerce").dropna()
+                if series.empty:
+                    continue
+                lo, hi = float(series.min()), float(series.max())
+                if lo == hi:
+                    continue
+                rng = st.slider(
+                    f"Range: {col}",
+                    min_value=lo,
+                    max_value=hi,
+                    value=(lo, hi),
+                    key=f"slicer_num_{col}",
+                )
+                if rng != (lo, hi):
+                    num_ranges[col] = rng
+    else:
+        st.caption("No categorical columns found for slicers — upload richer data (city, region, product…).")
+
+    view_df = apply_slicers(base_df, cat_filters, num_ranges)
+    st.caption(f"Showing **{len(view_df):,}** / {len(base_df):,} rows after filters")
+
+    # Recompute KPIs on filtered view for professional boxes
+    from core.kpis import compute_kpis as _ck
+    view_kpis = _ck(view_df, domain=st.session_state.domain or "generic",
+                    ml_metrics=st.session_state.ml_result if st.session_state.ml_result and st.session_state.ml_result.get("ok") else None)
+
+    st.markdown("#### KPI scoreboard")
+    kpi_cards(view_kpis or st.session_state.kpis or {}, max_cards=8)
+
+    # Business alerts on filtered view
+    alerts = generate_alerts(view_df, st.session_state.domain, st.session_state.ml_result)
     if alerts:
-        st.subheader("Business Alerts")
+        st.markdown("#### Business alerts")
         for a in alerts:
             icon = {"critical": "🔴", "high": "🟠", "warning": "🟡", "info": "ℹ️"}.get(a["severity"], "ℹ️")
             st.markdown(f"{icon} **{a['severity'].upper()}:** {a['message']}")
 
-    center, right = st.columns([3, 1])
-    with right:
-        st.subheader("Auto KPIs")
-        kpi_cards(st.session_state.kpis or {}, max_cards=10)
+    # Insights
+    st.markdown("#### Insights")
+    for insight in st.session_state.dashboard_insights or [st.session_state.briefing]:
+        st.markdown(insight or "_No insights yet — run ML Studio or Ask/AI._")
 
-    with center:
-        st.subheader("Insights")
-        for insight in st.session_state.dashboard_insights or [st.session_state.briefing]:
-            st.markdown(insight or "_No insights yet._")
+    # Charts: auto + pinned, always include pie when possible
+    st.markdown("#### Charts (includes Pie)")
+    charts = list(st.session_state.dashboard_charts or [])
+    if dash_mode.startswith("Auto"):
+        auto = st.session_state.get("auto_dash") or build_auto_dashboard(view_df, st.session_state.domain or "generic")
+        # regenerate chart specs from filtered view so pie/bar follow slicers
+        charts = auto_chart_specs(view_df) or auto.get("charts") or charts
 
-        st.subheader("Charts")
-        charts = st.session_state.dashboard_charts or []
-        if not charts:
-            st.info("Add charts from the Charts page.")
-        df = st.session_state.clean_df
-        for i, meta in enumerate(charts):
-            st.markdown(f"**{meta.get('title', meta.get('chart_type'))}**")
-            try:
-                fig = build_chart(
-                    df,
-                    chart_type=meta.get("chart_type", "bar"),
-                    lib=meta.get("lib", "plotly"),
-                    x=meta.get("x"),
-                    y=meta.get("y"),
-                    names=meta.get("names"),
-                    values=meta.get("values"),
-                    title=meta.get("title"),
-                )
-                if meta.get("lib") == "plotly":
-                    st.plotly_chart(fig, use_container_width=True, key=f"dash_plotly_{i}")
-                else:
-                    st.pyplot(fig)
-            except Exception as exc:
-                st.warning(f"Could not render chart: {exc}")
+    if not charts:
+        st.info("Click **Generate / refresh auto dashboard**, or pin charts from the Charts page (Pie is in the chart type list).")
 
-        if st.session_state.domain == "predictive_maintenance" and st.session_state.ml_result:
-            st.subheader("PdM model quality")
-            show_ml_metrics(st.session_state.ml_result)
+    for i, meta in enumerate(charts):
+        title = meta.get("title") or meta.get("chart_type")
+        st.markdown(f"**{title}**")
+        try:
+            fig = build_chart(
+                view_df,
+                chart_type=meta.get("chart_type", "bar"),
+                lib=meta.get("lib", "plotly"),
+                x=meta.get("x"),
+                y=meta.get("y"),
+                names=meta.get("names"),
+                values=meta.get("values"),
+                title=meta.get("title"),
+            )
+            if meta.get("lib", "plotly") == "plotly":
+                st.plotly_chart(fig, use_container_width=True, key=f"dash_plotly_{i}")
+            else:
+                st.pyplot(fig)
+        except Exception as exc:
+            st.warning(f"Could not render chart: {exc}")
+
+    if st.session_state.ml_result and st.session_state.ml_result.get("ok"):
+        st.markdown("#### Latest model")
+        show_ml_metrics(st.session_state.ml_result)
 
     st.divider()
-    pack = build_html_pack(
-        domain=st.session_state.domain,
-        source_name=st.session_state.source_name or "",
-        clean_log=st.session_state.clean_log,
-        kpis=st.session_state.kpis,
-        insights=st.session_state.dashboard_insights,
-        charts=st.session_state.dashboard_charts,
-        ml_metrics=st.session_state.ml_result,
-        briefing=st.session_state.briefing or "",
-    )
-    download_html_pack_button(pack, key="dash_pack")
-    if st.session_state.run_id and st.button("Save dashboard layout to SQLite"):
-        db.save_dashboard_layout(
-            st.session_state.run_id,
-            name="default",
-            layout={
-                "charts": st.session_state.dashboard_charts,
-                "insights": st.session_state.dashboard_insights,
-            },
+    # Email report to my account
+    user = st.session_state.get("user") or {}
+    my_email = user.get("email")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        pack = build_html_pack(
+            domain=st.session_state.domain,
+            source_name=st.session_state.source_name or "",
+            clean_log=st.session_state.clean_log,
+            kpis=view_kpis,
+            insights=st.session_state.dashboard_insights,
+            charts=charts,
+            ml_metrics=st.session_state.ml_result,
+            briefing=st.session_state.briefing or "",
         )
-        st.success("Layout saved")
+        download_html_pack_button(pack, key="dash_pack")
+    with c2:
+        if my_email and st.button("Email report + CSV to my account", type="primary"):
+            try:
+                send_current_report(
+                    my_email,
+                    domain=st.session_state.domain or "generic",
+                    source_name=st.session_state.source_name or "dataset",
+                    clean_log=st.session_state.clean_log or [],
+                    kpis=view_kpis or {},
+                    insights=st.session_state.dashboard_insights or [],
+                    charts=charts or [],
+                    ml_metrics=st.session_state.ml_result,
+                    briefing=st.session_state.briefing or "",
+                    clean_df=view_df,
+                    run_id=st.session_state.run_id,
+                    subject=f"[Analytics Forge] Report — {st.session_state.domain}",
+                )
+                st.success(f"Sent to {my_email}")
+            except EmailConfigError as exc:
+                st.error(f"Email not configured: {exc}")
+            except Exception as exc:
+                st.error(str(exc))
+    with c3:
+        if st.session_state.run_id and st.button("Save dashboard layout"):
+            db.save_dashboard_layout(
+                st.session_state.run_id,
+                name="default",
+                layout={"charts": charts, "insights": st.session_state.dashboard_insights, "slicers": {"cat": cat_filters}},
+            )
+            st.success("Layout saved")
 
 
 def page_email() -> None:
     page_hero(
         "Email automation",
-        "Send the report pack now, or auto-process inbound CSV emails and reply with insights.",
+        "Send report + clean CSV to your login email, or auto-reply when someone emails a CSV to the system inbox.",
         st.session_state.get("domain"),
-    )
-    st.caption(
-        "Send the dashboard/report pack to any email. "
-        "Or click Check inbox: unread emails with CSV/Excel are cleaned, analyzed, and auto-replied with the report."
-    )
-
-    from modules.email_automation import (
-        EmailConfigError,
-        config_status,
-        email_configured,
-        process_inbound_mailbox,
-        send_current_report,
     )
 
     status = config_status()
+    user = st.session_state.get("user") or {}
+    my_email = user.get("email")
+
     if status["configured"]:
         st.success(f"Email ready · SMTP {status['smtp']} · IMAP {status['imap']} · as {status['from']}")
     else:
         missing = status.get("missing") or ["EMAIL_USER", "EMAIL_PASSWORD"]
         st.warning(
-            "Email not configured yet — this is expected until you add credentials locally.\n\n"
-            "**Do not paste your real password into chat.** Put secrets in `.env` (local) or "
-            "Streamlit Cloud → Settings → Secrets.\n\n"
-            "Minimum for Gmail send/inbox:\n\n"
+            "SMTP not configured yet — Gemini is separate; email needs a Gmail App Password in `.env`:\n\n"
             "```\n"
             "EMAIL_USER=you@gmail.com\n"
             "EMAIL_PASSWORD=your_16_char_app_password\n"
             "EMAIL_FROM=you@gmail.com\n"
-            "EMAIL_SMTP_HOST=smtp.gmail.com\n"
-            "EMAIL_SMTP_PORT=587\n"
-            "EMAIL_IMAP_HOST=imap.gmail.com\n"
-            "EMAIL_IMAP_PORT=993\n"
             "```\n\n"
-            f"Currently missing: {', '.join(missing)}\n\n"
-            "Gmail: enable 2-Step Verification → create an **App Password** "
-            "(Google Account → Security). That App Password is what EMAIL_PASSWORD means — "
-            "not your normal Gmail login password. Aliases `SMTP_USER` / `SMTP_PASSWORD` / "
-            "`SMTP_HOST` also work."
+            f"Currently missing: {', '.join(missing)}"
         )
 
-    st.subheader("1) Send current report to me / anyone")
+    st.subheader("0) Send report to my account (logged-in user)")
+    if my_email:
+        st.caption(f"Logged in as **{my_email}** — one click sends HTML pack + clean CSV.")
+        if st.button("Email insights pack to me now", type="primary", key="email_to_me"):
+            if not st.session_state.get("pipeline_done"):
+                st.error("Load data first (Upload).")
+            else:
+                try:
+                    send_current_report(
+                        my_email,
+                        domain=st.session_state.domain or "generic",
+                        source_name=st.session_state.source_name or "dataset",
+                        clean_log=st.session_state.clean_log or [],
+                        kpis=st.session_state.kpis or {},
+                        insights=st.session_state.dashboard_insights or [],
+                        charts=st.session_state.dashboard_charts or [],
+                        ml_metrics=st.session_state.ml_result,
+                        briefing=st.session_state.briefing or "",
+                        clean_df=st.session_state.clean_df,
+                        run_id=st.session_state.run_id,
+                        subject=f"[Analytics Forge] Your report — {st.session_state.domain}",
+                    )
+                    st.success(f"Queued/sent to {my_email}")
+                except EmailConfigError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(str(exc))
+    else:
+        st.info("Log in so we know which email to send your downloads to.")
+
+    st.subheader("1) Send current report to anyone")
     if not st.session_state.get("pipeline_done"):
         st.info("Load and clean a dataset first (Upload), then you can email the report.")
     with st.form("email_send_form"):
-        to_addr = st.text_input("Recipient email", placeholder="you@gmail.com")
+        to_addr = st.text_input("Recipient email", value=my_email or "", placeholder="you@gmail.com")
         subject = st.text_input(
             "Subject",
             value=f"[Analytics Forge] Report — {st.session_state.get('domain') or 'analytics'}",
@@ -1160,7 +1268,6 @@ def page_email() -> None:
                     briefing = st.session_state.briefing or ""
                     if not isinstance(briefing, str):
                         import json as _json
-
                         briefing = _json.dumps(briefing, default=str)
                     result = send_current_report(
                         to_addr.strip(),
@@ -1189,8 +1296,8 @@ def page_email() -> None:
     st.subheader("2) Inbound automation (CSV email → auto report reply)")
     st.markdown(
         "Email a **CSV or Excel** file to your configured inbox (`EMAIL_USER`). "
-        "Then click the button below. Forge will: clean → detect field → KPIs → baseline ML → "
-        "email the HTML report + clean CSV back to the sender."
+        "Then click the button below. Forge will: clean → detect field → KPIs → charts pack → "
+        "email the HTML report + clean CSV + insights back to the sender."
     )
     if st.button("Check inbox & auto-process unread CSV emails", type="primary"):
         try:

@@ -1,60 +1,44 @@
-"""Auto SCADA-style dashboard for live mode — auto-generated KPIs and charts."""
+"""Auto dashboard builder — KPIs + pie/bar/line for live or one-click manual generate."""
 from __future__ import annotations
 
 from typing import Any
 
 import pandas as pd
 
+from modules.dashboard_slicers import auto_chart_specs
+
 
 def build_auto_dashboard(df: pd.DataFrame, domain: str = "generic") -> dict[str, Any]:
-    """Generate auto dashboard config from live data slice."""
+    """Generate auto dashboard config from a data slice."""
     num_cols = df.select_dtypes(include=["number"]).columns.tolist()
-    cat_cols = df.select_dtypes(include=["object", "string", "category"]).columns.tolist()
 
-    kpi_cards = []
+    kpi_list = []
     for col in num_cols[:6]:
-        kpi_cards.append({
+        kpi_list.append({
             "name": col,
             "value": round(float(df[col].mean()), 2),
             "label": f"Avg {col}",
         })
+        kpi_list.append({
+            "name": f"{col}_sum",
+            "value": round(float(df[col].sum()), 2),
+            "label": f"Total {col}",
+        })
+    # de-dupe to 8
+    kpi_list = kpi_list[:8]
 
-    charts = []
-    if num_cols:
-        charts.append({
-            "chart_type": "line",
-            "x": df.columns[0],
-            "y": num_cols[0],
-            "title": f"{num_cols[0]} trend",
-            "lib": "plotly",
-        })
-    if len(num_cols) >= 2:
-        charts.append({
-            "chart_type": "scatter",
-            "x": num_cols[0],
-            "y": num_cols[1],
-            "title": f"{num_cols[0]} vs {num_cols[1]}",
-            "lib": "plotly",
-        })
-    if cat_cols and num_cols:
-        charts.append({
-            "chart_type": "bar",
-            "x": cat_cols[0],
-            "y": num_cols[0],
-            "title": f"{num_cols[0]} by {cat_cols[0]}",
-            "lib": "plotly",
-        })
+    charts = auto_chart_specs(df)
 
     alerts = []
     for col in num_cols[:3]:
         mean = df[col].mean()
         std = df[col].std()
         high = df[col].max()
-        if high > mean + 2 * std:
+        if std and high > mean + 2 * std:
             alerts.append(f"⚠️ {col} has values {high:.1f} exceeding 2σ ({mean + 2*std:.1f})")
 
     return {
-        "kpi_cards": kpi_cards,
+        "kpi_cards": kpi_list,
         "charts": charts,
         "alerts": alerts,
         "domain": domain,

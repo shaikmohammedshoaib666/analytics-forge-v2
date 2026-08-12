@@ -98,26 +98,42 @@ html, body, [class*="css"]  {
 
 .af-kpi-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 0.85rem;
   margin: 0.5rem 0 1rem 0;
 }
 .af-kpi {
-  border-radius: 14px;
-  padding: 0.9rem 1rem;
-  border: 1px solid rgba(0,0,0,0.04);
-  box-shadow: 0 6px 16px rgba(0,0,0,0.06);
+  border-radius: 16px;
+  padding: 1.05rem 1.1rem;
+  min-height: 110px;
+  aspect-ratio: 1.35 / 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  border: 1px solid rgba(15, 23, 42, 0.06);
+  box-shadow: 0 8px 22px rgba(15, 23, 42, 0.08);
+  background: #fff;
 }
 .af-kpi .label {
-  font-size: 0.78rem;
-  font-weight: 600;
-  opacity: 0.85;
-  margin-bottom: 0.35rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  opacity: 0.8;
+  margin-bottom: 0.45rem;
 }
 .af-kpi .value {
   font-family: 'Space Grotesk', sans-serif;
-  font-size: 1.35rem;
+  font-size: 1.55rem;
   font-weight: 700;
+  line-height: 1.15;
+}
+.af-slicer-bar {
+  background: rgba(255,255,255,0.9);
+  border: 1px solid rgba(13, 148, 136, 0.2);
+  border-radius: 14px;
+  padding: 0.85rem 1rem;
+  margin-bottom: 1rem;
 }
 
 div.stButton > button {
