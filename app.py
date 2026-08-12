@@ -2481,22 +2481,85 @@ FORGE_MODEL_CATALOG: dict[str, dict[str, Any]] = {
 }
 
 DOMAIN_RECOMMENDED_MODELS: dict[str, list[str]] = {
-    "predictive_maintenance": ["XGBRegressor", "RandomForestRegressor", "XGBClassifier", "Prophet", "IsolationForest", "PCA"],
-    "sales_forecasting": ["Prophet", "XGBRegressor", "RandomForestRegressor", "Ridge"],
-    "telecom_churn": ["XGBClassifier", "RandomForestClassifier", "LogisticRegression"],
+    "predictive_maintenance": ["RandomForestRegressor", "XGBRegressor", "RandomForestClassifier", "XGBClassifier", "Prophet", "IsolationForest", "PCA"],
+    "sales_forecasting": ["Prophet", "RandomForestRegressor", "XGBRegressor", "Ridge"],
+    "telecom_churn": ["RandomForestClassifier", "XGBClassifier", "LogisticRegression"],
     "healthcare": ["RandomForestClassifier", "XGBClassifier", "LogisticRegression"],
-    "finance_risk": ["XGBClassifier", "LogisticRegression", "RandomForestClassifier"],
-    "energy_utilities": ["Prophet", "XGBRegressor", "PCA"],
+    "finance_risk": ["RandomForestClassifier", "XGBClassifier", "LogisticRegression"],
+    "energy_utilities": ["Prophet", "RandomForestRegressor", "XGBRegressor", "PCA"],
     "warehouse_logistics": ["RandomForestRegressor", "XGBRegressor", "Prophet"],
     "agriculture_iot": ["RandomForestRegressor", "Prophet", "IsolationForest"],
-    "hr_people": ["XGBClassifier", "LogisticRegression", "RandomForestClassifier"],
+    "hr_people": ["RandomForestClassifier", "XGBClassifier", "LogisticRegression"],
     "generic": ["RandomForestRegressor", "RandomForestClassifier", "Prophet", "PCA"],
 }
+
+
+_ML_LIB_READY_CACHE: dict[str, tuple[bool, str]] = {}
+
+
+def _ml_library_ready(library: str) -> tuple[bool, str]:
+    """
+    True if native ML lib can actually load.
+    Mac XGBoost often imports the Python package then fails on libomp.dylib —
+    that raises XGBoostError / OSError, not ImportError (so bare ImportError guards miss it).
+    """
+    library = (library or "").lower()
+    if library in _ML_LIB_READY_CACHE:
+        return _ML_LIB_READY_CACHE[library]
+    if library in {"sklearn", "prophet", "statsmodels", ""}:
+        _ML_LIB_READY_CACHE[library] = (True, "")
+        return True, ""
+    if library == "xgboost":
+        try:
+            import xgboost as xgb  # noqa: F401
+            # Force native lib load (import alone is not enough on macOS)
+            _ = xgb.XGBRegressor(n_estimators=1, max_depth=1)
+            result = (True, "")
+        except Exception as exc:
+            result = (
+                False,
+                (
+                    f"XGBoost unavailable ({exc}). "
+                    "On Mac: brew install libomp && pip install --force-reinstall xgboost. "
+                    "Forge falls back to RandomForest."
+                ),
+            )
+        _ML_LIB_READY_CACHE[library] = result
+        return result
+    if library == "lightgbm":
+        try:
+            import lightgbm as lgb  # noqa: F401
+            _ = lgb.LGBMRegressor(n_estimators=1)
+            result = (True, "")
+        except Exception as exc:
+            result = (False, f"LightGBM unavailable ({exc}). Using sklearn fallback.")
+        _ML_LIB_READY_CACHE[library] = result
+        return result
+    _ML_LIB_READY_CACHE[library] = (True, "")
+    return True, ""
+
+
+def list_runnable_models() -> list[str]:
+    """Catalog ids whose native libs load on this machine."""
+    out = []
+    for mid, meta in FORGE_MODEL_CATALOG.items():
+        ok, _ = _ml_library_ready(meta.get("library", "sklearn"))
+        if ok:
+            out.append(mid)
+    return out
 
 
 def _resolve_estimator(dotted: str, params: dict[str, Any]):
     import importlib
     module_path, _, cls_name = dotted.rpartition(".")
+    if module_path.startswith("xgboost"):
+        ok, msg = _ml_library_ready("xgboost")
+        if not ok:
+            raise RuntimeError(msg)
+    if module_path.startswith("lightgbm"):
+        ok, msg = _ml_library_ready("lightgbm")
+        if not ok:
+            raise RuntimeError(msg)
     mod = importlib.import_module(module_path)
     cls = getattr(mod, cls_name)
     try:
@@ -2558,6 +2621,9 @@ def run_forge_model(
         return {"ok": False, "error": f"Unknown model {model_id}", "model_id": model_id}
     task = meta["task"]
     library = meta["library"]
+    ok_lib, lib_msg = _ml_library_ready(library)
+    if not ok_lib:
+        return {"ok": False, "error": lib_msg, "model_id": model_id, "task": task}
 
     # PCA
     if task == "dimensionality" or model_id == "PCA":
@@ -2792,7 +2858,7 @@ def domain_default_target(df: pd.DataFrame, domain: str) -> Optional[str]:
 
 
 def field_best_model_card(df: pd.DataFrame, domain: str) -> dict[str, Any]:
-    """Auto-pick best model for domain target via quick CV bake-off (XGB preferred)."""
+    """Auto-pick best model for domain target via quick CV bake-off (XGB if libomp OK, else RF)."""
     target = domain_default_target(df, domain)
     if not target:
         return {"ok": False, "error": "No target column found for this field."}
@@ -2801,41 +2867,58 @@ def field_best_model_card(df: pd.DataFrame, domain: str) -> dict[str, Any]:
     task = "regression" if y_num.notna().sum() >= max(10, int(0.7 * len(y))) and y_num.nunique() > 8 else "classification"
     candidates = [m for m in DOMAIN_RECOMMENDED_MODELS.get(domain, []) if FORGE_MODEL_CATALOG.get(m, {}).get("task") == task]
     if not candidates:
-        candidates = ["XGBRegressor", "RandomForestRegressor"] if task == "regression" else ["XGBClassifier", "RandomForestClassifier"]
-    # ensure available
-    avail = []
+        candidates = ["RandomForestRegressor", "XGBRegressor"] if task == "regression" else ["RandomForestClassifier", "XGBClassifier"]
+
+    skipped: list[str] = []
+    avail: list[str] = []
     for mid in candidates:
         lib = FORGE_MODEL_CATALOG[mid]["library"]
-        if lib == "xgboost":
-            try:
-                import xgboost  # noqa
-                avail.append(mid)
-            except ImportError:
-                continue
-        elif lib == "lightgbm":
-            try:
-                import lightgbm  # noqa
-                avail.append(mid)
-            except ImportError:
-                continue
-        else:
-            avail.append(mid)
+        ok, msg = _ml_library_ready(lib)
+        if not ok:
+            skipped.append(f"{mid}: {msg}")
+            continue
+        avail.append(mid)
     if not avail:
         avail = ["RandomForestRegressor"] if task == "regression" else ["RandomForestClassifier"]
 
     results = []
+    failures = []
     for mid in avail[:4]:
-        res = run_forge_model(df, mid, target=target, time_series_split=True)
+        try:
+            res = run_forge_model(df, mid, target=target, time_series_split=True)
+        except Exception as exc:
+            failures.append(f"{mid}: {exc}")
+            continue
         if res.get("ok"):
             score = res.get("metrics", {}).get("cv_score")
             if score is None:
                 score = res.get("metrics", {}).get("r2") or res.get("metrics", {}).get("accuracy") or 0
             results.append((float(score), mid, res))
+        else:
+            failures.append(f"{mid}: {res.get('error')}")
     if not results:
-        return {"ok": False, "error": "All candidate models failed.", "target": target}
+        # Absolute last resort — plain RF via run_forge_model
+        fallback = "RandomForestRegressor" if task == "regression" else "RandomForestClassifier"
+        try:
+            res = run_forge_model(df, fallback, target=target, time_series_split=True)
+            if res.get("ok"):
+                results.append((float(res.get("metrics", {}).get("cv_score") or 0), fallback, res))
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"All candidate models failed. {exc}",
+                "target": target,
+                "skipped": skipped,
+                "failures": failures,
+            }
+    if not results:
+        return {"ok": False, "error": "All candidate models failed.", "target": target, "skipped": skipped, "failures": failures}
     results.sort(key=lambda z: -z[0])
     best_score, best_id, best_res = results[0]
     actions = perspective_actions(df, domain, best_res)
+    note = ""
+    if skipped:
+        note = "Some models skipped (native lib missing — common on Mac without `brew install libomp`)."
     return {
         "ok": True,
         "domain": domain,
@@ -2845,6 +2928,8 @@ def field_best_model_card(df: pd.DataFrame, domain: str) -> dict[str, Any]:
         "result": best_res,
         "leaderboard": [{"model": m, "score": round(s, 4)} for s, m, _ in results],
         "actions": actions,
+        "skipped": skipped[:3],
+        "note": note,
     }
 
 
@@ -3316,9 +3401,14 @@ Edit `config.yaml` → `LIVE_MODE.connection_type`.
                     st.success("Pinned")
             if st.button("Run best live model (Field card)"):
                 dom = st.session_state.get("domain") or "predictive_maintenance"
-                card = field_best_model_card(df, dom)
+                try:
+                    card = field_best_model_card(df, dom)
+                except Exception as exc:
+                    card = {"ok": False, "error": str(exc)}
                 if card.get("ok"):
                     st.session_state.ml_result = card["result"]
+                    if card.get("note"):
+                        st.warning(card["note"])
                     for a in card.get("actions") or []:
                         st.markdown(f"- {a}")
                 else:
@@ -3486,7 +3576,7 @@ def page_clean() -> None:
 def page_field() -> None:
     st.header("Field")
     st.caption(
-        "Industry detection + LlamaIndex build-once + best predictive model (XGB/RF bake-off) "
+        "Industry detection + LlamaIndex build-once + best predictive model (RF preferred; XGB if OpenMP OK) "
         "+ perspective alerts (bearing wear, downtime ₹ saved)."
     )
     gemini_key_ui("field")
@@ -3498,14 +3588,25 @@ def page_field() -> None:
     trials = st.slider("Optuna trials for field detect", 8, 40, 20)
     run = st.button("Detect field + build LlamaIndex + best model", type="primary")
     if run or st.session_state.field_result is None:
-        with st.spinner("Domain detect → LlamaIndex → XGB/RF bake-off..."):
+        with st.spinner("Domain detect → LlamaIndex → model bake-off..."):
             meta = detect_field(df, use_gemini=use_gem, optuna_trials=trials)
             st.session_state.domain = meta["domain"]
             st.session_state.domain_meta = meta
-            llama_meta = ensure_llama_index(df, force=True)
+            try:
+                llama_meta = ensure_llama_index(df, force=True)
+            except Exception as exc:
+                llama_meta = {"mode": "error", "n_docs": 0, "error": str(exc)}
             engineered = apply_domain_feature_engineering(df, meta["domain"])
             explain = field_risk_explain(engineered)
-            card = field_best_model_card(df, meta["domain"])
+            try:
+                card = field_best_model_card(df, meta["domain"])
+            except Exception as exc:
+                card = {
+                    "ok": False,
+                    "error": f"Bake-off soft-failed: {exc}",
+                    "skipped": [],
+                    "note": "Using domain detect only — open ML Studio and pick RandomForest.",
+                }
             if card.get("ok"):
                 st.session_state.ml_result = card["result"]
                 st.session_state.dashboard_insights = list(
@@ -3533,6 +3634,13 @@ def page_field() -> None:
             f"Selected target **`{card.get('target')}`** · best model **{card.get('best_model')}** · "
             f"CV score **{card.get('cv_score')}**"
         )
+        if card.get("note"):
+            st.warning(card["note"])
+        if card.get("skipped"):
+            with st.expander("Skipped optional models (native libs)"):
+                for line in card["skipped"]:
+                    st.caption(line)
+                st.caption("Mac fix: `brew install libomp` then `pip install --force-reinstall xgboost`.")
         st.dataframe(pd.DataFrame(card.get("leaderboard") or []), use_container_width=True)
         st.subheader("Perspective actions")
         for line in card.get("actions") or []:
@@ -3541,6 +3649,8 @@ def page_field() -> None:
             st.json(card.get("result", {}).get("metrics") or {})
     else:
         st.warning(card.get("error") or "Model card unavailable")
+        if card.get("skipped"):
+            st.caption("Skipped: " + " | ".join(card["skipped"][:2]))
 
     st.info(explain.get("explanation", ""))
     c1, c2 = st.columns(2)
@@ -3679,17 +3789,26 @@ def page_ml() -> None:
     st.header("ML Studio")
     st.caption(
         "Forge Analytics catalog — choose model + target. "
-        "Classifiers · Regressors · XGBoost · Prophet · PCA · StatsmodelsOLS · IsolationForest."
+        "Classifiers · Regressors · XGBoost (if OpenMP OK) · Prophet · PCA · StatsmodelsOLS · IsolationForest."
     )
     df = require_data()
     if df is None:
         return
     domain = st.session_state.get("domain") or detect_field(df, use_gemini=False, optuna_trials=8)["domain"]
     st.session_state.domain = domain
-    recommended = DOMAIN_RECOMMENDED_MODELS.get(domain, [])
-    model_ids = [m for m in recommended if m in FORGE_MODEL_CATALOG] + [
-        m for m in FORGE_MODEL_CATALOG if m not in recommended
-    ]
+    runnable = set(list_runnable_models())
+    hidden = [m for m in FORGE_MODEL_CATALOG if m not in runnable]
+    if hidden:
+        st.caption(
+            "Hidden (native lib missing on this machine): "
+            + ", ".join(hidden)
+            + " — Mac: `brew install libomp` then reinstall xgboost."
+        )
+    recommended = [m for m in DOMAIN_RECOMMENDED_MODELS.get(domain, []) if m in runnable]
+    model_ids = recommended + [m for m in runnable if m not in recommended]
+    if not model_ids:
+        st.error("No runnable models found. Check sklearn install.")
+        return
     model_id = st.selectbox(
         "Model",
         model_ids,

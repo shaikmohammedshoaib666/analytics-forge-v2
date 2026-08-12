@@ -15,6 +15,10 @@ git reset --hard origin/cursor/forge-v2-foundation-f3f9
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
+# macOS only — XGBoost needs OpenMP (fixes Field "libomp.dylib" crash).
+# Without this, Forge still runs and falls back to RandomForest.
+# brew install libomp && pip install --force-reinstall xgboost
+
 # .env (gitignored)
 # GEMINI_API_KEY=...
 # GEMINI_MODEL=gemini-flash-latest
