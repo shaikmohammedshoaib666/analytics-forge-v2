@@ -1,0 +1,23 @@
+# Render Blueprint — faster free/public host than Streamlit Cloud for this app.
+# Deploy: https://dashboard.render.com/select-repo?type=blueprint
+# Connect repo shaikmohammedshoaib666/analytics-forge-v2 → apply this file.
+# LIVE Modbus to private plant IPs will NOT work from Render — use MANUAL or buffer_only.
+
+services:
+  - type: web
+    name: analytics-forge-v2
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements-cloud.txt
+    startCommand: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: STREAMLIT_BROWSER_GATHER_USAGE_STATS
+        value: "false"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-flash-latest

@@ -33,58 +33,50 @@ python smoke_test.py
 
 ---
 
-## Deploy: Streamlit Cloud vs Docker (read this)
+## Deploy: pick a host (Streamlit Cloud is slow — use these)
 
-### Short answer
-| | **Streamlit Cloud** | **Docker** |
-|--|---------------------|------------|
-| What it is | Hosted website for Streamlit apps (share a URL) | A **box** that packs Python + libs so the same app runs anywhere |
-| Like Streamlit? | Yes — it's Streamlit's own host | No — Docker is packaging/runtime; you still run Streamlit *inside* the box |
-| Free tier | Yes, but **~1GB RAM**, slow installs | Needs a machine (your PC, Oracle free VM, Railway, Azure, …) |
-| This app full stack? | **Too heavy** if you install PySpark + GE + ydata + everything | **Yes** — that's what Docker is for |
-| Best for Forge v2 | **Demo / share link** with `requirements-cloud.txt` | **Full industrial OS** (Spark optional, gateway, persistent `data/`) |
+| Platform | Public URL? | Speed | Best for |
+|----------|-------------|-------|----------|
+| **Hugging Face Spaces** | Yes | Usually faster first build | **Recommended free demo link** — see `deploy/HUGGINGFACE.md` |
+| **Render** (Blueprint) | Yes (`render.yaml`) | Medium; free tier sleeps | Stable demo — see `deploy/RENDER.md` |
+| **Streamlit Cloud** | Yes | Often 15–40+ min / OOM | Only if you already use it + `requirements-cloud.txt` |
+| **Oracle Free / Azure / VPS + Docker** | Yes (your IP:8501) | Fast once VM exists | Full stack + LIVE gateway — `deploy/ORACLE_FREE.md` |
 
-**PySpark on free Streamlit Cloud will usually fail or OOM.** Polars + pandas + XGBoost + Prophet is the realistic Cloud set.
+**I cannot log into your HF / Render / Streamlit account** — you click once; then you own the permanent URL.
 
-### Option A — Streamlit Cloud (public URL, lighter)
+**PySpark on free cloud hosts will usually fail or OOM.** Always use **`requirements-cloud.txt`** for public demos.
 
-1. Push branch to GitHub (already done: `analytics-forge-v2`).
-2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**.
-3. Repo: `shaikmohammedshoaib666/analytics-forge-v2`
-4. Branch: `cursor/forge-v2-foundation-f3f9` (or `main` after merge)
-5. Main file: `app.py`
-6. **Important:** In app settings / advanced, set requirements file to **`requirements-cloud.txt`** (no PySpark).  
-   If the UI only reads `requirements.txt`, temporarily rename or copy cloud file over for that deploy.
-7. **Secrets** (Manage app → Secrets):
+### Option A — Hugging Face Spaces (preferred free link)
 
-```toml
-GEMINI_API_KEY = "your_key"
-GEMINI_MODEL = "gemini-flash-latest"
-```
+1. https://huggingface.co/new-space → SDK **Streamlit** → link this GitHub repo  
+2. Branch `cursor/forge-v2-foundation-f3f9`, app file `app.py`  
+3. Secret: `GEMINI_API_KEY`  
+4. Details: **`deploy/HUGGINGFACE.md`**
 
-8. Deploy. First build can take 10–20+ minutes.
+### Option B — Render Blueprint
 
-Cloud demo will show **pandas + polars** engines (not Spark). LIVE Modbus to a factory PLC from Cloud usually **won't** reach private `192.168.x` — use `buffer_only` / sample CSV / FastAPI on a public URL for demos.
+1. https://dashboard.render.com/select-repo?type=blueprint  
+2. Repo uses root **`render.yaml`** (installs `requirements-cloud.txt`)  
+3. Details: **`deploy/RENDER.md`**
 
-### Option B — Docker (full heavy app)
+### Option C — Streamlit Cloud (slower)
 
-Docker ≠ Streamlit Cloud. Think: **shipping container**. You put Forge + all libraries inside; then run that container on a laptop or cloud VM. Same Streamlit UI, but you control RAM/CPU.
+1. [share.streamlit.io](https://share.streamlit.io) → **New app**
+2. Repo: `shaikmohammedshoaib666/analytics-forge-v2`
+3. Branch: `cursor/forge-v2-foundation-f3f9` · Main file: `app.py`
+4. Requirements file: **`requirements-cloud.txt`**
+5. Secrets: `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-flash-latest`
+
+Cloud demos: use **MANUAL** or LIVE **`buffer_only`**. Private plant `192.168.x` Modbus will not reach from the internet.
+
+### Option D — Docker on your VM (full heavy app)
 
 ```bash
-# build (uses full requirements.txt — includes Spark if needed)
 docker compose up --build
-
-# open http://127.0.0.1:8501
+# http://127.0.0.1:8501  (or http://VM_PUBLIC_IP:8501)
 ```
 
-Or:
-
-```bash
-docker build -t analytics-forge-v2 .
-docker run --rm -p 8501:8501 --env-file .env -v "$(pwd)/data:/app/data" analytics-forge-v2
-```
-
-Put Docker on Oracle Free / Azure Student / a ₹500–1000 VPS when you want full Spark + gateway.
+See `deploy/ORACLE_FREE.md` / `deploy/AZURE_STUDENT.md`.
 
 ---
 
