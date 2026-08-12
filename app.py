@@ -1,65 +1,1248 @@
 """
-Analytics Forge — Phase 1 Streamlit app.
-Upload → Clean → Field → KPIs → Charts → ML → AI → Dashboard → Email
+Analytics Forge v2 — Production Dual-Mode Industrial OS
+Single-file app: LIVE Modbus SCADA buffer + MANUAL upload, shared analytics core.
 """
 from __future__ import annotations
 
-import sys
+import json
+import logging
+import os
+import smtplib
+import ssl
+import time
+import traceback
+import warnings
+from datetime import datetime, timedelta
+from email.message import EmailMessage
 from pathlib import Path
+from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
+from dotenv import load_dotenv
+from sklearn.ensemble import (
+    GradientBoostingClassifier,
+    GradientBoostingRegressor,
+    IsolationForest,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+)
+from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.preprocessing import LabelEncoder
 
-# Ensure project root on path
+warnings.filterwarnings("ignore")
+logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+logging.getLogger("prophet").setLevel(logging.WARNING)
+
+# -----------------------------------------------------------------------------
+# Paths / env
+# -----------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+load_dotenv(ROOT / ".env")
+DATA_DIR = ROOT / "data"
+LIVE_CSV = DATA_DIR / "live.csv"
+UPLOAD_DIR = DATA_DIR / "uploads"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-from config.settings import SAMPLES_DIR, UPLOADS_DIR
-from core import db
-from core.classify import classify, load_domains
-from core.engine import available_engines
-from core.filters import TopFilters, apply_buffer_filters, filter_schema_for_domain
-from core.kpis import compute_kpis
-from core.live.base import get_connector
-from core.live.stubs import VIRTUAL_UNIVERSE_SIZE, fetch_live_data, list_connectors
-from core.mode import DataMode
-from core.pack import build_html_pack
-from core.pipeline import run_pipeline
-from core.templates import load_templates
-from modules.ai_guide import ask_ai
-from modules.auto_dashboard import build_auto_dashboard
-from modules.business_alerts import generate_alerts
-from modules.charts import build_chart, load_charts_catalog
-from modules.ml_registry import list_models
-from modules.ml_runner import run_model
-from modules.optuna_tuner import optuna_available, tune_model
-from modules.rag import build_index, query_rag, rag_available
-from modules.dashboard_slicers import apply_slicers, auto_chart_specs, suggest_slicer_columns
-from modules.email_automation import (
-    EmailConfigError,
-    config_status,
-    email_configured,
-    process_inbound_mailbox,
-    send_current_report,
-)
-from ui.auth_gate import render_user_sidebar, require_login
-from ui.components import (
-    download_df_button,
-    download_html_pack_button,
-    kpi_cards,
-    show_ml_metrics,
-)
-from ui.session import init_session_state, reset_analysis_state
-from ui.theme import inject_css, page_hero
-from modules.manager_insights import build_manager_insight
+MODBUS_HOST = os.getenv("MODBUS_HOST", "192.168.1.100")
+MODBUS_PORT = int(os.getenv("MODBUS_PORT", "502"))
+MODBUS_UNIT = int(os.getenv("MODBUS_UNIT", "1"))
+MODBUS_START = int(os.getenv("MODBUS_START", "0"))  # 40001 -> address 0
+MODBUS_COUNT = int(os.getenv("MODBUS_COUNT", "10"))
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+EMAIL_USER = os.getenv("EMAIL_USER", "").strip()
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "").strip()
+EMAIL_FROM = os.getenv("EMAIL_FROM", "").strip() or EMAIL_USER
+EMAIL_SMTP_HOST = os.getenv("EMAIL_SMTP_HOST", "smtp.gmail.com").strip()
+EMAIL_SMTP_PORT = int(os.getenv("EMAIL_SMTP_PORT", "587") or 587)
+OPERATOR_EMAIL = "shaikhmohammedshoaib666@gmail.com"
+
+REGISTER_NAMES = [
+    "temperature",
+    "vibration",
+    "pressure",
+    "current",
+    "voltage",
+    "speed",
+    "torque",
+    "rul",
+    "failure",
+    "load",
+]
 
 st.set_page_config(
-    page_title="Analytics Forge",
+    page_title="Analytics Forge v2",
     page_icon="⚒️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# -----------------------------------------------------------------------------
+# Session defaults
+# -----------------------------------------------------------------------------
+def init_state() -> None:
+    defaults = {
+        "signed_in": True,
+        "mode": "MANUAL UPLOAD",
+        "page": "Upload",
+        "manual_df": None,
+        "manual_name": None,
+        "live_last_poll": 0.0,
+        "live_status": "idle",
+        "live_error": None,
+        "clean_df": None,
+        "clean_checks": None,
+        "automl_result": None,
+        "forecast_text": None,
+        "chat_history": [],
+        "pipeline_started": False,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+# =============================================================================
+# GLOBAL FUNCTIONS — dual-mode data + shared analytics core
+# =============================================================================
+
+def _scale_register(name: str, raw: int) -> float:
+    """Map raw Modbus register integers to engineering units."""
+    raw = float(raw)
+    if name == "temperature":
+        return round(raw / 10.0, 2)
+    if name == "vibration":
+        return round(raw / 1000.0, 4)
+    if name == "pressure":
+        return round(raw / 10.0, 2)
+    if name == "current":
+        return round(raw / 100.0, 3)
+    if name == "voltage":
+        return round(raw / 10.0, 2)
+    if name == "speed":
+        return float(raw)
+    if name == "torque":
+        return round(raw / 10.0, 2)
+    if name == "rul":
+        return float(raw)
+    if name == "failure":
+        return 1.0 if raw > 0 else 0.0
+    if name == "load":
+        return round(raw / 10.0, 2)
+    return raw
+
+
+def poll_modbus_once(
+    host: str = MODBUS_HOST,
+    port: int = MODBUS_PORT,
+    unit: int = MODBUS_UNIT,
+    start: int = MODBUS_START,
+    count: int = MODBUS_COUNT,
+) -> dict[str, Any]:
+    """
+    REAL Modbus TCP read of holding registers (40001+).
+    Raises on connection / protocol failure — no demo fake plant.
+    """
+    try:
+        from pymodbus.client import ModbusTcpClient
+    except ImportError as exc:
+        raise RuntimeError(
+            "pymodbus is not installed. Run: pip install pymodbus"
+        ) from exc
+
+    client = ModbusTcpClient(host=host, port=port, timeout=3)
+    try:
+        if not client.connect():
+            raise RuntimeError(
+                f"Cannot connect to Modbus TCP {host}:{port}. "
+                "Check plant PLC / VPN / MODBUS_HOST in .env."
+            )
+        # pymodbus 3.x uses device_id / slave depending on version
+        try:
+            result = client.read_holding_registers(address=start, count=count, device_id=unit)
+        except TypeError:
+            try:
+                result = client.read_holding_registers(address=start, count=count, slave=unit)
+            except TypeError:
+                result = client.read_holding_registers(start, count, unit)
+
+        if result is None or (hasattr(result, "isError") and result.isError()):
+            raise RuntimeError(f"Modbus read error from {host}:{port} regs@{start}+{count}: {result}")
+
+        regs = list(result.registers)
+        if len(regs) < count:
+            raise RuntimeError(f"Expected {count} registers, got {len(regs)}")
+
+        row: dict[str, Any] = {"timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+        for i, name in enumerate(REGISTER_NAMES[:count]):
+            row[name] = _scale_register(name, regs[i])
+        for i in range(len(REGISTER_NAMES), count):
+            row[f"reg_{40001 + i}"] = float(regs[i])
+        return row
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def append_live_csv(row: dict[str, Any], path: Path = LIVE_CSV) -> pd.DataFrame:
+    """Append one SCADA poll row to data/live.csv and return full buffer."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame([row])
+    if path.exists():
+        try:
+            old = pd.read_csv(path)
+            out = pd.concat([old, frame], ignore_index=True)
+        except Exception:
+            out = frame
+    else:
+        out = frame
+    # Keep a bounded SCADA buffer (last 50k rows)
+    if len(out) > 50_000:
+        out = out.tail(50_000).reset_index(drop=True)
+    out.to_csv(path, index=False)
+    return out
+
+
+def read_live_buffer(path: Path = LIVE_CSV) -> Optional[pd.DataFrame]:
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_csv(path)
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        return df
+    except Exception:
+        return None
+
+
+def ensure_live_poll(force: bool = False, min_interval_s: float = 5.0) -> pd.DataFrame:
+    """
+    LIVE SCADA path: poll pymodbus every ~5s, persist to data/live.csv, return buffer.
+    No DemoSimulator. Connection failure raises / surfaces as live_error.
+    """
+    now = time.time()
+    last = float(st.session_state.get("live_last_poll") or 0.0)
+    need = force or (now - last >= min_interval_s)
+    if need:
+        try:
+            row = poll_modbus_once()
+            df = append_live_csv(row)
+            st.session_state.live_last_poll = now
+            st.session_state.live_status = "connected"
+            st.session_state.live_error = None
+            return df
+        except Exception as exc:
+            st.session_state.live_status = "error"
+            st.session_state.live_error = str(exc)
+            buf = read_live_buffer()
+            if buf is not None and len(buf):
+                # Serve last good SCADA buffer while showing the error
+                return buf
+            raise
+    buf = read_live_buffer()
+    if buf is not None and len(buf):
+        return buf
+    # First poll required
+    row = poll_modbus_once()
+    df = append_live_csv(row)
+    st.session_state.live_last_poll = time.time()
+    st.session_state.live_status = "connected"
+    st.session_state.live_error = None
+    return df
+
+
+def get_data() -> pd.DataFrame:
+    """
+    Dual-mode data switch used by EVERY page.
+    LIVE CONNECT -> real Modbus SCADA buffer (data/live.csv)
+    MANUAL UPLOAD -> uploaded dataframe in session
+    """
+    mode = st.session_state.get("mode", "MANUAL UPLOAD")
+    if mode == "LIVE CONNECT":
+        return ensure_live_poll(force=False, min_interval_s=5.0)
+
+    df = st.session_state.get("manual_df")
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        raise RuntimeError(
+            "No manual file loaded. Go to Upload (or sidebar file uploader) and upload a CSV/Excel."
+        )
+    return df.copy()
+
+
+def _basic_checks(df: pd.DataFrame) -> list[dict[str, Any]]:
+    """Always-available quality checks (7 rows for Clean page table)."""
+    rows = []
+    n = len(df)
+    # 1 CONSTANT columns
+    const_cols = [c for c in df.columns if df[c].nunique(dropna=True) <= 1]
+    rows.append({
+        "check": "CONSTANT",
+        "status": "FAIL" if const_cols else "PASS",
+        "detail": f"{len(const_cols)} constant cols: {const_cols[:5]}" if const_cols else "No constant columns",
+    })
+    # 2 ZEROS
+    num = df.select_dtypes(include=[np.number])
+    zero_ratio = float((num == 0).sum().sum() / max(1, num.size)) if num.size else 0.0
+    rows.append({
+        "check": "ZEROS",
+        "status": "WARN" if zero_ratio > 0.3 else "PASS",
+        "detail": f"{zero_ratio*100:.1f}% zero cells in numeric columns",
+    })
+    # 3 NULLS / Missing
+    miss = float(df.isna().sum().sum() / max(1, df.size))
+    rows.append({
+        "check": "NULLS",
+        "status": "FAIL" if miss > 0.2 else ("WARN" if miss > 0.05 else "PASS"),
+        "detail": f"{miss*100:.2f}% missing values",
+    })
+    # 4 DUPLICATES
+    dups = int(df.duplicated().sum())
+    rows.append({
+        "check": "DUPLICATES",
+        "status": "WARN" if dups else "PASS",
+        "detail": f"{dups} duplicate rows",
+    })
+    # 5 OUTLIERS (IQR)
+    outlier_n = 0
+    for c in num.columns:
+        q1, q3 = num[c].quantile(0.25), num[c].quantile(0.75)
+        iqr = q3 - q1
+        if iqr == 0 or pd.isna(iqr):
+            continue
+        outlier_n += int(((num[c] < q1 - 1.5 * iqr) | (num[c] > q3 + 1.5 * iqr)).sum())
+    rows.append({
+        "check": "OUTLIER",
+        "status": "WARN" if outlier_n > max(5, int(0.05 * n)) else "PASS",
+        "detail": f"{outlier_n} IQR outlier cells",
+    })
+    # 6 SCHEMA
+    rows.append({
+        "check": "SCHEMA",
+        "status": "PASS" if n > 0 and df.shape[1] > 0 else "FAIL",
+        "detail": f"{n} rows × {df.shape[1]} cols",
+    })
+    # 7 TIMESTAMP
+    ts_cols = [c for c in df.columns if any(h in str(c).lower() for h in ("time", "date", "timestamp"))]
+    rows.append({
+        "check": "TIMESTAMP",
+        "status": "PASS" if ts_cols else "WARN",
+        "detail": f"time-like cols: {ts_cols}" if ts_cols else "No timestamp column detected",
+    })
+    return rows
+
+
+def _clean_pandas(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    log: list[str] = []
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    log.append("strip column names")
+    out = out.dropna(how="all")
+    out = out.loc[:, ~out.columns.duplicated()]
+    before = len(out)
+    out = out.drop_duplicates()
+    if len(out) != before:
+        log.append(f"drop_duplicates {before}->{len(out)}")
+    for c in list(out.columns):
+        if out[c].dtype == object:
+            converted = pd.to_numeric(out[c], errors="coerce")
+            if out[c].notna().sum() and converted.notna().sum() / max(1, out[c].notna().sum()) >= 0.8:
+                out[c] = converted
+                log.append(f"to_numeric {c}")
+    for c in out.select_dtypes(include=[np.number]).columns:
+        if out[c].isna().any():
+            out[c] = out[c].fillna(out[c].median())
+            log.append(f"fillna_median {c}")
+    for c in out.select_dtypes(include=["object", "string"]).columns:
+        if out[c].isna().any():
+            mode = out[c].mode(dropna=True)
+            fill = mode.iloc[0] if len(mode) else "Unknown"
+            out[c] = out[c].fillna(fill)
+            log.append(f"fillna_mode {c}")
+    return out.reset_index(drop=True), log
+
+
+def _clean_pyspark(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    from pyspark.sql import SparkSession
+
+    spark = (
+        SparkSession.builder.master("local[*]")
+        .appName("forge_v2_clean")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.shuffle.partitions", "2")
+        .getOrCreate()
+    )
+    log = ["pyspark session started"]
+    try:
+        sdf = spark.createDataFrame(df.astype(str))
+        before = sdf.count()
+        sdf = sdf.dropDuplicates()
+        after = sdf.count()
+        log.append(f"spark dropDuplicates {before}->{after}")
+        pdf = sdf.toPandas()
+        # restore numerics where possible
+        cleaned, plog = _clean_pandas(pdf)
+        log.extend(plog)
+        return cleaned, log
+    finally:
+        spark.stop()
+
+
+def _run_great_expectations(df: pd.DataFrame) -> dict[str, Any]:
+    try:
+        import great_expectations as gx  # noqa: F401
+
+        results = []
+        for col in df.columns:
+            null_pct = float(df[col].isna().mean())
+            results.append({"column": col, "check": "not_null_50pct", "success": null_pct < 0.5})
+        for col in df.select_dtypes(include=[np.number]).columns:
+            results.append({
+                "column": col,
+                "check": "finite",
+                "success": bool(np.isfinite(pd.to_numeric(df[col], errors="coerce")).all()),
+            })
+        passed = sum(1 for r in results if r["success"])
+        return {"engine": "great_expectations", "passed": passed, "total": len(results), "ok": True}
+    except Exception as exc:
+        return {"engine": "great_expectations", "ok": False, "error": str(exc)}
+
+
+def _run_ydata(df: pd.DataFrame) -> dict[str, Any]:
+    try:
+        from ydata_profiling import ProfileReport
+
+        profile = ProfileReport(df.head(min(500, len(df))), minimal=True, progress_bar=False)
+        desc = profile.get_description()
+        n_vars = len(desc.get("variables", {}))
+        n_alerts = len(desc.get("alerts", []))
+        return {"engine": "ydata-profiling", "ok": True, "variables": n_vars, "alerts": n_alerts}
+    except Exception as exc:
+        return {"engine": "ydata-profiling", "ok": False, "error": str(exc)}
+
+
+def _run_cleanlab(df: pd.DataFrame) -> dict[str, Any]:
+    try:
+        from cleanlab import Datalab
+
+        num = df.select_dtypes(include=[np.number]).dropna()
+        if num.shape[1] < 2 or len(num) < 10:
+            return {"engine": "cleanlab", "ok": True, "skipped": "need >=2 numeric cols and 10 rows"}
+        lab = Datalab(data=num.reset_index(drop=True))
+        lab.find_issues(features=num.values)
+        issues = lab.get_issues()
+        n_out = int(issues["is_outlier_issue"].sum()) if "is_outlier_issue" in issues.columns else 0
+        return {"engine": "cleanlab", "ok": True, "outlier_issues": n_out, "rows": len(num)}
+    except Exception as exc:
+        return {"engine": "cleanlab", "ok": False, "error": str(exc)}
+
+
+def clean_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Industrial clean: PySpark (if available) + pandas finish + GE + ydata + Cleanlab.
+    Returns (clean_df, checks_table with 7 rows).
+    """
+    engine_logs: list[str] = []
+    try:
+        clean_df, engine_logs = _clean_pyspark(df)
+        engine_logs.insert(0, "engine=pyspark")
+    except Exception as exc:
+        clean_df, engine_logs = _clean_pandas(df)
+        engine_logs.insert(0, f"engine=pandas (pyspark fallback: {exc})")
+
+    checks = _basic_checks(clean_df)
+    ge = _run_great_expectations(clean_df)
+    yd = _run_ydata(clean_df)
+    cl = _run_cleanlab(clean_df)
+
+    # Enrich CONSTANT / OUTLIER rows with engine notes in detail already set
+    checks_df = pd.DataFrame(checks)
+    meta = pd.DataFrame([
+        {"check": "ENGINES", "status": "INFO", "detail": " | ".join(engine_logs[:4])},
+        {"check": "GE", "status": "PASS" if ge.get("ok") else "WARN", "detail": json.dumps(ge)[:180]},
+        {"check": "YDATA", "status": "PASS" if yd.get("ok") else "WARN", "detail": json.dumps(yd)[:180]},
+        {"check": "CLEANLAB", "status": "PASS" if cl.get("ok") else "WARN", "detail": json.dumps(cl)[:180]},
+    ])
+    # Keep first 7 operational checks for the screenshot-style table
+    table = checks_df.head(7).copy()
+    st.session_state["_clean_engine_meta"] = meta
+    st.session_state.clean_df = clean_df
+    st.session_state.clean_checks = table
+    return clean_df, table
+
+
+def _col(df: pd.DataFrame, *names: str) -> Optional[str]:
+    lower = {str(c).lower(): c for c in df.columns}
+    for n in names:
+        if n.lower() in lower:
+            return lower[n.lower()]
+    for n in names:
+        for k, real in lower.items():
+            if n.lower() in k:
+                return real
+    return None
+
+
+def get_kpis(df: pd.DataFrame) -> dict[str, Any]:
+    """Industrial KPI dict for SCADA / PdM boards."""
+    n_rows, n_cols = df.shape
+    miss = round(float(df.isna().sum().sum() / max(1, df.size) * 100), 2)
+    tcol = _col(df, "temperature", "temp")
+    vcol = _col(df, "vibration", "vib")
+    pcol = _col(df, "pressure")
+    rcol = _col(df, "rul", "remaining_useful_life")
+    fcol = _col(df, "failure", "fault", "alarm")
+
+    def mean_of(col: Optional[str]) -> Any:
+        if not col:
+            return "—"
+        s = pd.to_numeric(df[col], errors="coerce")
+        if s.notna().sum() == 0:
+            return "—"
+        return round(float(s.mean()), 3)
+
+    kpis = {
+        "Rows": int(n_rows),
+        "Cols": int(n_cols),
+        "Missing%": miss,
+        "Mean_temp": mean_of(tcol),
+        "Mean_vib": mean_of(vcol),
+        "Mean_pressure": mean_of(pcol),
+        "Mean_RUL": mean_of(rcol),
+        "Failure_Count": int(pd.to_numeric(df[fcol], errors="coerce").fillna(0).sum()) if fcol else 0,
+        "Min_RUL": (
+            round(float(pd.to_numeric(df[rcol], errors="coerce").min()), 2)
+            if rcol and pd.to_numeric(df[rcol], errors="coerce").notna().any()
+            else "—"
+        ),
+    }
+    return kpis
+
+
+def _numeric_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, Optional[str]]:
+    work = df.copy()
+    fail_col = _col(work, "failure", "fault", "alarm", "label")
+    num_cols = work.select_dtypes(include=[np.number]).columns.tolist()
+    feats = [c for c in num_cols if c != fail_col][:12]
+    if not feats:
+        raise RuntimeError("Need numeric sensor columns for field prediction.")
+    X = work[feats].apply(pd.to_numeric, errors="coerce").fillna(0)
+    return X, fail_col
+
+
+def field_predict(df: pd.DataFrame) -> float:
+    """
+    Train RF + GB + IsolationForest ensemble to estimate failure risk % in next window.
+    Returns risk percentage 0-100.
+    """
+    X, fail_col = _numeric_xy(df)
+    if len(X) < 10:
+        # Not enough history — use IsolationForest anomaly rate as risk proxy
+        iso = IsolationForest(contamination=0.1, random_state=42)
+        labels = iso.fit_predict(X)
+        risk = float((labels == -1).mean() * 100)
+        return round(min(99.0, max(1.0, risk)), 1)
+
+    if fail_col and work_has_binary(df, fail_col):
+        y = pd.to_numeric(df[fail_col], errors="coerce").fillna(0).astype(int)
+        y = (y > 0).astype(int)
+        if y.nunique() < 2:
+            iso = IsolationForest(contamination=0.08, random_state=42)
+            risk = float((iso.fit_predict(X) == -1).mean() * 100)
+            return round(risk, 1)
+        rf = RandomForestClassifier(n_estimators=120, random_state=42)
+        gb = GradientBoostingClassifier(random_state=42)
+        rf.fit(X, y)
+        gb.fit(X, y)
+        iso = IsolationForest(contamination=max(0.05, float(y.mean()) or 0.05), random_state=42)
+        iso.fit(X)
+        # Predict on latest window
+        latest = X.tail(min(24, len(X)))
+        p_rf = rf.predict_proba(latest)[:, 1].mean()
+        p_gb = gb.predict_proba(latest)[:, 1].mean()
+        p_iso = float((iso.predict(latest) == -1).mean())
+        risk = 100.0 * (0.4 * p_rf + 0.4 * p_gb + 0.2 * p_iso)
+        return round(float(min(99.5, max(0.5, risk))), 1)
+
+    iso = IsolationForest(contamination=0.1, random_state=42)
+    risk = float((iso.fit_predict(X) == -1).mean() * 100)
+    # Blend with high temp / vib heuristics if present
+    tcol = _col(df, "temperature", "temp")
+    vcol = _col(df, "vibration", "vib")
+    bump = 0.0
+    if tcol:
+        t = pd.to_numeric(df[tcol], errors="coerce")
+        if t.notna().any() and t.iloc[-1] > t.mean() + 2 * (t.std() or 1):
+            bump += 15
+    if vcol:
+        v = pd.to_numeric(df[vcol], errors="coerce")
+        if v.notna().any() and v.iloc[-1] > v.mean() + 2 * (v.std() or 1):
+            bump += 15
+    return round(min(99.0, risk + bump), 1)
+
+
+def work_has_binary(df: pd.DataFrame, col: str) -> bool:
+    s = pd.to_numeric(df[col], errors="coerce").dropna()
+    if s.empty:
+        return False
+    return s.nunique() <= 5
+
+
+def run_automl(df: pd.DataFrame, target: str, n_trials: int = 50) -> tuple[str, dict[str, Any]]:
+    """
+    Optuna AutoML (50 trials) — picks best model family + hyperparameters.
+    Returns (model_name, metrics).
+    """
+    if target not in df.columns:
+        raise RuntimeError(f"Target '{target}' not in dataframe.")
+
+    work = df.copy()
+    y_raw = work[target]
+    feature_cols = [c for c in work.columns if c != target]
+    # Drop datetime-like
+    feature_cols = [
+        c for c in feature_cols
+        if not pd.api.types.is_datetime64_any_dtype(work[c])
+        and not any(h in str(c).lower() for h in ("timestamp", "datetime"))
+    ]
+    X = work[feature_cols].copy()
+    for c in X.columns:
+        if not pd.api.types.is_numeric_dtype(X[c]):
+            X[c] = pd.factorize(X[c].astype(str))[0]
+        else:
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+    X = X.fillna(0)
+
+    # Task detection
+    y_num = pd.to_numeric(y_raw, errors="coerce")
+    if y_num.notna().sum() >= max(10, int(0.8 * len(y_raw))) and y_num.nunique() > 8:
+        task = "regression"
+        y = y_num
+        mask = y.notna()
+        X, y = X.loc[mask], y.loc[mask]
+        scoring = "neg_root_mean_squared_error"
+    else:
+        task = "classification"
+        le = LabelEncoder()
+        y = pd.Series(le.fit_transform(y_raw.astype(str)), index=y_raw.index)
+        scoring = "accuracy"
+
+    if len(X) < 12:
+        raise RuntimeError("Need at least 12 rows for AutoML.")
+
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    except ImportError as exc:
+        raise RuntimeError("Optuna not installed. pip install optuna") from exc
+
+    def objective(trial: Any) -> float:
+        model_name = trial.suggest_categorical(
+            "model",
+            ["RandomForest", "GradientBoosting"],
+        )
+        if task == "regression":
+            if model_name == "RandomForest":
+                model = RandomForestRegressor(
+                    n_estimators=trial.suggest_int("n_estimators", 50, 300),
+                    max_depth=trial.suggest_int("max_depth", 2, 20),
+                    min_samples_split=trial.suggest_int("min_samples_split", 2, 12),
+                    random_state=42,
+                    n_jobs=-1,
+                )
+            else:
+                model = GradientBoostingRegressor(
+                    n_estimators=trial.suggest_int("n_estimators", 50, 250),
+                    max_depth=trial.suggest_int("max_depth", 2, 8),
+                    learning_rate=trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                    random_state=42,
+                )
+        else:
+            if model_name == "RandomForest":
+                model = RandomForestClassifier(
+                    n_estimators=trial.suggest_int("n_estimators", 50, 300),
+                    max_depth=trial.suggest_int("max_depth", 2, 20),
+                    min_samples_split=trial.suggest_int("min_samples_split", 2, 12),
+                    random_state=42,
+                    n_jobs=-1,
+                )
+            else:
+                model = GradientBoostingClassifier(
+                    n_estimators=trial.suggest_int("n_estimators", 50, 250),
+                    max_depth=trial.suggest_int("max_depth", 2, 8),
+                    learning_rate=trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                    random_state=42,
+                )
+        scores = cross_val_score(model, X, y, cv=min(5, max(2, len(X) // 5)), scoring=scoring)
+        return float(scores.mean())
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=int(n_trials), show_progress_bar=False)
+    best = study.best_params
+    best_model_name = str(best.get("model", "RandomForest"))
+
+    # Fit final holdout metrics
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    params = {k: v for k, v in best.items() if k != "model"}
+    if task == "regression":
+        if best_model_name == "RandomForest":
+            model = RandomForestRegressor(random_state=42, n_jobs=-1, **params)
+        else:
+            model = GradientBoostingRegressor(random_state=42, **params)
+        model.fit(X_train, y_train)
+        pred = model.predict(X_test)
+        metrics = {
+            "task": task,
+            "r2": round(float(r2_score(y_test, pred)), 4),
+            "rmse": round(float(np.sqrt(mean_squared_error(y_test, pred))), 4),
+            "mae": round(float(mean_absolute_error(y_test, pred)), 4),
+            "optuna_best_value": round(float(study.best_value), 4),
+            "n_trials": int(n_trials),
+            "params": best,
+            "target": target,
+        }
+    else:
+        if best_model_name == "RandomForest":
+            model = RandomForestClassifier(random_state=42, n_jobs=-1, **params)
+        else:
+            model = GradientBoostingClassifier(random_state=42, **params)
+        model.fit(X_train, y_train)
+        pred = model.predict(X_test)
+        metrics = {
+            "task": task,
+            "accuracy": round(float(accuracy_score(y_test, pred)), 4),
+            "f1": round(float(f1_score(y_test, pred, average="weighted", zero_division=0)), 4),
+            "optuna_best_value": round(float(study.best_value), 4),
+            "n_trials": int(n_trials),
+            "params": best,
+            "target": target,
+        }
+    return best_model_name, metrics
+
+
+def prophet_forecast(df: pd.DataFrame, target: str) -> str:
+    """
+    Prophet 90-day business forecast text:
+    'Business will decrease X% in Y days' style.
+    """
+    try:
+        from prophet import Prophet
+    except Exception as exc:
+        return f"Prophet unavailable ({exc}). Install: pip install prophet"
+
+    # Find date column
+    date_col = None
+    for c in df.columns:
+        if any(h in str(c).lower() for h in ("time", "date", "timestamp", "ds")):
+            parsed = pd.to_datetime(df[c], errors="coerce")
+            if parsed.notna().sum() >= max(8, int(0.5 * len(df))):
+                date_col = c
+                break
+    if date_col is None:
+        # synthesize index timeline for SCADA buffer
+        ds = pd.date_range(end=datetime.utcnow(), periods=len(df), freq="H")
+    else:
+        ds = pd.to_datetime(df[date_col], errors="coerce")
+
+    if target not in df.columns:
+        return f"Target '{target}' not found for Prophet."
+
+    tmp = pd.DataFrame({"ds": ds, "y": pd.to_numeric(df[target], errors="coerce")}).dropna()
+    tmp = tmp.sort_values("ds").drop_duplicates("ds", keep="last")
+    if len(tmp) < 10:
+        return "Need >=10 dated rows for Prophet 90-day forecast."
+
+    m = Prophet(uncertainty_samples=100)
+    m.fit(tmp)
+    # Infer freq
+    freq = pd.infer_freq(tmp["ds"]) or "D"
+    # 90 days ahead — if hourly-ish use 90*24
+    if freq in {"H", "h", "T", "min"}:
+        periods = 90 * 24
+        horizon_days = 90
+    else:
+        periods = 90
+        horizon_days = 90
+    future = m.make_future_dataframe(periods=periods, freq=freq if freq else "D")
+    fc = m.predict(future)
+    last_actual = float(tmp["y"].iloc[-1])
+    future_only = fc[fc["ds"] > tmp["ds"].max()]
+    if future_only.empty:
+        end_yhat = float(fc["yhat"].iloc[-1])
+    else:
+        # point near ~90 days
+        idx = min(len(future_only) - 1, max(0, periods - 1))
+        end_yhat = float(future_only["yhat"].iloc[idx])
+    if last_actual == 0:
+        pct = 0.0
+    else:
+        pct = (end_yhat - last_actual) / abs(last_actual) * 100.0
+    direction = "increase" if pct >= 0 else "decrease"
+    return (
+        f"Business / `{target}` will {direction} {abs(pct):.1f}% in {horizon_days} days "
+        f"(last={last_actual:.3f} → forecast≈{end_yhat:.3f})."
+    )
+
+
+def _gemini_answer(prompt: str) -> str:
+    if not GEMINI_API_KEY:
+        return ""
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        resp = model.generate_content(prompt)
+        return (getattr(resp, "text", None) or str(resp)).strip()
+    except Exception as exc:
+        return f"[Gemini error] {exc}"
+
+
+def rag_ask(question: str, df: pd.DataFrame) -> str:
+    """
+    Build LlamaIndex over current dataframe rows, then answer with Gemini grounded on context.
+    """
+    context_rows = []
+    sample = df.head(80)
+    for _, row in sample.iterrows():
+        context_rows.append(" | ".join(f"{c}={row[c]}" for c in sample.columns if pd.notna(row[c])))
+    context = "\n".join(context_rows[:80])
+
+    nodes_text = ""
+    try:
+        from llama_index.core import Document, VectorStoreIndex, Settings
+        from llama_index.core.embeddings import BaseEmbedding
+
+        # Lightweight local path: use simple keyword retrieval if embeddings unavailable
+        docs = [Document(text=t) for t in context_rows[:120]]
+        # Try building index; if embedding model missing, fall through
+        try:
+            index = VectorStoreIndex.from_documents(docs)
+            engine = index.as_query_engine(similarity_top_k=4)
+            retrieved = engine.query(question)
+            nodes_text = str(retrieved)
+        except Exception:
+            # keyword overlap retrieval
+            q_tokens = set(question.lower().split())
+            scored = []
+            for t in context_rows:
+                score = len(q_tokens & set(t.lower().split()))
+                scored.append((score, t))
+            scored.sort(reverse=True)
+            nodes_text = "\n".join(t for s, t in scored[:5] if s > 0) or context[:2000]
+    except Exception as exc:
+        nodes_text = context[:2500] + f"\n[LlamaIndex note: {exc}]"
+
+    prompt = (
+        "You are Analytics Forge industrial assistant. Answer ONLY from the data context.\n"
+        f"Question: {question}\n\nData context:\n{nodes_text}\n\n"
+        "Give a concise operational answer with numbers when present."
+    )
+    gem = _gemini_answer(prompt)
+    if gem:
+        return gem
+    # Offline fallback
+    return f"(Offline RAG) Top matching rows:\n{nodes_text[:1500]}"
+
+
+def send_email_report(to_addr: str, subject: str, body: str, df: Optional[pd.DataFrame] = None) -> str:
+    if not EMAIL_USER or not EMAIL_PASSWORD:
+        raise RuntimeError(
+            "Email not configured. Set EMAIL_USER and EMAIL_PASSWORD (Gmail App Password) in .env"
+        )
+    msg = EmailMessage()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg.set_content(body)
+    if df is not None:
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+        msg.add_attachment(csv_bytes, maintype="text", subtype="csv", filename="forge_buffer.csv")
+    context = ssl.create_default_context()
+    with smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=30) as server:
+        server.starttls(context=context)
+        server.login(EMAIL_USER, EMAIL_PASSWORD)
+        server.send_message(msg)
+    return f"Sent to {to_addr}"
+
+
+def load_uploaded_file(uploaded) -> pd.DataFrame:
+    name = uploaded.name.lower()
+    raw = uploaded.getvalue()
+    dest = UPLOAD_DIR / uploaded.name
+    dest.write_bytes(raw)
+    if name.endswith(".csv") or name.endswith(".tsv") or name.endswith(".txt"):
+        sep = "\t" if name.endswith(".tsv") else ","
+        return pd.read_csv(dest, sep=sep)
+    if name.endswith((".xlsx", ".xls", ".xlsm")):
+        return pd.read_excel(dest)
+    if name.endswith(".json"):
+        return pd.read_json(dest)
+    if name.endswith(".parquet"):
+        return pd.read_parquet(dest)
+    raise RuntimeError(f"Unsupported file type: {uploaded.name}")
+
+
+# =============================================================================
+# UI HELPERS (no raw HTML KPI leak — Streamlit metrics only)
+# =============================================================================
+
+def metric_grid(kpis: dict[str, Any], per_row: int = 4) -> None:
+    items = list(kpis.items())
+    for i in range(0, len(items), per_row):
+        cols = st.columns(per_row)
+        for j, (k, v) in enumerate(items[i : i + per_row]):
+            with cols[j]:
+                st.metric(str(k).replace("_", " "), v)
+
+
+def require_data() -> Optional[pd.DataFrame]:
+    try:
+        return get_data()
+    except Exception as exc:
+        st.error(str(exc))
+        if st.session_state.get("mode") == "LIVE CONNECT" and st.session_state.get("live_error"):
+            st.warning(
+                f"LIVE Modbus status: {st.session_state.live_status} — {st.session_state.live_error}"
+            )
+        return None
+
+
+# =============================================================================
+# PAGES
+# =============================================================================
+
+def page_upload() -> None:
+    st.header("Upload")
+    st.caption("MANUAL mode uses this file for all pages. LIVE mode ignores upload and uses Modbus SCADA buffer.")
+
+    if st.session_state.mode == "LIVE CONNECT":
+        st.info(
+            f"LIVE CONNECT active → pymodbus `{MODBUS_HOST}:{MODBUS_PORT}` "
+            f"regs {40001}-{40001 + MODBUS_COUNT - 1}, poll ≤5s, buffer `{LIVE_CSV}`."
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Force Modbus poll now", type="primary"):
+                try:
+                    df = ensure_live_poll(force=True)
+                    st.success(f"Polled OK — buffer {len(df):,} rows")
+                    st.dataframe(df.tail(20), use_container_width=True)
+                except Exception as exc:
+                    st.error(str(exc))
+        with c2:
+            st.write(f"Status: **{st.session_state.get('live_status')}**")
+            if st.session_state.get("live_error"):
+                st.error(st.session_state.live_error)
+        buf = read_live_buffer()
+        if buf is not None:
+            st.subheader("Current SCADA buffer")
+            st.dataframe(buf.tail(50), use_container_width=True)
+        return
+
+    uploaded = st.file_uploader(
+        "Upload industrial / ERP / plant CSV or Excel",
+        type=["csv", "tsv", "txt", "xlsx", "xls", "xlsm", "json", "parquet"],
+    )
+    if uploaded is not None:
+        try:
+            df = load_uploaded_file(uploaded)
+            st.session_state.manual_df = df
+            st.session_state.manual_name = uploaded.name
+            st.success(f"Loaded **{uploaded.name}** — {len(df):,} rows × {df.shape[1]} cols")
+            st.dataframe(df.head(50), use_container_width=True)
+        except Exception as exc:
+            st.error(str(exc))
+    elif st.session_state.manual_df is not None:
+        st.write(f"Current file: **{st.session_state.manual_name}**")
+        st.dataframe(st.session_state.manual_df.head(50), use_container_width=True)
+
+
+def page_clean() -> None:
+    st.header("Clean")
+    st.caption("PySpark (+pandas fallback) · Great Expectations · ydata-profiling · Cleanlab")
+    df = require_data()
+    if df is None:
+        return
+    if st.button("Run industrial clean + quality", type="primary") or st.session_state.clean_df is None:
+        with st.spinner("Cleaning..."):
+            clean_df, checks = clean_data(df)
+        st.success(f"Clean complete — {len(clean_df):,} rows")
+    else:
+        clean_df = st.session_state.clean_df
+        checks = st.session_state.clean_checks
+
+    st.subheader("Quality checks")
+    st.dataframe(checks, use_container_width=True)
+    meta = st.session_state.get("_clean_engine_meta")
+    if meta is not None:
+        with st.expander("Engine details (GE / ydata / Cleanlab)"):
+            st.dataframe(meta, use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Raw head")
+        st.dataframe(df.head(30), use_container_width=True)
+    with c2:
+        st.subheader("Clean head")
+        st.dataframe(clean_df.head(30), use_container_width=True)
+
+
+def page_field() -> None:
+    st.header("Field")
+    df = require_data()
+    if df is None:
+        return
+    st.write("**Auto detected:** Predictive Maintenance")
+    with st.spinner("Training RF + GB + IsolationForest..."):
+        risk = field_predict(df)
+    st.metric("Failure Risk", f"{risk}% in 12h")
+    if risk >= 70:
+        st.error(f"CRITICAL: Failure risk {risk}% — schedule maintenance within 8–12h.")
+    elif risk >= 40:
+        st.warning(f"Elevated risk {risk}% — inspect vibration / temperature trends.")
+    else:
+        st.success(f"Risk {risk}% — within normal operating envelope.")
+    kpis = get_kpis(df)
+    metric_grid({k: kpis[k] for k in ("Mean_temp", "Mean_vib", "Mean_pressure", "Min_RUL")})
+
+
+def page_kpis() -> None:
+    st.header("Auto KPIs")
+    df = require_data()
+    if df is None:
+        return
+    kpis = get_kpis(df)
+    metric_grid(kpis, per_row=4)
+    st.subheader("Predictive Maintenance briefing")
+    risk = field_predict(df)
+    st.write(
+        f"Buffer holds **{kpis['Rows']}** rows. "
+        f"Mean temperature **{kpis['Mean_temp']}**, vibration **{kpis['Mean_vib']}**, "
+        f"pressure **{kpis['Mean_pressure']}**. "
+        f"Failures counted: **{kpis['Failure_Count']}**. Min RUL **{kpis['Min_RUL']}**. "
+        f"Ensemble failure risk ≈ **{risk}%** in the next 12h window."
+    )
+
+
+def page_charts() -> None:
+    st.header("Charts")
+    df = require_data()
+    if df is None:
+        return
+    tcol = _col(df, "temperature", "temp")
+    vcol = _col(df, "vibration", "vib")
+    pcol = _col(df, "pressure")
+    cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
+    if tcol:
+        st.subheader("Temperature (last 48)")
+        series = pd.to_numeric(df[tcol], errors="coerce").tail(48)
+        st.line_chart(series)
+        fig = px.line(series.reset_index(), y=tcol if tcol in series.reset_index().columns else series.name,
+                      title="Temperature trend")
+        # simpler plotly
+        fig = go.Figure(go.Scatter(y=series.values, mode="lines", name=tcol))
+        fig.update_layout(title=f"{tcol} — last 48", height=360)
+        st.plotly_chart(fig, use_container_width=True)
+
+    if tcol and vcol:
+        st.subheader("Vibration vs Temperature")
+        plot_df = df[[vcol, tcol]].apply(pd.to_numeric, errors="coerce").dropna().tail(500)
+        st.scatter_chart(plot_df.rename(columns={vcol: "vibration", tcol: "temperature"}))
+        fig2 = px.scatter(plot_df, x=vcol, y=tcol, title="Vibration vs Temperature")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    if cat_cols and num_cols:
+        st.subheader("Pie distribution")
+        names, values = cat_cols[0], num_cols[0]
+        pie_df = df.groupby(names, dropna=False)[values].mean().reset_index()
+        fig3 = px.pie(pie_df, names=names, values=values, title=f"{values} by {names}")
+        st.plotly_chart(fig3, use_container_width=True)
+
+    if pcol:
+        st.subheader("Pressure")
+        st.line_chart(pd.to_numeric(df[pcol], errors="coerce").tail(48))
+
+
+def page_ml() -> None:
+    st.header("ML Studio")
+    st.caption("Optuna AutoML selects the model — no manual model pick. Prophet adds 90-day business forecast.")
+    df = require_data()
+    if df is None:
+        return
+    cols = list(df.columns)
+    default_i = 0
+    for preferred in ("rul", "failure", "temperature", "revenue", "sales"):
+        hit = _col(df, preferred)
+        if hit and hit in cols:
+            default_i = cols.index(hit)
+            break
+    target = st.selectbox("Target", cols, index=default_i)
+    trials = st.slider("Optuna trials", 10, 50, 50)
+    if st.button("Run AutoML + Forecast", type="primary"):
+        with st.spinner("Optuna searching best model..."):
+            try:
+                best_model, metrics = run_automl(df, target, n_trials=trials)
+                forecast_text = prophet_forecast(df, target)
+                st.session_state.automl_result = {"best_model": best_model, "metrics": metrics}
+                st.session_state.forecast_text = forecast_text
+            except Exception as exc:
+                st.error(str(exc))
+                st.code(traceback.format_exc())
+                return
+    res = st.session_state.get("automl_result")
+    if res:
+        st.success(f"Best Model: **{res['best_model']}** (Optuna auto-selected)")
+        st.json(res["metrics"])
+    if st.session_state.get("forecast_text"):
+        st.write(st.session_state.forecast_text)
+
+
+def page_ask() -> None:
+    st.header("Ask / AI")
+    gem_ok = bool(GEMINI_API_KEY)
+    st.write(f"Gemini: **{'Connected' if gem_ok else 'No key'}** ({GEMINI_MODEL})")
+    st.write("RAG: LlamaIndex on current data buffer + Gemini grounded answers")
+    if not gem_ok:
+        st.warning("Set GEMINI_API_KEY in `.env` and restart Streamlit.")
+
+    df = require_data()
+    if df is None:
+        return
+
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    q = st.chat_input("Ask about your plant / buffer data…")
+    if q:
+        st.session_state.chat_history.append({"role": "user", "content": q})
+        with st.chat_message("user"):
+            st.markdown(q)
+        with st.chat_message("assistant"):
+            with st.spinner("RAG + Gemini..."):
+                ans = rag_ask(q, df)
+            st.markdown(ans)
+        st.session_state.chat_history.append({"role": "assistant", "content": ans})
+
+
+def page_dashboard() -> None:
+    """Dashboard — NO raw HTML. Metrics + charts + alerts only."""
+    st.header("Dashboard")
+    st.caption("SCADA-style board for LIVE · same KPIs for MANUAL. Filter-gated buffer view.")
+    df = require_data()
+    if df is None:
+        return
+
+    # Power-BI-like slicers
+    st.subheader("Filters")
+    cat_cols = [c for c in df.select_dtypes(include=["object", "category"]).columns if df[c].nunique() <= 40]
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    view = df.copy()
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        for c in cat_cols[:3]:
+            opts = sorted(view[c].dropna().astype(str).unique().tolist())
+            sel = st.multiselect(f"Filter {c}", opts, default=[], key=f"dash_f_{c}")
+            if sel:
+                view = view[view[c].astype(str).isin(sel)]
+    with fc2:
+        for c in num_cols[:2]:
+            s = pd.to_numeric(view[c], errors="coerce").dropna()
+            if s.empty or s.min() == s.max():
+                continue
+            lo, hi = float(s.min()), float(s.max())
+            rng = st.slider(f"Range {c}", lo, hi, (lo, hi), key=f"dash_r_{c}")
+            series = pd.to_numeric(view[c], errors="coerce")
+            view = view[(series >= rng[0]) & (series <= rng[1])]
+
+    st.caption(f"Buffer rows in view: **{len(view):,}** / {len(df):,}")
+
+    kpis = get_kpis(view)
+    risk = field_predict(view if len(view) >= 10 else df)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows in Buffer", kpis["Rows"])
+    c2.metric("Virtual Plant Cap", "1,250,000")
+    c3.metric("Failure Risk", f"{risk}%")
+    c4.metric("Forecasted", "Yes" if st.session_state.get("forecast_text") else "Run ML Studio")
+
+    st.subheader("KPI scoreboard")
+    metric_grid(kpis, per_row=4)
+
+    tcol = _col(view, "temperature", "temp")
+    vcol = _col(view, "vibration", "vib")
+    if tcol:
+        st.subheader("Temperature — last 48")
+        st.line_chart(pd.to_numeric(view[tcol], errors="coerce").tail(48))
+    if vcol:
+        st.subheader("Vibration")
+        st.scatter_chart(pd.to_numeric(view[vcol], errors="coerce").tail(200))
+
+    if tcol and vcol:
+        plot_df = view[[vcol, tcol]].apply(pd.to_numeric, errors="coerce").dropna().tail(400)
+        fig = px.scatter(plot_df, x=vcol, y=tcol, title="Vibration vs Temperature")
+        st.plotly_chart(fig, use_container_width=True)
+
+    if risk > 70:
+        st.error(f"ALERT: Failure risk {risk}% in 8h — dispatch maintenance.")
+    elif risk > 40:
+        st.warning(f"Watchlist: Failure risk {risk}% — review sensors.")
+    else:
+        st.success(f"Operating normally — failure risk {risk}%.")
+
+    if st.session_state.get("forecast_text"):
+        st.info(st.session_state.forecast_text)
+
+
+def page_email() -> None:
+    st.header("Email")
+    st.write(f"Operator account: **{OPERATOR_EMAIL}**")
+    st.caption("Send current buffer + KPIs / risk briefing. Requires EMAIL_USER + EMAIL_PASSWORD in .env.")
+    df = None
+    try:
+        df = get_data()
+    except Exception as exc:
+        st.warning(str(exc))
+
+    to_addr = st.text_input("Recipient", value=OPERATOR_EMAIL)
+    subject = st.text_input("Subject", value="[Analytics Forge v2] Industrial report")
+    if st.button("Send report + CSV", type="primary"):
+        if df is None:
+            st.error("No data buffer available.")
+            return
+        try:
+            kpis = get_kpis(df)
+            risk = field_predict(df)
+            body = (
+                f"Analytics Forge v2 report\nMode: {st.session_state.mode}\n"
+                f"Rows: {kpis['Rows']}\nFailure risk: {risk}%\nKPIs: {json.dumps(kpis)}\n"
+                f"Forecast: {st.session_state.get('forecast_text') or 'n/a'}\n"
+            )
+            msg = send_email_report(to_addr, subject, body, df=df)
+            st.success(msg)
+        except Exception as exc:
+            st.error(str(exc))
+
+
+# =============================================================================
+# SIDEBAR + MAIN
+# =============================================================================
 
 PAGES = [
     "Upload",
@@ -74,1292 +1257,75 @@ PAGES = [
 ]
 
 
-def ensure_samples() -> None:
-    """Create sample CSVs if missing (also ships with repo samples)."""
-    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
-    pdm = SAMPLES_DIR / "sample_predictive_maintenance.csv"
-    sales = SAMPLES_DIR / "sample_sales.csv"
-    if not pdm.exists():
-        # Minimal regenerate
-        rows = []
-        for mid in range(1, 6):
-            for h in range(8):
-                rows.append(
-                    {
-                        "machine_id": f"M-{mid:03d}",
-                        "timestamp": f"2024-01-0{1 + h // 4} {h % 4 * 6:02d}:00:00",
-                        "temperature": 70 + mid * 2 + h,
-                        "vibration": 0.3 + mid * 0.05 + h * 0.08,
-                        "pressure": 102 - h * 0.8,
-                        "failure": 1 if h == 7 and mid % 2 else 0,
-                        "rul": 0 if h == 7 and mid % 2 else 200 - h * 10,
-                    }
-                )
-        pd.DataFrame(rows).to_csv(pdm, index=False)
-    if not sales.exists():
-        import numpy as np
-
-        rng = np.random.default_rng(42)
-        regions = ["North", "South", "East", "West"]
-        cats = ["Electronics", "Furniture", "Office Supplies"]
-        rows = []
-        for d in range(1, 31):
-            rows.append(
-                {
-                    "order_date": f"2024-01-{d:02d}",
-                    "region": regions[d % 4],
-                    "category": cats[d % 3],
-                    "revenue": float(rng.integers(100, 5000)),
-                    "units": int(rng.integers(1, 30)),
-                }
-            )
-        pd.DataFrame(rows).to_csv(sales, index=False)
-
-
-def apply_pipeline_to_state(result: dict) -> None:
-    st.session_state.messy_df = result["messy_df"]
-    st.session_state.clean_df = result["clean_df"]
-    st.session_state.clean_log = result["clean_log"]
-    st.session_state.source_name = result["source_name"]
-    st.session_state.domain = result["domain"]
-    st.session_state.classification = result["classification"]
-    st.session_state.kpis = result["kpis"]
-    st.session_state.briefing = result["briefing"]
-    st.session_state.schema = result["schema"]
-    st.session_state.run_id = result.get("run_id")
-    st.session_state.pipeline_done = True
-    st.session_state.dashboard_insights = [result["briefing"]]
-    st.session_state.ml_result = None
-    st.session_state.chat_history = []
-
-
-def _current_user_id() -> int | None:
-    user = st.session_state.get("user")
-    if not user:
-        return None
-    try:
-        return int(user["id"])
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-def load_saved_project(run_id: int) -> bool:
-    """Reload a past project from SQLite + saved clean CSV."""
-    from pathlib import Path
-
-    from core.briefing import build_briefing
-    from core.ingest import schema_summary
-
-    row = db.get_run(run_id)
-    if not row:
-        st.error("Project not found.")
-        return False
-    uid = _current_user_id()
-    if uid is not None and row.get("user_id") not in (None, uid):
-        st.error("That project belongs to another account.")
-        return False
-
-    clean_path = row.get("clean_path") or ""
-    if not clean_path or not Path(clean_path).exists():
-        st.error("Saved data file is missing on this machine. Re-upload the CSV.")
-        return False
-
-    clean_df = pd.read_csv(clean_path)
-    domain = row.get("domain") or "generic"
-    classification = {"domain": domain, "confidence": row.get("domain_confidence") or 0.0}
-    kpis = compute_kpis(clean_df, domain=domain)
-    briefing = build_briefing(domain, clean_df.shape, kpis=kpis, classification=classification)
-    schema = schema_summary(clean_df)
-
-    reset_analysis_state()
-    st.session_state.messy_df = clean_df.copy()
-    st.session_state.clean_df = clean_df
-    st.session_state.clean_log = []
-    st.session_state.source_name = row.get("source_name") or row.get("title") or f"run_{run_id}"
-    st.session_state.domain = domain
-    st.session_state.classification = classification
-    st.session_state.kpis = kpis
-    st.session_state.briefing = briefing
-    st.session_state.schema = schema
-    st.session_state.run_id = run_id
-    st.session_state.pipeline_done = True
-    st.session_state.dashboard_insights = [briefing]
-
-    ml = db.get_latest_ml_for_run(run_id)
-    if ml:
-        st.session_state.ml_result = {
-            "ok": True,
-            "model_id": ml.get("model_id"),
-            "task": ml.get("task"),
-            "target": ml.get("target_col"),
-            "metrics": ml.get("metrics") or {},
-            "manager_briefing": ml.get("manager_briefing") or "",
-        }
-
-    if uid is not None:
-        chats = db.list_chat_messages(uid, run_id=run_id, limit=40)
-        st.session_state.chat_history = [
-            {"role": c["role"], "content": c["content"]} for c in chats
-        ]
-    return True
-
-
-def render_recent_projects() -> None:
-    uid = _current_user_id()
-    if uid is None:
-        return
-    st.sidebar.markdown("#### Recent projects")
-    rows = db.list_recent_runs(uid, limit=10)
-    if not rows:
-        st.sidebar.caption("No saved projects yet — upload data to create one.")
-        return
-    for r in rows:
-        label = r.get("title") or r.get("source_name") or f"Run {r['id']}"
-        meta = f"{r.get('domain', '?')} · {r.get('row_count') or 0:,} rows"
-        if st.sidebar.button(
-            f"{label}\n{meta}",
-            key=f"recent_run_{r['id']}",
-            use_container_width=True,
-        ):
-            if load_saved_project(int(r["id"])):
-                st.session_state.page = "Dashboard"
-                st.rerun()
-
-
-def page_upload() -> None:
-    page_hero(
-        "Upload",
-        "Drop a table file (or a ZIP that contains one). Or connect live (demo simulator).",
-        st.session_state.get("domain"),
-    )
-
-    # --- Mode selector ---
-    mode_choice = st.radio("Data mode", ["Manual (upload/sample)", "Live (demo simulator)"], horizontal=True)
-    data_mode = DataMode.MANUAL if "Manual" in mode_choice else DataMode.LIVE
-
-    # --- Engine selector ---
-    engines = available_engines()
-    engine = st.selectbox("Clean engine", engines, index=0, help="Polars/PySpark for bigger data")
-
-    if data_mode == DataMode.LIVE:
-        _page_upload_live(engine)
-        return
-
-    st.write(
-        "Supported formats: **CSV, TSV, Excel (.xlsx / .xls), JSON, Parquet**, "
-        "or a **ZIP** that contains one of those."
-    )
-    st.caption(
-        "Tip for managers: export from Excel / Google Sheets / your ERP as CSV or Excel, "
-        "or zip that file and upload the zip."
-    )
-
-    ensure_samples()
-    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        from core.ingest import ZipNoTabularError, list_zip_tabular_members
-
-        uploaded = st.file_uploader(
-            "Upload data file",
-            type=["csv", "tsv", "txt", "xlsx", "xls", "xlsm", "json", "parquet", "zip"],
-            help=(
-                "CSV / TSV / Excel / JSON / Parquet, or a ZIP containing one of those. "
-                "If the ZIP has several tables, you can pick which one to load."
-            ),
-        )
-        zip_member = None
-        if uploaded is not None:
-            data = uploaded.getvalue()
-            dest = UPLOADS_DIR / uploaded.name
-            dest.write_bytes(data)
-
-            if uploaded.name.lower().endswith(".zip"):
-                try:
-                    members = list_zip_tabular_members(data)
-                except Exception as exc:
-                    st.error(f"Could not read ZIP: {exc}")
-                    members = []
-                if not members:
-                    st.error(
-                        "This ZIP has no tabular files. "
-                        "Include at least one CSV, TSV, Excel (.xlsx/.xls), JSON, or Parquet file."
-                    )
-                elif len(members) == 1:
-                    zip_member = members[0]
-                    st.caption(f"ZIP contains: `{zip_member}`")
-                else:
-                    zip_member = st.selectbox(
-                        "This ZIP has several tables — pick one",
-                        members,
-                        help="We load one sheet/table into the cleaning pipeline.",
-                    )
-
-            can_run = True
-            if uploaded.name.lower().endswith(".zip") and not zip_member:
-                can_run = False
-
-            if can_run and st.button("Run pipeline on upload", type="primary", key="run_upload"):
-                try:
-                    with st.spinner("Running pipeline…"):
-                        result = run_pipeline(
-                            file_bytes=data,
-                            filename=uploaded.name,
-                            domain_override=st.session_state.domain_override,
-                            persist=True,
-                            zip_member=zip_member,
-                            user_id=_current_user_id(),
-                        )
-                    apply_pipeline_to_state(result)
-                    st.success(f"Loaded **{result['source_name']}** · domain `{result['domain']}`")
-                    st.dataframe(result["clean_df"].head(20), use_container_width=True)
-                except ZipNoTabularError as exc:
-                    st.error(str(exc))
-                except Exception as exc:
-                    st.error(f"Could not load file: {exc}")
-
-    with c2:
-        sample_choice = st.selectbox(
-            "Or use sample data",
-            [
-                "sample_predictive_maintenance.csv",
-                "sample_sales.csv",
-            ],
-        )
-        if st.button("Load sample & run pipeline", key="run_sample"):
-            path = SAMPLES_DIR / sample_choice
-            with st.spinner("Running pipeline…"):
-                result = run_pipeline(
-                    source=path,
-                    domain_override=st.session_state.domain_override,
-                    persist=True,
-                    user_id=_current_user_id(),
-                )
-            apply_pipeline_to_state(result)
-            st.success(f"Sample loaded · domain `{result['domain']}`")
-            st.dataframe(result["clean_df"].head(20), use_container_width=True)
-
-    if st.session_state.pipeline_done:
-        st.divider()
-        st.subheader("Current dataset")
-        st.write(
-            f"**{st.session_state.source_name}** — "
-            f"{len(st.session_state.clean_df):,} rows × {st.session_state.clean_df.shape[1]} cols · "
-            f"domain `{st.session_state.domain}` · run_id `{st.session_state.run_id}`"
-        )
-        if st.button("Reset analysis", key="reset_all"):
-            reset_analysis_state()
+def render_sidebar() -> str:
+    with st.sidebar:
+        st.write(f"📧 {OPERATOR_EMAIL}")
+        if st.button("Sign out"):
+            st.session_state.signed_in = False
             st.rerun()
 
+        st.title("Analytics Forge v2")
+        st.caption("Dual mode · filter-gated live · shared core")
 
-def _page_upload_live(engine: str) -> None:
-    """Live mode — industry-adaptive filters + real-capable connectors (sim until creds)."""
-    st.info(
-        "**Demo Simulator** = like sample CSV (pipeline test only). "
-        "**Modbus / OPC-UA / REST / SMPS / Azure** = real-capable plugins. "
-        "Without host/credentials they use sim data; with credentials they attempt a real fetch."
-    )
+        mode = st.radio(
+            "Mode",
+            ["LIVE CONNECT", "MANUAL UPLOAD"],
+            index=0 if st.session_state.mode == "LIVE CONNECT" else 1,
+        )
+        st.session_state.mode = mode
 
-    templates = load_templates()
-    domain_keys = list(templates.keys()) or ["generic"]
-    domain_labels = {k: templates[k].get("label", k) for k in domain_keys}
-    industry = st.selectbox(
-        "Industry / use-case (changes filters)",
-        domain_keys,
-        format_func=lambda k: domain_labels.get(k, k),
-        help="BMW factory ≠ hospital ≠ Gucci retail ≠ warehouse ≠ Azure ERP — filters adapt.",
-    )
-
-    # Connectors allowed for this industry
-    allowed = templates.get(industry, {}).get("connectors") or list(list_connectors().keys())
-    all_conn = list_connectors()
-    conn_ids = [c for c in allowed if c in all_conn] or list(all_conn.keys())
-    conn_id = st.selectbox(
-        "Connector",
-        conn_ids,
-        format_func=lambda k: f"{all_conn[k]['label']} [{all_conn[k].get('capability', '?')}]",
-    )
-    connector = get_connector(conn_id)
-
-    # Real connection settings (optional — leave blank for sim)
-    with st.expander("Connection settings (optional — for real industry / Azure later)", expanded=False):
-        st.caption("Leave blank to stay in sim/demo mode. Fill these when you have a real plant or Azure endpoint.")
-        host = st.text_input("Host / URL / Endpoint", placeholder="opc.tcp://plant:4840 or https://api... or Azure URL")
-        token = st.text_input("Token / Password / Connection string", type="password")
-        username = st.text_input("Username (if needed)", placeholder="optional")
-    config = {}
-    if host:
-        config["host"] = host
-        config["url"] = host
-        config["endpoint"] = host
-    if token:
-        config["token"] = token
-        config["connection_string"] = token
-    if username:
-        config["username"] = username
-
-    if connector:
-        status = connector.connection_status(config)
-        if status["mode"] == "demo":
-            st.caption(status["message"])
-        elif status["mode"] == "sim_fallback":
-            st.warning(status["message"])
+        if mode == "LIVE CONNECT":
+            st.caption(f"SCADA Modbus `{MODBUS_HOST}:{MODBUS_PORT}` → `{LIVE_CSV.name}`")
+            st.write(f"Link: **{st.session_state.get('live_status', 'idle')}**")
         else:
-            st.success(status["message"])
-
-    st.subheader(f"Top Filters for {domain_labels.get(industry, industry)}")
-    st.caption(
-        f"Pull only a slice — never the full source (~{VIRTUAL_UNIVERSE_SIZE:,} virtual rows in sim)."
-    )
-    schema = filter_schema_for_domain(industry)
-    filter_vals: dict = {}
-    cols = st.columns(3)
-    for i, field in enumerate(schema):
-        with cols[i % 3]:
-            filter_vals[field["key"]] = st.text_input(
-                field.get("label", field["key"]),
-                placeholder=field.get("hint", ""),
-                key=f"live_f_{industry}_{field['key']}",
-            ) or None
-
-    max_rows = st.number_input("Max rows", min_value=10, max_value=50000, value=500)
-
-    filters = TopFilters(
-        values={k: v for k, v in filter_vals.items() if v},
-        max_rows=int(max_rows),
-        domain=industry,
-    )
-
-    if st.button("Fetch filtered live slice", type="primary"):
-        with st.spinner("Fetching..."):
-            try:
-                raw_df = fetch_live_data(conn_id, filters, config or None)
-                result = run_pipeline(
-                    raw_df=raw_df,
-                    filename=f"live_{conn_id}_{industry}",
-                    domain_override=industry if industry != "generic" else st.session_state.domain_override,
-                    persist=True,
-                    user_id=_current_user_id(),
-                    clean_engine=engine,
-                    data_mode="live",
-                )
-                apply_pipeline_to_state(result)
-                st.session_state["data_mode"] = "live"
-                st.session_state["live_industry"] = industry
-                st.success(
-                    f"Loaded **{len(raw_df):,}** rows via {all_conn[conn_id]['label']} · domain `{result['domain']}`"
-                )
-                st.dataframe(result["clean_df"].head(20), use_container_width=True)
-            except Exception as exc:
-                st.error(str(exc))
-
-    if st.session_state.pipeline_done and st.session_state.get("data_mode") == "live":
-        st.divider()
-        st.subheader("Buffer filters (refine loaded data — no re-fetch)")
-        if st.button("Apply buffer filters"):
-            filtered = apply_buffer_filters(st.session_state.clean_df, filters)
-            st.session_state.clean_df = filtered
-            st.success(f"Filtered to {len(filtered):,} rows")
-            st.dataframe(filtered.head(20), use_container_width=True)
-
-
-def page_clean() -> None:
-    page_hero(
-        "Clean",
-        "Messy vs clean side-by-side — see exactly what pandas cleaned for you.",
-        st.session_state.get("domain"),
-    )
-    if st.session_state.messy_df is None:
-        st.warning("Upload or load a sample first.")
-        return
-
-    left, right = st.columns(2)
-    with left:
-        st.subheader("Messy (raw)")
-        st.dataframe(st.session_state.messy_df.head(50), use_container_width=True)
-        st.caption(f"{len(st.session_state.messy_df):,} rows")
-        download_df_button(
-            st.session_state.messy_df,
-            "Download raw CSV",
-            "messy.csv",
-            key="dl_messy",
-        )
-    with right:
-        st.subheader("Clean")
-        st.dataframe(st.session_state.clean_df.head(50), use_container_width=True)
-        st.caption(f"{len(st.session_state.clean_df):,} rows")
-        download_df_button(
-            st.session_state.clean_df,
-            "Download clean CSV",
-            "clean.csv",
-            key="dl_clean",
-        )
-
-    st.subheader("Cleaning log (pandas ops)")
-    log = st.session_state.clean_log or []
-    st.dataframe(pd.DataFrame(log), use_container_width=True)
-
-    # Quality report section
-    st.subheader("Quality Report (GE · ydata · Cleanlab)")
-    if st.button("Run quality checks"):
-        with st.spinner("Running quality pipeline..."):
-            from core.clean_quality import run_quality_pipeline
-            qr = run_quality_pipeline(st.session_state.clean_df)
-            st.session_state["quality_report"] = qr
-    qr = st.session_state.get("quality_report")
-    if qr:
-        st.markdown(qr.get("summary", ""))
-
-
-def page_field() -> None:
-    page_hero(
-        "Field detection",
-        "Auto-detects warehouse, sales, PdM, hospital, and more — then suggests models & next steps.",
-        st.session_state.get("domain"),
-    )
-    if st.session_state.clean_df is None:
-        st.warning("Upload or load a sample first.")
-        return
-
-    domains = load_domains()
-    labels = {k: v.get("label", k) for k, v in domains.items()}
-    clf = st.session_state.classification or classify(st.session_state.clean_df)
-
-    st.write(f"**Auto-detected:** `{clf.get('domain')}` — {clf.get('label')}")
-    scores = clf.get("scores") or {}
-    score_df = (
-        pd.DataFrame(
-            [{"domain": d, "label": labels.get(d, d), "score": round(s, 3)} for d, s in scores.items()]
-        )
-        .sort_values("score", ascending=False)
-        .reset_index(drop=True)
-    )
-    st.dataframe(score_df, use_container_width=True)
-
-    override = st.selectbox(
-        "Override domain",
-        options=list(domains.keys()),
-        format_func=lambda x: f"{labels.get(x, x)} ({x})",
-        index=list(domains.keys()).index(st.session_state.domain)
-        if st.session_state.domain in domains
-        else list(domains.keys()).index("generic"),
-    )
-    if st.button("Apply domain override", type="primary"):
-        st.session_state.domain_override = override
-        clf2 = classify(st.session_state.clean_df, override=override)
-        st.session_state.classification = clf2
-        st.session_state.domain = clf2["domain"]
-        st.session_state.kpis = compute_kpis(
-            st.session_state.clean_df,
-            domain=clf2["domain"],
-            ml_metrics=(st.session_state.ml_result or {}).get("metrics"),
-        )
-        from core.briefing import build_briefing
-
-        st.session_state.briefing = build_briefing(
-            clf2["domain"],
-            st.session_state.clean_df.shape,
-            kpis=st.session_state.kpis,
-            classification=clf2,
-        )
-        st.success(f"Domain set to `{clf2['domain']}`")
-        st.rerun()
-
-    st.info("Recommended models: " + ", ".join(clf.get("recommended_models") or []))
-
-
-def page_kpis() -> None:
-    page_hero(
-        "Auto KPIs",
-        "Scoreboard numbers for your detected field — including sales-on-latest-day style metrics.",
-        st.session_state.get("domain"),
-    )
-    if st.session_state.clean_df is None:
-        st.warning("Upload or load a sample first.")
-        return
-
-    if st.button("Recompute KPIs"):
-        ml_m = None
-        if st.session_state.ml_result and st.session_state.ml_result.get("ok"):
-            ml_m = st.session_state.ml_result
-        st.session_state.kpis = compute_kpis(
-            st.session_state.clean_df,
-            domain=st.session_state.domain,
-            ml_metrics=ml_m,
-        )
-
-    kpi_cards(st.session_state.kpis or {})
-    st.subheader("All KPIs")
-    rows = []
-    for kid, item in (st.session_state.kpis or {}).items():
-        if isinstance(item, dict):
-            rows.append(
-                {
-                    "id": kid,
-                    "name": item.get("name"),
-                    "value": item.get("value"),
-                    "formula": item.get("formula", ""),
-                }
+            up = st.file_uploader(
+                "Quick upload",
+                type=["csv", "tsv", "xlsx", "xls", "json", "parquet"],
+                key="sidebar_upload",
             )
-        else:
-            rows.append({"id": kid, "name": kid, "value": item, "formula": ""})
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
-
-    if st.session_state.domain == "predictive_maintenance" and st.session_state.ml_result:
-        st.subheader("PdM ML metrics")
-        show_ml_metrics(st.session_state.ml_result)
-
-    st.markdown(st.session_state.briefing or "")
-
-
-def page_charts() -> None:
-    page_hero(
-        "Charts",
-        "Build colorful views including Pie · download one chart · or pin several into your dashboard.",
-        st.session_state.get("domain"),
-    )
-    if st.session_state.clean_df is None:
-        st.warning("Upload or load a sample first.")
-        return
-
-    df = st.session_state.clean_df
-    catalog = load_charts_catalog()
-    chart_types = list(catalog.keys())
-    # Prefer pie near the top so it's easy to find
-    if "pie" in chart_types:
-        chart_types = ["pie"] + [t for t in chart_types if t != "pie"]
-    cols = list(df.columns)
-
-    st.success("Tip: choose **Pie Chart**, set Names (e.g. city/region) + Values (e.g. revenue), then **Add to dashboard**.")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        chart_type = st.selectbox("Chart type", chart_types, format_func=lambda t: catalog[t].get("label", t))
-    with c2:
-        libs = catalog.get(chart_type, {}).get("libs", ["plotly", "matplotlib", "seaborn"])
-        lib = st.selectbox("Library", libs)
-    with c3:
-        title = st.text_input("Title", value=f"{catalog[chart_type].get('label', chart_type)}")
-
-    needs = catalog.get(chart_type, {}).get("needs", [])
-    x = y = names = values = None
-    r1, r2 = st.columns(2)
-    with r1:
-        if "x" in needs or chart_type in ("bar", "line", "scatter", "histogram", "box", "area"):
-            x = st.selectbox("X column", cols, key="chart_x")
-        if "names" in needs:
-            names = st.selectbox("Names", cols, key="chart_names")
-    with r2:
-        num_cols = df.select_dtypes("number").columns.tolist() or cols
-        if "y" in needs or chart_type in ("bar", "line", "scatter", "box", "area"):
-            y = st.selectbox("Y column", num_cols if num_cols else cols, key="chart_y")
-        if "values" in needs:
-            values = st.selectbox("Values", num_cols if num_cols else cols, key="chart_vals")
-
-    if st.button("Render chart", type="primary"):
-        try:
-            fig = build_chart(
-                df,
-                chart_type=chart_type,
-                lib=lib,
-                x=x,
-                y=y,
-                names=names,
-                values=values,
-                title=title,
-            )
-            st.session_state["_last_fig"] = fig
-            st.session_state["_last_fig_meta"] = {
-                "chart_type": chart_type,
-                "lib": lib,
-                "title": title,
-                "x": x,
-                "y": y,
-                "names": names,
-                "values": values,
-            }
-        except Exception as exc:
-            st.error(str(exc))
-
-    fig = st.session_state.get("_last_fig")
-    meta = st.session_state.get("_last_fig_meta")
-    if fig is not None and meta:
-        if meta.get("lib") == "plotly":
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.pyplot(fig)
-
-        b1, b2 = st.columns(2)
-        with b1:
-            if st.button("Add to dashboard"):
-                entry = {**meta}
-                st.session_state.dashboard_charts.append(entry)
-                if st.session_state.run_id:
-                    db.save_chart(
-                        st.session_state.run_id,
-                        chart_type=meta["chart_type"],
-                        lib=meta["lib"],
-                        title=meta["title"],
-                        config=meta,
-                    )
-                st.success("Added to dashboard")
-        with b2:
-            # download: plotly html or note
-            if meta.get("lib") == "plotly":
+            if up is not None:
                 try:
-                    html_bytes = fig.to_html(include_plotlyjs="cdn").encode("utf-8")
-                    st.download_button(
-                        "Download chart HTML",
-                        data=html_bytes,
-                        file_name=f"{meta['chart_type']}_chart.html",
-                        mime="text/html",
-                        key="dl_chart_html",
-                    )
-                except Exception:
-                    st.caption("Chart download unavailable for this figure.")
-
-
-def page_ml() -> None:
-    page_hero(
-        "ML Studio",
-        "Pick a model, read plain-English What / Why / What it does, choose a target, then see R² / RMSE / MAE.",
-        st.session_state.get("domain"),
-    )
-    if st.session_state.clean_df is None:
-        st.warning("Upload or load a sample first.")
-        return
-
-    from modules.ml_runner import model_guidance
-
-    models = list_models(include_soft_fail=True)
-    domain = st.session_state.domain
-    domains = load_domains()
-    recommended = domains.get(domain, {}).get("recommended_models", [])
-    model_ids = list(models.keys())
-    # put recommended first
-    model_ids = [m for m in recommended if m in models] + [m for m in model_ids if m not in recommended]
-
-    model_id = st.selectbox(
-        "Model",
-        model_ids,
-        format_func=lambda m: f"{models[m].get('label', m)} [{models[m].get('task')}]"
-        + (" ★" if m in recommended else ""),
-    )
-    meta = models[model_id]
-    guide = model_guidance(model_id)
-    st.info(
-        f"**What:** {guide.get('what') or guide.get('good_for', '')}\n\n"
-        f"**Why:** {guide.get('why', '')}\n\n"
-        f"**What it does:** {guide.get('what_it_does', '')}\n\n"
-        f"**Target to pick:** {guide.get('target', '')}"
-    )
-    if meta.get("note"):
-        st.caption(meta["note"])
-    else:
-        st.caption(f"Library: {meta.get('library')}")
-
-    df = st.session_state.clean_df
-    cols = list(df.columns)
-    target_label = "Target (the number or label to predict)"
-    if model_id == "Prophet":
-        target_label = "Target = the number to forecast (revenue / sales / RUL)"
-    elif meta.get("task") in {"clustering", "anomaly", "dimensionality", "optimization"}:
-        target_label = "Target (usually leave as auto — not required)"
-
-    target = st.selectbox(
-        target_label,
-        options=["(auto)"] + cols,
-        help=guide.get("target", "Pick the column you want to predict."),
-    )
-    target_arg = None if target == "(auto)" else target
-
-    if model_id == "Prophet":
-        st.success(
-            "Prophet tip for managers: pick **Target** = revenue, sales, or RUL (the number). "
-            "The **date column is found automatically** — you do not pick it here. "
-            "Why: forecasting needs a timeline plus a number to predict."
-        )
-
-    # Optuna tuning option
-    use_optuna = False
-    if optuna_available() and meta.get("task") in ("regression", "classification"):
-        use_optuna = st.checkbox("🔧 Optuna auto-tune (20 trials)", value=False)
-
-    if st.button("Run model", type="primary"):
-        with st.spinner("Training…"):
-            result = run_model(df, model_id=model_id, target=target_arg)
-            if use_optuna and result.get("ok") and result.get("target") and result.get("features"):
-                with st.spinner("Optuna tuning..."):
-                    tune_res = tune_model(
-                        df, model_id, result["target"], result["features"],
-                        task=result.get("task", "regression"),
-                        domain=domain or "generic",
-                    )
-                    if tune_res.get("ok"):
-                        result["optuna"] = tune_res
-                        st.info(
-                            f"Optuna best {tune_res['scoring']}={tune_res['best_score']:.4f} · "
-                            f"params: {tune_res['best_params']}"
-                        )
-                        if tune_res.get("business_insight"):
-                            st.success(f"**Business insight:** {tune_res['business_insight']}")
-                            result["manager_briefing"] = (
-                                (result.get("manager_briefing") or "")
-                                + "\n\n"
-                                + tune_res["business_insight"]
-                            )
-        if result.get("ok"):
-            briefing = build_manager_insight(result)
-            result["manager_briefing"] = briefing
-            if briefing:
-                st.session_state.dashboard_insights = list(
-                    dict.fromkeys(
-                        (st.session_state.dashboard_insights or []) + [briefing]
-                    )
-                )
-        st.session_state.ml_result = result
-        if result.get("ok"):
-            st.session_state.kpis = compute_kpis(
-                df, domain=domain, ml_metrics=result
-            )
-            if st.session_state.run_id:
-                db.save_ml_run(
-                    st.session_state.run_id,
-                    model_id=model_id,
-                    task=result.get("task", ""),
-                    target_col=str(result.get("target") or ""),
-                    metrics=result.get("metrics") or {},
-                    manager_briefing=result.get("manager_briefing") or "",
-                )
-                if result.get("manager_briefing"):
-                    db.save_insight(
-                        st.session_state.run_id,
-                        f"manager:{model_id}",
-                        result["manager_briefing"],
-                    )
-            st.success("Model finished")
-        else:
-            st.error(result.get("error", "Failed"))
-
-    show_ml_metrics(st.session_state.ml_result)
-
-    if st.session_state.ml_result and st.session_state.ml_result.get("ok"):
-        if st.session_state.ml_result.get("model_id") == "Prophet":
-            m = st.session_state.ml_result.get("metrics") or {}
-            nums = st.columns(4)
-            if m.get("last_actual") is not None:
-                nums[0].metric("Last actual", f"{m['last_actual']:,.2f}")
-            if m.get("forecast_end") is not None:
-                nums[1].metric("Forecast end", f"{m['forecast_end']:,.2f}")
-            if m.get("forecast_mean") is not None:
-                nums[2].metric("Avg forecast", f"{m['forecast_mean']:,.2f}")
-            if m.get("pct_change") is not None:
-                nums[3].metric("Change", f"{m['pct_change'] * 100:.1f}%")
-
-        preview = st.session_state.ml_result.get("predictions_preview")
-        if preview is not None:
-            st.subheader("Predictions preview")
-            st.dataframe(preview, use_container_width=True)
-            download_df_button(
-                preview,
-                "Download predictions CSV",
-                "ml_predictions_preview.csv",
-                key="dl_preds",
-            )
-
-        # Adaptive PdM tables
-        if domain == "predictive_maintenance":
-            st.subheader("Adaptive PdM view")
-            metrics = st.session_state.ml_result.get("metrics") or {}
-            mcols = st.columns(3)
-            if "r2" in metrics:
-                mcols[0].metric("R²", f"{metrics['r2']:.4f}")
-            if "rmse" in metrics:
-                mcols[1].metric("RMSE", f"{metrics['rmse']:.4f}")
-            if "mae" in metrics:
-                mcols[2].metric("MAE", f"{metrics['mae']:.4f}")
-            if "accuracy" in metrics:
-                mcols[0].metric("Accuracy", f"{metrics['accuracy']:.4f}")
-
-            sensor_cols = [
-                c
-                for c in df.columns
-                if str(c).lower() in {"temperature", "vibration", "pressure", "rul", "failure"}
-            ]
-            if sensor_cols:
-                st.dataframe(df[sensor_cols].describe(), use_container_width=True)
-            if "machine_id" in [c.lower() for c in df.columns]:
-                mid = next(c for c in df.columns if str(c).lower() == "machine_id")
-                fail_col = next(
-                    (c for c in df.columns if str(c).lower() == "failure"), None
-                )
-                if fail_col:
-                    agg = (
-                        df.groupby(mid)
-                        .agg(
-                            rows=(mid, "count"),
-                            failures=(fail_col, "sum"),
-                            avg_temp=(
-                                next(
-                                    (c for c in df.columns if "temp" in str(c).lower()),
-                                    fail_col,
-                                ),
-                                "mean",
-                            ),
-                        )
-                        .reset_index()
-                    )
-                    st.dataframe(agg, use_container_width=True)
-
-
-def page_ai() -> None:
-    page_hero(
-        "Ask / AI Guide",
-        "Ask in plain English — e.g. “what are sales today?” — and get guided next steps.",
-        st.session_state.get("domain"),
-    )
-    if st.session_state.clean_df is None:
-        st.warning("Upload or load a sample first.")
-        return
-
-    from modules.ai_guide import gemini_configured, openai_configured, provider_status
-
-    status = provider_status()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Gemini", "Ready" if status["gemini"] else "No key")
-    c2.metric("OpenAI", "Ready" if status["openai"] else "No key")
-    c3.metric("Offline", "Always on")
-
-    if status["gemini"] or status["openai"]:
-        st.success("Cloud AI available — pick a provider below.")
-    else:
-        st.warning(
-            "No cloud AI keys yet — offline answers still work.\n\n"
-            "**How to create a Gemini API key (free):**\n"
-            "1. Open https://aistudio.google.com/apikey\n"
-            "2. Sign in with Google → **Create API key**\n"
-            "3. Copy the key\n"
-            "4. Put it in a `.env` file in this project (never paste keys into chat):\n\n"
-            "```\n"
-            "GEMINI_API_KEY=your_key_here\n"
-            "GEMINI_MODEL=gemini-2.0-flash\n"
-            "AI_DEFAULT_PROVIDER=gemini\n"
-            "```\n\n"
-            "Then restart Streamlit. Optional OpenAI: `OPENAI_API_KEY=sk-...`"
-        )
-
-    selectable = ["auto"]
-    if gemini_configured():
-        selectable.append("gemini")
-    if openai_configured():
-        selectable.append("openai")
-    if rag_available():
-        selectable.append("rag")
-    selectable.append("offline")
-    provider = st.selectbox("AI provider", selectable, index=0, help="Gemini often has a free tier. RAG uses your data offline.")
-
-    st.caption(
-        "Try: `which model did I use?` · `show kpis` · `which machine will fail?` · `how to reduce machine failure?`"
-    )
-    for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    prompt = st.chat_input("Ask about your data…")
-    if prompt:
-        st.session_state.chat_history.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        uid = _current_user_id()
-        if uid is not None:
-            db.save_chat_message(
-                uid, "user", prompt, run_id=st.session_state.get("run_id")
-            )
-        if provider == "rag":
-            idx = st.session_state.get("_rag_index")
-            if idx is None:
-                idx = build_index(st.session_state.clean_df, st.session_state.domain)
-                st.session_state["_rag_index"] = idx
-            result = query_rag(idx, prompt)
-        else:
-            result = ask_ai(
-                prompt,
-                domain=st.session_state.domain,
-                schema=st.session_state.schema,
-                kpis=st.session_state.kpis,
-                df=st.session_state.clean_df,
-                briefing=st.session_state.briefing or "",
-                history=st.session_state.chat_history[:-1],
-                ml_result=st.session_state.ml_result,
-                provider=provider,
-            )
-        answer = result.get("answer", "")
-        st.session_state.chat_history.append({"role": "assistant", "content": answer})
-        if uid is not None:
-            db.save_chat_message(
-                uid, "assistant", answer, run_id=st.session_state.get("run_id")
-            )
-        with st.chat_message("assistant"):
-            st.markdown(answer)
-            st.caption(f"source: {result.get('source')}")
-
-
-def page_dashboard() -> None:
-    page_hero(
-        "Dashboard",
-        "Power BI-style slicers · professional KPI boxes · pie/bar/line · Live auto or Manual build.",
-        st.session_state.get("domain"),
-    )
-    if st.session_state.clean_df is None:
-        st.warning("Upload or load a sample first.")
-        return
-
-    base_df = st.session_state.clean_df
-    is_live = st.session_state.get("data_mode") == "live"
-
-    # --- Build mode: Live auto vs Manual ---
-    mode_label = "Live auto-generate" if is_live else "Manual / one-click auto"
-    dash_mode = st.radio(
-        "Dashboard mode",
-        ["Auto-generate (recommended)", "Manual pinned charts only"],
-        horizontal=True,
-        help="Live data auto-builds KPIs + pie/bar/line. Manual keeps Charts you pinned, or click Auto once.",
-        key="dash_build_mode",
-    )
-
-    if dash_mode.startswith("Auto") and st.button("Generate / refresh auto dashboard", type="primary"):
-        auto = build_auto_dashboard(base_df, st.session_state.domain or "generic")
-        st.session_state["auto_dash"] = auto
-        # also pin auto charts into dashboard_charts for pack download
-        st.session_state.dashboard_charts = list(auto.get("charts") or [])
-        st.success(f"Auto dashboard ready ({auto.get('rows', 0):,} rows){' — live' if is_live else ''}")
-
-    # Keep auto for live by default
-    if is_live and "auto_dash" not in st.session_state:
-        st.session_state["auto_dash"] = build_auto_dashboard(base_df, st.session_state.domain or "generic")
-        if not st.session_state.dashboard_charts:
-            st.session_state.dashboard_charts = list(st.session_state["auto_dash"].get("charts") or [])
-
-    # --- Power BI-style slicers ---
-    st.markdown("#### Filters (like Power BI — dashboard updates live)")
-    suggestions = suggest_slicer_columns(base_df)
-    cat_cols = suggestions["categorical"]
-    num_cols = suggestions["numeric"]
-
-    cat_filters: dict = {}
-    num_ranges: dict = {}
-    if cat_cols or num_cols:
-        sc1, sc2 = st.columns(2)
-        with sc1:
-            for col in cat_cols[:4]:
-                opts = sorted(base_df[col].dropna().astype(str).unique().tolist())
-                selected = st.multiselect(
-                    f"Filter: {col}",
-                    opts,
-                    default=[],
-                    key=f"slicer_cat_{col}",
-                    help="Pick one or more values (e.g. city, region, product)",
-                )
-                if selected:
-                    cat_filters[col] = selected
-        with sc2:
-            for col in num_cols[:3]:
-                series = pd.to_numeric(base_df[col], errors="coerce").dropna()
-                if series.empty:
-                    continue
-                lo, hi = float(series.min()), float(series.max())
-                if lo == hi:
-                    continue
-                rng = st.slider(
-                    f"Range: {col}",
-                    min_value=lo,
-                    max_value=hi,
-                    value=(lo, hi),
-                    key=f"slicer_num_{col}",
-                )
-                if rng != (lo, hi):
-                    num_ranges[col] = rng
-    else:
-        st.caption("No categorical columns found for slicers — upload richer data (city, region, product…).")
-
-    view_df = apply_slicers(base_df, cat_filters, num_ranges)
-    st.caption(f"Showing **{len(view_df):,}** / {len(base_df):,} rows after filters")
-
-    # Recompute KPIs on filtered view for professional boxes
-    from core.kpis import compute_kpis as _ck
-    view_kpis = _ck(view_df, domain=st.session_state.domain or "generic",
-                    ml_metrics=st.session_state.ml_result if st.session_state.ml_result and st.session_state.ml_result.get("ok") else None)
-
-    st.markdown("#### KPI scoreboard")
-    kpi_cards(view_kpis or st.session_state.kpis or {}, max_cards=8)
-
-    # Business alerts on filtered view
-    alerts = generate_alerts(view_df, st.session_state.domain, st.session_state.ml_result)
-    if alerts:
-        st.markdown("#### Business alerts")
-        for a in alerts:
-            icon = {"critical": "🔴", "high": "🟠", "warning": "🟡", "info": "ℹ️"}.get(a["severity"], "ℹ️")
-            st.markdown(f"{icon} **{a['severity'].upper()}:** {a['message']}")
-
-    # Insights
-    st.markdown("#### Insights")
-    for insight in st.session_state.dashboard_insights or [st.session_state.briefing]:
-        st.markdown(insight or "_No insights yet — run ML Studio or Ask/AI._")
-
-    # Charts: auto + pinned, always include pie when possible
-    st.markdown("#### Charts (includes Pie)")
-    charts = list(st.session_state.dashboard_charts or [])
-    if dash_mode.startswith("Auto"):
-        auto = st.session_state.get("auto_dash") or build_auto_dashboard(view_df, st.session_state.domain or "generic")
-        # regenerate chart specs from filtered view so pie/bar follow slicers
-        charts = auto_chart_specs(view_df) or auto.get("charts") or charts
-
-    if not charts:
-        st.info("Click **Generate / refresh auto dashboard**, or pin charts from the Charts page (Pie is in the chart type list).")
-
-    for i, meta in enumerate(charts):
-        title = meta.get("title") or meta.get("chart_type")
-        st.markdown(f"**{title}**")
-        try:
-            fig = build_chart(
-                view_df,
-                chart_type=meta.get("chart_type", "bar"),
-                lib=meta.get("lib", "plotly"),
-                x=meta.get("x"),
-                y=meta.get("y"),
-                names=meta.get("names"),
-                values=meta.get("values"),
-                title=meta.get("title"),
-            )
-            if meta.get("lib", "plotly") == "plotly":
-                st.plotly_chart(fig, use_container_width=True, key=f"dash_plotly_{i}")
-            else:
-                st.pyplot(fig)
-        except Exception as exc:
-            st.warning(f"Could not render chart: {exc}")
-
-    if st.session_state.ml_result and st.session_state.ml_result.get("ok"):
-        st.markdown("#### Latest model")
-        show_ml_metrics(st.session_state.ml_result)
-
-    st.divider()
-    # Email report to my account
-    user = st.session_state.get("user") or {}
-    my_email = user.get("email")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        pack = build_html_pack(
-            domain=st.session_state.domain,
-            source_name=st.session_state.source_name or "",
-            clean_log=st.session_state.clean_log,
-            kpis=view_kpis,
-            insights=st.session_state.dashboard_insights,
-            charts=charts,
-            ml_metrics=st.session_state.ml_result,
-            briefing=st.session_state.briefing or "",
-        )
-        download_html_pack_button(pack, key="dash_pack")
-    with c2:
-        if my_email and st.button("Email report + CSV to my account", type="primary"):
-            try:
-                send_current_report(
-                    my_email,
-                    domain=st.session_state.domain or "generic",
-                    source_name=st.session_state.source_name or "dataset",
-                    clean_log=st.session_state.clean_log or [],
-                    kpis=view_kpis or {},
-                    insights=st.session_state.dashboard_insights or [],
-                    charts=charts or [],
-                    ml_metrics=st.session_state.ml_result,
-                    briefing=st.session_state.briefing or "",
-                    clean_df=view_df,
-                    run_id=st.session_state.run_id,
-                    subject=f"[Analytics Forge] Report — {st.session_state.domain}",
-                )
-                st.success(f"Sent to {my_email}")
-            except EmailConfigError as exc:
-                st.error(f"Email not configured: {exc}")
-            except Exception as exc:
-                st.error(str(exc))
-    with c3:
-        if st.session_state.run_id and st.button("Save dashboard layout"):
-            db.save_dashboard_layout(
-                st.session_state.run_id,
-                name="default",
-                layout={"charts": charts, "insights": st.session_state.dashboard_insights, "slicers": {"cat": cat_filters}},
-            )
-            st.success("Layout saved")
-
-
-def page_email() -> None:
-    page_hero(
-        "Email automation",
-        "Send report + clean CSV to your login email, or auto-reply when someone emails a CSV to the system inbox.",
-        st.session_state.get("domain"),
-    )
-
-    status = config_status()
-    user = st.session_state.get("user") or {}
-    my_email = user.get("email")
-
-    if status["configured"]:
-        st.success(f"Email ready · SMTP {status['smtp']} · IMAP {status['imap']} · as {status['from']}")
-    else:
-        missing = status.get("missing") or ["EMAIL_USER", "EMAIL_PASSWORD"]
-        st.warning(
-            "SMTP not configured yet — Gemini is separate; email needs a Gmail App Password in `.env`:\n\n"
-            "```\n"
-            "EMAIL_USER=you@gmail.com\n"
-            "EMAIL_PASSWORD=your_16_char_app_password\n"
-            "EMAIL_FROM=you@gmail.com\n"
-            "```\n\n"
-            f"Currently missing: {', '.join(missing)}"
-        )
-
-    st.subheader("0) Send report to my account (logged-in user)")
-    if my_email:
-        st.caption(f"Logged in as **{my_email}** — one click sends HTML pack + clean CSV.")
-        if st.button("Email insights pack to me now", type="primary", key="email_to_me"):
-            if not st.session_state.get("pipeline_done"):
-                st.error("Load data first (Upload).")
-            else:
-                try:
-                    send_current_report(
-                        my_email,
-                        domain=st.session_state.domain or "generic",
-                        source_name=st.session_state.source_name or "dataset",
-                        clean_log=st.session_state.clean_log or [],
-                        kpis=st.session_state.kpis or {},
-                        insights=st.session_state.dashboard_insights or [],
-                        charts=st.session_state.dashboard_charts or [],
-                        ml_metrics=st.session_state.ml_result,
-                        briefing=st.session_state.briefing or "",
-                        clean_df=st.session_state.clean_df,
-                        run_id=st.session_state.run_id,
-                        subject=f"[Analytics Forge] Your report — {st.session_state.domain}",
-                    )
-                    st.success(f"Queued/sent to {my_email}")
-                except EmailConfigError as exc:
-                    st.error(str(exc))
+                    st.session_state.manual_df = load_uploaded_file(up)
+                    st.session_state.manual_name = up.name
+                    st.success(f"Loaded {up.name}")
                 except Exception as exc:
                     st.error(str(exc))
-    else:
-        st.info("Log in so we know which email to send your downloads to.")
 
-    st.subheader("1) Send current report to anyone")
-    if not st.session_state.get("pipeline_done"):
-        st.info("Load and clean a dataset first (Upload), then you can email the report.")
-    with st.form("email_send_form"):
-        to_addr = st.text_input("Recipient email", value=my_email or "", placeholder="you@gmail.com")
-        subject = st.text_input(
-            "Subject",
-            value=f"[Analytics Forge] Report — {st.session_state.get('domain') or 'analytics'}",
+        page = st.radio(
+            "Navigate",
+            PAGES,
+            index=PAGES.index(st.session_state.page) if st.session_state.page in PAGES else 0,
         )
-        note = st.text_area("Extra note (optional)", value="")
-        send_clicked = st.form_submit_button("Send report now (HTML pack + clean CSV)", type="primary")
-        if send_clicked:
-            if not st.session_state.get("pipeline_done"):
-                st.error("No analysis loaded. Upload/clean data first.")
-            elif not to_addr.strip():
-                st.error("Enter a recipient email.")
-            else:
-                try:
-                    briefing = st.session_state.briefing or ""
-                    if not isinstance(briefing, str):
-                        import json as _json
-                        briefing = _json.dumps(briefing, default=str)
-                    result = send_current_report(
-                        to_addr.strip(),
-                        domain=st.session_state.domain or "generic",
-                        source_name=st.session_state.source_name or "dataset",
-                        clean_log=st.session_state.clean_log or [],
-                        kpis=st.session_state.kpis or {},
-                        insights=st.session_state.dashboard_insights or [],
-                        charts=st.session_state.dashboard_charts or [],
-                        ml_metrics=st.session_state.ml_result,
-                        briefing=briefing,
-                        clean_df=st.session_state.clean_df,
-                        run_id=st.session_state.run_id,
-                        subject=subject,
-                        extra_body=note,
-                    )
-                    st.success(
-                        f"Sent to {result['to']} (email_id={result['email_id']}). "
-                        f"Attachments: {', '.join(result.get('attachments') or [])}"
-                    )
-                except EmailConfigError as exc:
-                    st.error(str(exc))
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"Send failed: {exc}")
+        st.session_state.page = page
 
-    st.subheader("2) Inbound automation (CSV email → auto report reply)")
-    st.markdown(
-        "Email a **CSV or Excel** file to your configured inbox (`EMAIL_USER`). "
-        "Then click the button below. Forge will: clean → detect field → KPIs → charts pack → "
-        "email the HTML report + clean CSV + insights back to the sender."
-    )
-    if st.button("Check inbox & auto-process unread CSV emails", type="primary"):
-        try:
-            with st.spinner("Checking IMAP inbox..."):
-                out = process_inbound_mailbox(limit=10)
-            st.success(f"Processed {out.get('count', 0)} message(s).")
-            if out.get("processed"):
-                st.dataframe(pd.DataFrame(out["processed"]), use_container_width=True)
-            else:
-                st.info("No new unread CSV emails found.")
-        except EmailConfigError as exc:
-            st.error(str(exc))
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Inbox processing failed: {exc}")
-
-    st.subheader("Email log (SQLite)")
-    try:
-        rows = db.list_emails(100)
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
-        else:
-            st.info("No emails logged yet.")
-    except Exception:
-        st.info("Email log empty.")
+        st.divider()
+        if st.button("Start FORGE", type="primary"):
+            st.session_state.pipeline_started = True
+            st.success("Pipeline started")
+        st.caption(f"Gemini key: {'yes' if GEMINI_API_KEY else 'missing'}")
+        return page
 
 
 def main() -> None:
-    init_session_state()
-    inject_css()
-    db.init_db()
-    ensure_samples()
-
-    if not require_login():
+    init_state()
+    if not st.session_state.signed_in:
+        st.warning("Signed out.")
+        if st.button("Sign in again"):
+            st.session_state.signed_in = True
+            st.rerun()
         return
 
-    render_user_sidebar()
-    st.sidebar.markdown("### Analytics Forge")
-    st.sidebar.caption("Your data workspace — projects stay after refresh")
-    page = st.sidebar.radio(
-        "Navigate",
-        PAGES,
-        index=PAGES.index(st.session_state.page) if st.session_state.page in PAGES else 0,
-    )
-    st.session_state.page = page
-    render_recent_projects()
+    page = render_sidebar()
 
-    if st.session_state.pipeline_done:
-        st.sidebar.success(
-            f"{st.session_state.source_name or 'dataset'}\n\n"
-            f"`{st.session_state.domain}` · {len(st.session_state.clean_df):,} rows"
-        )
+    if st.session_state.pipeline_started:
+        st.toast("FORGE pipeline active", icon="⚒️")
+
+    # Banner mode
+    if st.session_state.mode == "LIVE CONNECT":
+        st.info("MODE: LIVE CONNECT (SCADA Modbus) — all pages read `data/live.csv` buffer")
     else:
-        st.sidebar.info("Load data on Upload to begin.")
-
-    try:
-        from modules.email_automation import email_configured as _email_ok
-
-        st.sidebar.caption(
-            "Email: configured" if _email_ok() else "Email: set .env to enable send/inbox"
-        )
-    except Exception:
-        pass
+        name = st.session_state.manual_name or "none"
+        st.info(f"MODE: MANUAL UPLOAD — all pages read uploaded file (`{name}`)")
 
     if page == "Upload":
         page_upload()
@@ -1374,7 +1340,7 @@ def main() -> None:
     elif page == "ML Studio":
         page_ml()
     elif page == "Ask / AI":
-        page_ai()
+        page_ask()
     elif page == "Dashboard":
         page_dashboard()
     elif page == "Email":
