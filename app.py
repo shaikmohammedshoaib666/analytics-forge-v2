@@ -272,58 +272,98 @@ def list_available_engines() -> list[str]:
 # GLOBAL FUNCTIONS — dual-mode data + shared analytics core
 # =============================================================================
 
-def _scale_register(name: str, raw: int) -> float:
-    """Map raw Modbus register integers to engineering units."""
-    raw = float(raw)
-    if name == "temperature":
-        return round(raw / 10.0, 2)
-    if name == "vibration":
-        return round(raw / 1000.0, 4)
-    if name == "pressure":
-        return round(raw / 10.0, 2)
-    if name == "current":
-        return round(raw / 100.0, 3)
-    if name == "voltage":
-        return round(raw / 10.0, 2)
-    if name == "speed":
-        return float(raw)
-    if name == "torque":
-        return round(raw / 10.0, 2)
-    if name == "rul":
-        return float(raw)
-    if name == "failure":
-        return 1.0 if raw > 0 else 0.0
-    if name == "load":
-        return round(raw / 10.0, 2)
-    return raw
+
+def load_live_config() -> dict[str, Any]:
+    """Load LIVE_MODE from config.yaml with .env overrides (+ session override from LIVE UI)."""
+    if st.session_state.get("live_cfg_override"):
+        return dict(st.session_state.live_cfg_override)
+    cfg: dict[str, Any] = {
+        "connection_type": "direct",
+        "ocp_u_ip": MODBUS_HOST,
+        "ocp_u_port": MODBUS_PORT,
+        "unit_id": MODBUS_UNIT,
+        "poll_interval_s": 5,
+        "modbus_timeout_s": 2.5,
+        "fastapi_url": "http://127.0.0.1:8088/live",
+        "fastapi_health_url": "http://127.0.0.1:8088/health",
+        "buffer_path": str(LIVE_CSV.relative_to(ROOT)) if LIVE_CSV.is_relative_to(ROOT) else "data/live.csv",
+        "max_buffer_rows": 50000,
+        "default_insight_engine": "prophet",
+        "auto_dashboard": True,
+        "registers": {
+            name: {"address": i, "scale": _default_scale(name)}
+            for i, name in enumerate(REGISTER_NAMES)
+        },
+    }
+    conf_path = ROOT / "config.yaml"
+    if conf_path.exists():
+        try:
+            import yaml
+            raw = yaml.safe_load(conf_path.read_text(encoding="utf-8")) or {}
+            live = dict(raw.get("LIVE_MODE") or {})
+            cfg.update({k: v for k, v in live.items() if v is not None})
+        except Exception as exc:
+            st.session_state.live_config_warning = f"config.yaml parse warning: {exc}"
+    # env wins for plant deploy
+    if os.getenv("LIVE_CONNECTION_TYPE"):
+        cfg["connection_type"] = os.getenv("LIVE_CONNECTION_TYPE", "direct").strip().lower()
+    if os.getenv("OCP_U_IP") or os.getenv("MODBUS_HOST"):
+        cfg["ocp_u_ip"] = os.getenv("OCP_U_IP") or os.getenv("MODBUS_HOST") or cfg["ocp_u_ip"]
+    if os.getenv("OCP_U_PORT") or os.getenv("MODBUS_PORT"):
+        cfg["ocp_u_port"] = int(os.getenv("OCP_U_PORT") or os.getenv("MODBUS_PORT") or cfg["ocp_u_port"])
+    if os.getenv("FASTAPI_LIVE_URL"):
+        cfg["fastapi_url"] = os.getenv("FASTAPI_LIVE_URL")
+    cfg["connection_type"] = str(cfg.get("connection_type") or "direct").strip().lower()
+    return cfg
 
 
-def poll_modbus_once(
-    host: str = MODBUS_HOST,
-    port: int = MODBUS_PORT,
-    unit: int = MODBUS_UNIT,
-    start: int = MODBUS_START,
-    count: int = MODBUS_COUNT,
-) -> dict[str, Any]:
-    """
-    REAL Modbus TCP read of holding registers (40001+).
-    Raises on connection / protocol failure — no demo fake plant.
-    """
+def _default_scale(name: str) -> float:
+    return {
+        "temperature": 0.1,
+        "vibration": 0.001,
+        "pressure": 0.1,
+        "current": 0.01,
+        "smps_current": 0.01,
+        "voltage": 0.1,
+        "smps_voltage": 0.1,
+        "torque": 0.1,
+        "load": 0.1,
+    }.get(name, 1.0)
+
+
+def live_buffer_path(cfg: Optional[dict[str, Any]] = None) -> Path:
+    cfg = cfg or load_live_config()
+    p = Path(str(cfg.get("buffer_path") or "data/live.csv"))
+    return p if p.is_absolute() else (ROOT / p)
+
+
+def read_via_pymodbus(cfg: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """OPTION A — Direct: Streamlit/gateway → pymodbus → OCP-U."""
+    cfg = cfg or load_live_config()
     try:
         from pymodbus.client import ModbusTcpClient
     except ImportError as exc:
-        raise RuntimeError(
-            "pymodbus is not installed. Run: pip install pymodbus"
-        ) from exc
+        raise RuntimeError("pymodbus not installed. pip install pymodbus") from exc
 
-    client = ModbusTcpClient(host=host, port=port, timeout=3)
+    host = str(cfg.get("ocp_u_ip") or MODBUS_HOST)
+    port = int(cfg.get("ocp_u_port") or MODBUS_PORT)
+    unit = int(cfg.get("unit_id") or MODBUS_UNIT)
+    timeout = float(cfg.get("modbus_timeout_s") or 2.5)
+    regs_map: dict[str, Any] = cfg.get("registers") or {}
+    if not regs_map:
+        raise RuntimeError("No register map in config.yaml LIVE_MODE.registers")
+
+    addresses = [int(m["address"]) for m in regs_map.values()]
+    start = min(addresses)
+    count = max(addresses) - start + 1
+
+    client = ModbusTcpClient(host=host, port=port, timeout=timeout)
     try:
         if not client.connect():
             raise RuntimeError(
-                f"Cannot connect to Modbus TCP {host}:{port}. "
-                "Check plant PLC / VPN / MODBUS_HOST in .env."
+                f"Cannot connect to OCP-U Modbus TCP {host}:{port}. "
+                "Check Ethernet/VPN, IP, and that the PLC is online."
             )
-        # pymodbus 3.x uses device_id / slave depending on version
         try:
             result = client.read_holding_registers(address=start, count=count, device_id=unit)
         except TypeError:
@@ -331,19 +371,24 @@ def poll_modbus_once(
                 result = client.read_holding_registers(address=start, count=count, slave=unit)
             except TypeError:
                 result = client.read_holding_registers(start, count, unit)
-
         if result is None or (hasattr(result, "isError") and result.isError()):
-            raise RuntimeError(f"Modbus read error from {host}:{port} regs@{start}+{count}: {result}")
+            raise RuntimeError(f"Modbus read error from {host}:{port}: {result}")
+        raw = list(result.registers)
+        if len(raw) < count:
+            raise RuntimeError(f"Expected {count} registers, got {len(raw)}")
 
-        regs = list(result.registers)
-        if len(regs) < count:
-            raise RuntimeError(f"Expected {count} registers, got {len(regs)}")
-
-        row: dict[str, Any] = {"timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
-        for i, name in enumerate(REGISTER_NAMES[:count]):
-            row[name] = _scale_register(name, regs[i])
-        for i in range(len(REGISTER_NAMES), count):
-            row[f"reg_{40001 + i}"] = float(regs[i])
+        row: dict[str, Any] = {
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "source": "direct_pymodbus",
+            "ocp_u": f"{host}:{port}",
+        }
+        for name, meta in regs_map.items():
+            addr = int(meta["address"])
+            scale = float(meta.get("scale", 1.0))
+            val = float(raw[addr - start]) * scale
+            if name == "failure":
+                val = 1.0 if val > 0 else 0.0
+            row[name] = round(val, 6) if name != "failure" else val
         return row
     finally:
         try:
@@ -352,8 +397,51 @@ def poll_modbus_once(
             pass
 
 
-def append_live_csv(row: dict[str, Any], path: Path = LIVE_CSV) -> pd.DataFrame:
-    """Append one SCADA poll row to data/live.csv and return full buffer."""
+def read_via_fastapi(cfg: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """OPTION B — Production: Streamlit → FastAPI gateway → pymodbus → OCP-U."""
+    cfg = cfg or load_live_config()
+    url = str(cfg.get("fastapi_url") or "").strip()
+    if not url:
+        raise RuntimeError("fastapi_url missing in config.yaml")
+    try:
+        import requests
+    except ImportError as exc:
+        raise RuntimeError("requests not installed. pip install requests") from exc
+    try:
+        resp = requests.get(url, timeout=float(cfg.get("modbus_timeout_s") or 3) + 2)
+    except Exception as exc:
+        raise RuntimeError(
+            f"FastAPI gateway unreachable at {url}: {exc}. "
+            "Start gateway: uvicorn gateway:app --port 8088"
+        ) from exc
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Gateway error {resp.status_code}: {resp.text[:300]}")
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("Gateway did not return a JSON object")
+    data.setdefault("source", "fastapi_gateway")
+    data.setdefault("timestamp", datetime.utcnow().isoformat(timespec="seconds") + "Z")
+    return data
+
+
+def fetch_live_row(cfg: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Single pipe entry: routes by connection_type."""
+    cfg = cfg or load_live_config()
+    ctype = str(cfg.get("connection_type") or "direct").lower()
+    if ctype == "buffer_only":
+        raise RuntimeError(
+            "connection_type=buffer_only — Streamlit will not poll plant. "
+            "Run gateway.py on the Pi to fill data/live.csv."
+        )
+    if ctype == "fastapi":
+        return read_via_fastapi(cfg)
+    return read_via_pymodbus(cfg)
+
+
+def append_live_csv(row: dict[str, Any], path: Optional[Path] = None) -> pd.DataFrame:
+    """Append one SCADA poll row to buffer and return full frame."""
+    cfg = load_live_config()
+    path = path or live_buffer_path(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
     frame = pd.DataFrame([row])
     if path.exists():
@@ -364,14 +452,15 @@ def append_live_csv(row: dict[str, Any], path: Path = LIVE_CSV) -> pd.DataFrame:
             out = frame
     else:
         out = frame
-    # Keep a bounded SCADA buffer (last 50k rows)
-    if len(out) > 50_000:
-        out = out.tail(50_000).reset_index(drop=True)
+    max_rows = int(cfg.get("max_buffer_rows") or 50000)
+    if len(out) > max_rows:
+        out = out.tail(max_rows).reset_index(drop=True)
     out.to_csv(path, index=False)
     return out
 
 
-def read_live_buffer(path: Path = LIVE_CSV) -> Optional[pd.DataFrame]:
+def read_live_buffer(path: Optional[Path] = None) -> Optional[pd.DataFrame]:
+    path = path or live_buffer_path()
     if not path.exists():
         return None
     try:
@@ -379,44 +468,162 @@ def read_live_buffer(path: Path = LIVE_CSV) -> Optional[pd.DataFrame]:
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
         return df
-    except Exception:
+    except Exception as exc:
+        st.session_state.live_error = f"Buffer read failed: {exc}"
         return None
 
 
-def ensure_live_poll(force: bool = False, min_interval_s: float = 5.0) -> pd.DataFrame:
+def ensure_live_poll(force: bool = False, min_interval_s: Optional[float] = None) -> pd.DataFrame:
     """
-    LIVE SCADA path: poll pymodbus every ~5s, persist to data/live.csv, return buffer.
-    No DemoSimulator. Connection failure raises / surfaces as live_error.
+    LIVE SCADA path — buffer-first industrial pattern:
+    1) Optionally poll plant (direct/fastapi) every N seconds
+    2) Persist to data/live.csv
+    3) On plant failure: serve last good buffer + surface error (never silent fake data)
     """
+    cfg = load_live_config()
+    interval = float(min_interval_s if min_interval_s is not None else cfg.get("poll_interval_s") or 5)
+    ctype = str(cfg.get("connection_type") or "direct").lower()
     now = time.time()
     last = float(st.session_state.get("live_last_poll") or 0.0)
-    need = force or (now - last >= min_interval_s)
+    need = force or (now - last >= interval)
+
+    if ctype == "buffer_only":
+        buf = read_live_buffer()
+        if buf is not None and len(buf):
+            st.session_state.live_status = "buffer_only"
+            st.session_state.live_error = None
+            return buf
+        raise RuntimeError(
+            "buffer_only mode: data/live.csv is empty. "
+            "Start gateway.py near OCP-U so it writes the buffer."
+        )
+
     if need:
         try:
-            row = poll_modbus_once()
+            row = fetch_live_row(cfg)
+            # fastapi gateway may already persist — still mirror locally for UI
             df = append_live_csv(row)
             st.session_state.live_last_poll = now
-            st.session_state.live_status = "connected"
+            st.session_state.live_status = f"connected:{ctype}"
             st.session_state.live_error = None
+            st.session_state.live_last_row = row
             return df
         except Exception as exc:
             st.session_state.live_status = "error"
             st.session_state.live_error = str(exc)
             buf = read_live_buffer()
             if buf is not None and len(buf):
-                # Serve last good SCADA buffer while showing the error
                 return buf
             raise
+
     buf = read_live_buffer()
     if buf is not None and len(buf):
         return buf
-    # First poll required
-    row = poll_modbus_once()
+    # first poll required
+    row = fetch_live_row(cfg)
     df = append_live_csv(row)
     st.session_state.live_last_poll = time.time()
-    st.session_state.live_status = "connected"
+    st.session_state.live_status = f"connected:{ctype}"
     st.session_state.live_error = None
+    st.session_state.live_last_row = row
     return df
+
+
+def live_latest_metrics(df: Optional[pd.DataFrame] = None) -> dict[str, Any]:
+    df = df if df is not None else read_live_buffer()
+    if df is None or df.empty:
+        return {}
+    row = df.iloc[-1]
+    keys = [
+        "temperature", "vibration", "pressure", "smps_voltage", "smps_current",
+        "voltage", "current", "speed", "torque", "rul", "failure", "load",
+    ]
+    out = {}
+    for k in keys:
+        if k in df.columns and pd.notna(row[k]):
+            try:
+                out[k] = float(row[k])
+            except Exception:
+                out[k] = row[k]
+    if "timestamp" in df.columns:
+        out["timestamp"] = str(row["timestamp"])
+    return out
+
+
+def live_auto_insights(df: pd.DataFrame, engine: str = "prophet") -> list[str]:
+    """Right-rail insights for LIVE SCADA (domain-aware, buffer slice)."""
+    lines: list[str] = []
+    if df is None or df.empty:
+        return ["No live buffer yet — poll OCP-U or start gateway."]
+    metrics = live_latest_metrics(df)
+    lines.append(f"Buffer **{len(df):,}** rows · latest `{metrics.get('timestamp', '—')}`")
+    if "vibration" in metrics:
+        vib = float(metrics["vibration"])
+        mean_v = float(pd.to_numeric(df["vibration"], errors="coerce").mean()) if "vibration" in df.columns else vib
+        if vib > mean_v * 1.5 + 0.1:
+            lines.append(f"🚨 Vibration spike **{vib:.3f}** (mean {mean_v:.3f}) — inspect bearings / SMPS coupling.")
+        else:
+            lines.append(f"Vibration **{vib:.3f}** within recent envelope.")
+    if "temperature" in metrics:
+        lines.append(f"Temperature **{metrics['temperature']:.2f}°C**")
+    if "smps_voltage" in metrics or "voltage" in metrics:
+        v = metrics.get("smps_voltage", metrics.get("voltage"))
+        lines.append(f"SMPS / supply voltage **{v}**")
+    if "failure" in metrics and float(metrics["failure"]) >= 1:
+        lines.append("🚨 Failure flag **1** on latest packet — open maintenance ticket.")
+
+    engine = (engine or "prophet").lower()
+    target = _col(df, "rul", "temperature", "vibration", "load")
+    try:
+        if engine == "prophet" and target:
+            lines.append(prophet_forecast(df.tail(min(500, len(df))), target))
+        elif engine == "pyspark" and target:
+            # lightweight spark summary — fallback pandas if spark heavy
+            try:
+                from pyspark.sql import SparkSession
+                spark = (
+                    SparkSession.builder.master("local[1]")
+                    .appName("forge_live_insight")
+                    .config("spark.ui.enabled", "false")
+                    .getOrCreate()
+                )
+                pdf = df[[target]].dropna().tail(200)
+                sdf = spark.createDataFrame(pdf.astype(float))
+                stats = sdf.describe(target).toPandas()
+                lines.append(f"PySpark describe `{target}`:\n{stats.to_string(index=False)}")
+                spark.stop()
+            except Exception as exc:
+                s = pd.to_numeric(df[target], errors="coerce")
+                lines.append(f"PySpark unavailable ({exc}); pandas mean={s.mean():.3f} std={s.std():.3f}")
+        else:
+            if target:
+                s = pd.to_numeric(df[target], errors="coerce").dropna()
+                if len(s) >= 5:
+                    slope = float(np.polyfit(np.arange(len(s.tail(50))), s.tail(50).to_numpy(), 1)[0])
+                    lines.append(f"Pandas trend `{target}` slope={slope:.4f} (last 50).")
+    except Exception as exc:
+        lines.append(f"Insight engine note: {exc}")
+    return lines
+
+
+# backward-compat aliases used elsewhere
+def poll_modbus_once(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    cfg = load_live_config()
+    if args or kwargs:
+        if args:
+            cfg["ocp_u_ip"] = args[0]
+        if len(args) > 1:
+            cfg["ocp_u_port"] = args[1]
+        cfg["ocp_u_ip"] = kwargs.get("host", cfg["ocp_u_ip"])
+        cfg["ocp_u_port"] = kwargs.get("port", cfg["ocp_u_port"])
+        cfg["unit_id"] = kwargs.get("unit", cfg.get("unit_id"))
+    return read_via_pymodbus(cfg)
+
+
+def _scale_register(name: str, raw: int) -> float:
+    """Legacy helper — prefer config.yaml scales."""
+    return round(float(raw) * _default_scale(name), 6)
+
 
 
 def get_data() -> pd.DataFrame:
@@ -427,7 +634,19 @@ def get_data() -> pd.DataFrame:
     """
     mode = st.session_state.get("mode", "MANUAL UPLOAD")
     if mode == "LIVE CONNECT":
-        return ensure_live_poll(force=False, min_interval_s=5.0)
+        try:
+            cfg = load_live_config()
+            interval = float(cfg.get("poll_interval_s") or 5)
+            return ensure_live_poll(force=False, min_interval_s=interval)
+        except Exception as exc:
+            st.session_state.live_status = "error"
+            st.session_state.live_error = str(exc)
+            buf = read_live_buffer()
+            if buf is not None and len(buf):
+                return buf
+            raise RuntimeError(
+                f"LIVE unavailable: {exc}. Fix OCP-U/FastAPI connection or switch to MANUAL UPLOAD."
+            ) from exc
 
     if st.session_state.get("prefer_clean_df") and isinstance(st.session_state.get("clean_df"), pd.DataFrame):
         cdf = st.session_state.clean_df
@@ -2909,6 +3128,209 @@ def send_forge_email_report(
 # PAGES
 # =============================================================================
 
+
+def page_live_console() -> None:
+    """SCADA LIVE console — left: connection + metrics + buffer; right: auto insights / engine."""
+    st.header("LIVE SCADA")
+    st.caption(
+        "One pipe, three layers: **OCP-U → pymodbus → (optional FastAPI) → data/live.csv → Streamlit**. "
+        "Switch Direct / FastAPI / Buffer-only in `config.yaml` — Manual mode unchanged."
+    )
+    cfg = load_live_config()
+    ctype = str(cfg.get("connection_type") or "direct").lower()
+
+    left, right = st.columns([2.2, 1])
+    with left:
+        st.subheader("Connection")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            ui_type = st.selectbox(
+                "Connection type (session override)",
+                ["direct", "fastapi", "buffer_only"],
+                index=["direct", "fastapi", "buffer_only"].index(ctype) if ctype in ("direct", "fastapi", "buffer_only") else 0,
+                help="Persists only this session; edit config.yaml for permanent.",
+            )
+        with c2:
+            ip = st.text_input("OCP-U IP", value=str(cfg.get("ocp_u_ip") or "192.168.1.50"))
+        with c3:
+            port = st.number_input("Port", min_value=1, max_value=65535, value=int(cfg.get("ocp_u_port") or 502))
+        fastapi_url = st.text_input("FastAPI /live URL", value=str(cfg.get("fastapi_url") or "http://127.0.0.1:8088/live"))
+        # session overrides
+        st.session_state.live_cfg_override = {
+            **cfg,
+            "connection_type": ui_type,
+            "ocp_u_ip": ip,
+            "ocp_u_port": int(port),
+            "fastapi_url": fastapi_url,
+        }
+
+        # monkey-patch load for this session via wrapper stored
+        def _cfg_override():
+            return st.session_state.live_cfg_override
+
+        # temporarily use override inside poll by writing a thin adapter
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            poll_now = st.button("Poll now", type="primary")
+        with b2:
+            auto = st.checkbox("Auto-poll (~5s on rerun)", value=bool(st.session_state.get("live_auto_poll")))
+            st.session_state.live_auto_poll = auto
+        with b3:
+            if st.button("Reload buffer only"):
+                buf = read_live_buffer()
+                if buf is not None:
+                    st.success(f"Buffer {len(buf):,} rows")
+                else:
+                    st.warning("No data/live.csv yet")
+
+        # Apply override into ensure_live by patching load_live_config call site via session
+        # We call fetch with override cfg directly for poll_now
+        err = None
+        df = None
+        try:
+            if poll_now or (auto and ui_type != "buffer_only"):
+                if ui_type == "buffer_only":
+                    df = read_live_buffer()
+                    if df is None or df.empty:
+                        raise RuntimeError("buffer_only: empty data/live.csv — run gateway.py on plant Pi.")
+                    st.session_state.live_status = "buffer_only"
+                    st.session_state.live_error = None
+                else:
+                    row = fetch_live_row(st.session_state.live_cfg_override)
+                    df = append_live_csv(row)
+                    st.session_state.live_last_poll = time.time()
+                    st.session_state.live_status = f"connected:{ui_type}"
+                    st.session_state.live_error = None
+                    st.session_state.live_last_row = row
+                    st.success(f"Polled OK via **{ui_type}**")
+            else:
+                df = read_live_buffer()
+                if df is None:
+                    # try soft ensure (may error)
+                    try:
+                        # use override
+                        old = load_live_config
+                        # call ensure with patched config by temporarily writing
+                        row = None
+                        if ui_type != "buffer_only":
+                            pass
+                        df = read_live_buffer()
+                    except Exception:
+                        df = None
+        except Exception as exc:
+            err = str(exc)
+            st.session_state.live_status = "error"
+            st.session_state.live_error = err
+            df = read_live_buffer()
+
+        st.write(
+            f"Status: **{st.session_state.get('live_status', 'idle')}** · "
+            f"config default `{ctype}` · buffer `{live_buffer_path(cfg)}`"
+        )
+        if err or st.session_state.get("live_error"):
+            st.error(err or st.session_state.live_error)
+            st.caption("Plant unreachable — showing last good buffer if any (no fake live data).")
+
+        metrics = live_latest_metrics(df)
+        if metrics:
+            st.subheader("Live tags")
+            keys = [k for k in ("temperature", "vibration", "pressure", "smps_voltage", "smps_current", "rul", "failure", "load") if k in metrics]
+            if not keys:
+                keys = list(metrics.keys())[:8]
+            cols = st.columns(min(4, max(1, len(keys))))
+            for i, k in enumerate(keys):
+                cols[i % len(cols)].metric(k.replace("_", " ").title(), metrics[k])
+        else:
+            st.info(
+                "No live tags yet. Set OCP-U IP (or FastAPI URL), click **Poll now**. "
+                "For demo without plant: run gateway against a Modbus simulator, or copy a CSV to `data/live.csv`."
+            )
+
+        if df is not None and len(df):
+            st.subheader("SCADA buffer (tail)")
+            st.dataframe(df.tail(40), use_container_width=True)
+            tcol = _col(df, "temperature")
+            vcol = _col(df, "vibration")
+            if tcol:
+                st.line_chart(pd.to_numeric(df[tcol], errors="coerce").tail(60))
+            if vcol:
+                st.line_chart(pd.to_numeric(df[vcol], errors="coerce").tail(60))
+        with st.expander("Register map (from config.yaml)"):
+            st.json(cfg.get("registers") or {})
+        with st.expander("How LIVE works"):
+            st.markdown(
+                """
+**Direct (demo room):** `Streamlit → pymodbus → OCP-U @ IP:502`  
+**FastAPI (factory):** `OCP-U → gateway.py (Pi) → /live` then `Streamlit → HTTP`  
+**Buffer-only:** Gateway writes `data/live.csv` 24/7; Streamlit only reads (never crashes if plant drops).
+
+Edit `config.yaml` → `LIVE_MODE.connection_type`.
+                """
+            )
+
+    with right:
+        st.subheader("Auto insights")
+        engine = st.selectbox(
+            "Insight engine",
+            ["prophet", "pandas", "pyspark"],
+            index=["prophet", "pandas", "pyspark"].index(str(cfg.get("default_insight_engine") or "prophet"))
+            if str(cfg.get("default_insight_engine") or "prophet") in ("prophet", "pandas", "pyspark")
+            else 0,
+        )
+        st.session_state.live_insight_engine = engine
+        if df is not None and len(df) >= 5:
+            if st.button("Generate LIVE insights", type="primary") or st.session_state.get("live_insights_auto"):
+                with st.spinner("Analyzing buffer..."):
+                    lines = live_auto_insights(df, engine=engine)
+                    st.session_state.live_insight_lines = lines
+                    st.session_state.dashboard_insights = list(
+                        dict.fromkeys((st.session_state.get("dashboard_insights") or []) + lines[:4])
+                    )
+            for line in st.session_state.get("live_insight_lines") or live_auto_insights(df, engine=engine):
+                st.markdown(f"- {line}")
+            st.divider()
+            st.subheader("Quick actions")
+            if st.button("Detect field on live buffer"):
+                with st.spinner("Detecting..."):
+                    meta = detect_field(df, use_gemini=bool(get_gemini_api_key()), optuna_trials=10)
+                    st.session_state.domain = meta["domain"]
+                    st.session_state.domain_meta = meta
+                    ensure_llama_index(df, force=True)
+                st.success(f"Field → {meta['label']} ({meta['confidence']})")
+            if st.button("Pin latest trend to Dashboard"):
+                tcol = _col(df, "temperature", "vibration", "rul")
+                if tcol:
+                    charts = list(st.session_state.get("dashboard_charts") or [])
+                    charts.append(
+                        {
+                            "title": f"LIVE {tcol} trend",
+                            "chart_type": "line",
+                            "lib": "plotly",
+                            "x": "timestamp" if "timestamp" in df.columns else tcol,
+                            "y": tcol,
+                            "color": None,
+                            "insight": f"Pinned from LIVE buffer ({len(df)} rows)",
+                        }
+                    )
+                    st.session_state.dashboard_charts = charts
+                    st.success("Pinned")
+            if st.button("Run best live model (Field card)"):
+                dom = st.session_state.get("domain") or "predictive_maintenance"
+                card = field_best_model_card(df, dom)
+                if card.get("ok"):
+                    st.session_state.ml_result = card["result"]
+                    for a in card.get("actions") or []:
+                        st.markdown(f"- {a}")
+                else:
+                    st.warning(card.get("error"))
+        else:
+            st.caption("Poll plant first to unlock insights / Prophet / PySpark.")
+
+    if auto and ui_type != "buffer_only":
+        time.sleep(0.05)
+        st.caption("Auto-poll armed — interact or refresh to pull next sample (Streamlit-safe, no blocking loop).")
+
+
 def page_upload() -> None:
     st.header("Upload")
     st.caption(
@@ -2917,27 +3339,7 @@ def page_upload() -> None:
     )
 
     if st.session_state.mode == "LIVE CONNECT":
-        st.info(
-            f"LIVE CONNECT active → pymodbus `{MODBUS_HOST}:{MODBUS_PORT}` "
-            f"regs {40001}-{40001 + MODBUS_COUNT - 1}, poll ≤5s, buffer `{LIVE_CSV}`."
-        )
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Force Modbus poll now", type="primary"):
-                try:
-                    df = ensure_live_poll(force=True)
-                    st.success(f"Polled OK — buffer {len(df):,} rows")
-                    st.dataframe(df.tail(20), use_container_width=True)
-                except Exception as exc:
-                    st.error(str(exc))
-        with c2:
-            st.write(f"Status: **{st.session_state.get('live_status')}**")
-            if st.session_state.get("live_error"):
-                st.error(st.session_state.live_error)
-        buf = read_live_buffer()
-        if buf is not None:
-            st.subheader("Current SCADA buffer")
-            st.dataframe(buf.tail(50), use_container_width=True)
+        page_live_console()
         return
 
     gemini_key_ui("upload")
@@ -3552,8 +3954,17 @@ def render_sidebar() -> str:
         st.session_state.mode = mode
 
         if mode == "LIVE CONNECT":
-            st.caption(f"SCADA Modbus `{MODBUS_HOST}:{MODBUS_PORT}` → `{LIVE_CSV.name}`")
+            try:
+                _lc = load_live_config()
+                st.caption(
+                    f"LIVE `{_lc.get('connection_type')}` · "
+                    f"{_lc.get('ocp_u_ip')}:{_lc.get('ocp_u_port')} · buffer `{LIVE_CSV.name}`"
+                )
+            except Exception:
+                st.caption(f"SCADA → `{LIVE_CSV.name}`")
             st.write(f"Link: **{st.session_state.get('live_status', 'idle')}**")
+            if st.session_state.get("live_error"):
+                st.warning(str(st.session_state.live_error)[:180])
         else:
             up = st.file_uploader(
                 "Quick upload",
@@ -3614,7 +4025,15 @@ def main() -> None:
 
     # Banner mode
     if st.session_state.mode == "LIVE CONNECT":
-        st.info("MODE: LIVE CONNECT (SCADA Modbus) — all pages read `data/live.csv` buffer")
+        try:
+            _lc = load_live_config()
+            st.info(
+                f"MODE: LIVE CONNECT (`{_lc.get('connection_type')}`) — "
+                f"OCP-U {_lc.get('ocp_u_ip')}:{_lc.get('ocp_u_port')} · "
+                f"buffer `data/live.csv` · Upload page = SCADA console"
+            )
+        except Exception:
+            st.info("MODE: LIVE CONNECT — all pages read `data/live.csv` buffer")
     else:
         name = st.session_state.manual_name or "none"
         st.info(f"MODE: MANUAL UPLOAD — all pages read uploaded file (`{name}`)")

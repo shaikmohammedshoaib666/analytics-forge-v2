@@ -19,3 +19,7 @@ seaborn>=0.13
 xgboost>=2.0
 lightgbm>=4.0
 statsmodels>=0.14
+pyyaml>=6.0
+fastapi>=0.110
+uvicorn>=0.27
+requests>=2.31
