@@ -19,12 +19,14 @@ from config.settings import SAMPLES_DIR, UPLOADS_DIR
 from core import db
 from core.classify import classify, load_domains
 from core.engine import available_engines
-from core.filters import TopFilters, apply_buffer_filters
+from core.filters import TopFilters, apply_buffer_filters, filter_schema_for_domain
 from core.kpis import compute_kpis
+from core.live.base import get_connector
 from core.live.stubs import VIRTUAL_UNIVERSE_SIZE, fetch_live_data, list_connectors
 from core.mode import DataMode
 from core.pack import build_html_pack
 from core.pipeline import run_pipeline
+from core.templates import load_templates
 from modules.ai_guide import ask_ai
 from modules.auto_dashboard import build_auto_dashboard
 from modules.business_alerts import generate_alerts
@@ -344,49 +346,109 @@ def page_upload() -> None:
 
 
 def _page_upload_live(engine: str) -> None:
-    """Live mode upload — demo simulator with top filters."""
-    st.markdown(f"**Virtual plant universe:** ~{VIRTUAL_UNIVERSE_SIZE:,} rows (never fully loaded)")
-    connectors = list_connectors()
-    conn_id = st.selectbox("Connector", list(connectors.keys()),
-                           format_func=lambda k: connectors[k]["label"])
+    """Live mode — industry-adaptive filters + real-capable connectors (sim until creds)."""
+    st.info(
+        "**Demo Simulator** = like sample CSV (pipeline test only). "
+        "**Modbus / OPC-UA / REST / SMPS / Azure** = real-capable plugins. "
+        "Without host/credentials they use sim data; with credentials they attempt a real fetch."
+    )
 
-    st.subheader("Top Filters (gate the fetch)")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        site = st.text_input("Site", placeholder="e.g. Site-1")
-        line = st.text_input("Line", placeholder="e.g. Line-1")
-    with c2:
-        machine = st.text_input("Machine", placeholder="e.g. M-001")
-        product = st.text_input("Product", placeholder="e.g. ProductA")
-    with c3:
-        region = st.text_input("Region", placeholder="e.g. North")
-        max_rows = st.number_input("Max rows", min_value=10, max_value=50000, value=500)
+    templates = load_templates()
+    domain_keys = list(templates.keys()) or ["generic"]
+    domain_labels = {k: templates[k].get("label", k) for k in domain_keys}
+    industry = st.selectbox(
+        "Industry / use-case (changes filters)",
+        domain_keys,
+        format_func=lambda k: domain_labels.get(k, k),
+        help="BMW factory ≠ hospital ≠ Gucci retail ≠ warehouse ≠ Azure ERP — filters adapt.",
+    )
+
+    # Connectors allowed for this industry
+    allowed = templates.get(industry, {}).get("connectors") or list(list_connectors().keys())
+    all_conn = list_connectors()
+    conn_ids = [c for c in allowed if c in all_conn] or list(all_conn.keys())
+    conn_id = st.selectbox(
+        "Connector",
+        conn_ids,
+        format_func=lambda k: f"{all_conn[k]['label']} [{all_conn[k].get('capability', '?')}]",
+    )
+    connector = get_connector(conn_id)
+
+    # Real connection settings (optional — leave blank for sim)
+    with st.expander("Connection settings (optional — for real industry / Azure later)", expanded=False):
+        st.caption("Leave blank to stay in sim/demo mode. Fill these when you have a real plant or Azure endpoint.")
+        host = st.text_input("Host / URL / Endpoint", placeholder="opc.tcp://plant:4840 or https://api... or Azure URL")
+        token = st.text_input("Token / Password / Connection string", type="password")
+        username = st.text_input("Username (if needed)", placeholder="optional")
+    config = {}
+    if host:
+        config["host"] = host
+        config["url"] = host
+        config["endpoint"] = host
+    if token:
+        config["token"] = token
+        config["connection_string"] = token
+    if username:
+        config["username"] = username
+
+    if connector:
+        status = connector.connection_status(config)
+        if status["mode"] == "demo":
+            st.caption(status["message"])
+        elif status["mode"] == "sim_fallback":
+            st.warning(status["message"])
+        else:
+            st.success(status["message"])
+
+    st.subheader(f"Top Filters for {domain_labels.get(industry, industry)}")
+    st.caption(
+        f"Pull only a slice — never the full source (~{VIRTUAL_UNIVERSE_SIZE:,} virtual rows in sim)."
+    )
+    schema = filter_schema_for_domain(industry)
+    filter_vals: dict = {}
+    cols = st.columns(3)
+    for i, field in enumerate(schema):
+        with cols[i % 3]:
+            filter_vals[field["key"]] = st.text_input(
+                field.get("label", field["key"]),
+                placeholder=field.get("hint", ""),
+                key=f"live_f_{industry}_{field['key']}",
+            ) or None
+
+    max_rows = st.number_input("Max rows", min_value=10, max_value=50000, value=500)
 
     filters = TopFilters(
-        site=site or None, line=line or None, machine=machine or None,
-        product=product or None, region=region or None, max_rows=int(max_rows),
+        values={k: v for k, v in filter_vals.items() if v},
+        max_rows=int(max_rows),
+        domain=industry,
     )
 
     if st.button("Fetch filtered live slice", type="primary"):
-        with st.spinner("Fetching from simulator..."):
-            raw_df = fetch_live_data(conn_id, filters)
-            result = run_pipeline(
-                raw_df=raw_df,
-                filename=f"live_{conn_id}",
-                domain_override=st.session_state.domain_override,
-                persist=True,
-                user_id=_current_user_id(),
-                clean_engine=engine,
-                data_mode="live",
-            )
-        apply_pipeline_to_state(result)
-        st.session_state["data_mode"] = "live"
-        st.success(f"Loaded **{len(raw_df):,}** rows from {connectors[conn_id]['label']} · domain `{result['domain']}`")
-        st.dataframe(result["clean_df"].head(20), use_container_width=True)
+        with st.spinner("Fetching..."):
+            try:
+                raw_df = fetch_live_data(conn_id, filters, config or None)
+                result = run_pipeline(
+                    raw_df=raw_df,
+                    filename=f"live_{conn_id}_{industry}",
+                    domain_override=industry if industry != "generic" else st.session_state.domain_override,
+                    persist=True,
+                    user_id=_current_user_id(),
+                    clean_engine=engine,
+                    data_mode="live",
+                )
+                apply_pipeline_to_state(result)
+                st.session_state["data_mode"] = "live"
+                st.session_state["live_industry"] = industry
+                st.success(
+                    f"Loaded **{len(raw_df):,}** rows via {all_conn[conn_id]['label']} · domain `{result['domain']}`"
+                )
+                st.dataframe(result["clean_df"].head(20), use_container_width=True)
+            except Exception as exc:
+                st.error(str(exc))
 
     if st.session_state.pipeline_done and st.session_state.get("data_mode") == "live":
         st.divider()
-        st.subheader("Buffer filters (refine loaded data)")
+        st.subheader("Buffer filters (refine loaded data — no re-fetch)")
         if st.button("Apply buffer filters"):
             filtered = apply_buffer_filters(st.session_state.clean_df, filters)
             st.session_state.clean_df = filtered
@@ -716,11 +778,24 @@ def page_ml() -> None:
             result = run_model(df, model_id=model_id, target=target_arg)
             if use_optuna and result.get("ok") and result.get("target") and result.get("features"):
                 with st.spinner("Optuna tuning..."):
-                    tune_res = tune_model(df, model_id, result["target"], result["features"],
-                                          task=result.get("task", "regression"))
+                    tune_res = tune_model(
+                        df, model_id, result["target"], result["features"],
+                        task=result.get("task", "regression"),
+                        domain=domain or "generic",
+                    )
                     if tune_res.get("ok"):
                         result["optuna"] = tune_res
-                        st.info(f"Optuna best: {tune_res['scoring']}={tune_res['best_score']:.4f} | params: {tune_res['best_params']}")
+                        st.info(
+                            f"Optuna best {tune_res['scoring']}={tune_res['best_score']:.4f} · "
+                            f"params: {tune_res['best_params']}"
+                        )
+                        if tune_res.get("business_insight"):
+                            st.success(f"**Business insight:** {tune_res['business_insight']}")
+                            result["manager_briefing"] = (
+                                (result.get("manager_briefing") or "")
+                                + "\n\n"
+                                + tune_res["business_insight"]
+                            )
         if result.get("ok"):
             briefing = build_manager_insight(result)
             result["manager_briefing"] = briefing
@@ -848,16 +923,17 @@ def page_ai() -> None:
     else:
         st.warning(
             "No cloud AI keys yet — offline answers still work.\n\n"
-            "Add to `.env` (local) or Streamlit Secrets (cloud), then restart:\n\n"
+            "**How to create a Gemini API key (free):**\n"
+            "1. Open https://aistudio.google.com/apikey\n"
+            "2. Sign in with Google → **Create API key**\n"
+            "3. Copy the key\n"
+            "4. Put it in a `.env` file in this project (never paste keys into chat):\n\n"
             "```\n"
-            "GEMINI_API_KEY=your_key_from_Google_AI_Studio\n"
+            "GEMINI_API_KEY=your_key_here\n"
             "GEMINI_MODEL=gemini-2.0-flash\n"
             "AI_DEFAULT_PROVIDER=gemini\n"
-            "# optional:\n"
-            "OPENAI_API_KEY=sk-...\n"
-            "OPENAI_MODEL=gpt-4o-mini\n"
             "```\n\n"
-            "Gemini free tier: https://aistudio.google.com/apikey — never paste keys into chat."
+            "Then restart Streamlit. Optional OpenAI: `OPENAI_API_KEY=sk-...`"
         )
 
     selectable = ["auto"]

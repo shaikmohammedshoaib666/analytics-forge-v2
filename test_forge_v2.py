@@ -17,16 +17,22 @@ def test_mode():
 
 
 def test_filters():
-    from core.filters import TopFilters, apply_buffer_filters, MAX_ROWS_HARD_CAP
-    f = TopFilters(site="Site-1", max_rows=100)
+    from core.filters import TopFilters, apply_buffer_filters, MAX_ROWS_HARD_CAP, filter_schema_for_domain
+    f = TopFilters(values={"site": "Site-1"}, max_rows=100, domain="predictive_maintenance")
     assert f.effective_max_rows() == 100
     f2 = TopFilters(max_rows=999999)
     assert f2.effective_max_rows() == MAX_ROWS_HARD_CAP
     # Buffer filter
     df = pd.DataFrame({"site": ["A", "B", "A"], "val": [1, 2, 3]})
-    out = apply_buffer_filters(df, TopFilters(site="A", max_rows=10))
+    out = apply_buffer_filters(df, TopFilters(values={"site": "A"}, max_rows=10))
     assert len(out) == 2
-    print("  filters: OK")
+    # Industry schemas differ
+    factory = [x["key"] for x in filter_schema_for_domain("predictive_maintenance")]
+    health = [x["key"] for x in filter_schema_for_domain("healthcare")]
+    assert "machine" in factory
+    assert "hospital" in health
+    assert "machine" not in health
+    print("  filters: OK (industry-adaptive)")
 
 
 def test_live_simulator():
@@ -34,12 +40,18 @@ def test_live_simulator():
     from core.live.stubs import fetch_live_data, list_connectors, VIRTUAL_UNIVERSE_SIZE
     connectors = list_connectors()
     assert "demo_simulator" in connectors
+    assert "azure" in connectors
+    assert connectors["pymodbus"]["capability"] == "capable"
+    assert connectors["demo_simulator"]["capability"] == "sim"
     assert VIRTUAL_UNIVERSE_SIZE > 1_000_000
-    filters = TopFilters(site="Site-1", max_rows=50)
+    filters = TopFilters(values={"site": "Site-1"}, max_rows=50, domain="predictive_maintenance")
     df = fetch_live_data("demo_simulator", filters)
     assert len(df) <= 50
-    assert "temperature" in df.columns
-    print(f"  live_simulator: OK ({len(df)} rows from {VIRTUAL_UNIVERSE_SIZE:,} virtual)")
+    # Healthcare filters produce healthcare columns
+    hf = TopFilters(values={"hospital": "City General"}, max_rows=30, domain="healthcare")
+    hdf = fetch_live_data("api", hf)
+    assert "hospital" in hdf.columns or "wait_minutes" in hdf.columns
+    print(f"  live_simulator: OK ({len(df)} rows; connectors={list(connectors)})")
 
 
 def test_engine_polars():
@@ -89,9 +101,10 @@ def test_optuna():
     from modules.optuna_tuner import optuna_available, tune_model
     assert optuna_available()
     df = pd.DataFrame({"a": range(50), "b": range(50, 100), "target": range(50)})
-    result = tune_model(df, "RandomForestRegressor", "target", ["a", "b"], n_trials=5)
+    result = tune_model(df, "RandomForestRegressor", "target", ["a", "b"], n_trials=5, domain="sales_forecasting")
     assert result["ok"], result.get("error")
-    print(f"  Optuna: OK (best={result['best_score']:.3f})")
+    assert result.get("business_insight")
+    print(f"  Optuna: OK (best={result['best_score']:.3f}; insight={result['business_insight'][:60]}...)")
 
 
 def test_rag():
@@ -128,8 +141,10 @@ def test_templates():
     from core.templates import load_templates, get_template
     templates = load_templates()
     assert "predictive_maintenance" in templates
-    t = get_template("predictive_maintenance")
-    assert "kpi_focus" in t
+    assert "healthcare" in templates
+    assert "erp_cloud" in templates
+    t = get_template("healthcare")
+    assert any(f["key"] == "hospital" for f in t.get("filter_fields", []))
     print("  templates: OK")
 
 
@@ -137,7 +152,7 @@ def test_live_pipeline_e2e():
     from core.filters import TopFilters
     from core.live.stubs import fetch_live_data
     from core.pipeline import run_pipeline
-    filters = TopFilters(site="Site-1", max_rows=100)
+    filters = TopFilters(values={"site": "Site-1"}, max_rows=100, domain="predictive_maintenance")
     raw = fetch_live_data("demo_simulator", filters)
     result = run_pipeline(raw_df=raw, filename="live_test", persist=False, clean_engine="pandas", data_mode="live")
     assert result["clean_df"] is not None

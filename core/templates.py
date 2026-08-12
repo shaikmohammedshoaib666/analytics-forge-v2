@@ -19,4 +19,28 @@ def load_templates() -> dict[str, Any]:
 
 def get_template(domain: str) -> dict[str, Any]:
     templates = load_templates()
-    return templates.get(domain, templates.get("generic", {}))
+    if domain in templates:
+        return templates[domain]
+    # Map common aliases
+    aliases = {
+        "pdm": "predictive_maintenance",
+        "manufacturing": "predictive_maintenance",
+        "factory": "predictive_maintenance",
+        "sales": "sales_forecasting",
+        "retail": "sales_forecasting",
+        "hospital": "healthcare",
+        "warehouse": "supply_chain",
+        "logistics": "supply_chain",
+        "azure": "erp_cloud",
+        "cloud": "erp_cloud",
+        "erp": "erp_cloud",
+    }
+    mapped = aliases.get((domain or "").lower())
+    if mapped and mapped in templates:
+        return templates[mapped]
+    return templates.get("generic", {})
+
+
+def insight_text(domain: str, kind: str) -> str:
+    tpl = get_template(domain)
+    return (tpl.get("insight_templates") or {}).get(kind, "")
