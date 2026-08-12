@@ -16,11 +16,8 @@ Industry dual-mode analytics OS — **Manual upload** + **LIVE SCADA** — share
 
 Repo: `shaikmohammedshoaib666/analytics-forge-v2` (keep separate from `analytics-forge` v1 demo).
 
-> **Hugging Face Space:** this repo is Docker-Space ready (`sdk: docker`, light `requirements-cloud.txt`).  
-> After you create the Space from this GitHub repo, URL looks like:  
-> `https://huggingface.co/spaces/<YOUR_HF_USER>/analytics-forge-v2`  
-> App: `https://<YOUR_HF_USER>-analytics-forge-v2.hf.space`  
-> Full click path: **`deploy/HUGGINGFACE.md`**
+> **Deploy:** Free public host = **Render** (`deploy/RENDER.md`).  
+> Hugging Face free tier is **Static only** now — Docker needs **HF PRO** and cannot run Forge on free Static. See `deploy/HUGGINGFACE.md`.
 
 ## Try now (localhost)
 
@@ -51,33 +48,26 @@ python smoke_test.py
 
 ---
 
-## Deploy: pick a host (Streamlit Cloud is slow — use these)
+## Deploy: pick a host
 
-| Platform | Public URL? | Speed | Best for |
-|----------|-------------|-------|----------|
-| **Hugging Face Spaces** | Yes | Usually faster first build | **Recommended free demo link** — see `deploy/HUGGINGFACE.md` |
-| **Render** (Blueprint) | Yes (`render.yaml`) | Medium; free tier sleeps | Stable demo — see `deploy/RENDER.md` |
-| **Streamlit Cloud** | Yes | Often 15–40+ min / OOM | Only if you already use it + `requirements-cloud.txt` |
-| **Oracle Free / Azure / VPS + Docker** | Yes (your IP:8501) | Fast once VM exists | Full stack + LIVE gateway — `deploy/ORACLE_FREE.md` |
+| Platform | Free public URL? | Notes |
+|----------|------------------|-------|
+| **Render** (Blueprint) | **Yes — use this** | Root `render.yaml` + `deploy/RENDER.md` |
+| **Streamlit Cloud** | Yes | Often slow / OOM — use `requirements-cloud.txt` |
+| **Oracle Free / Azure / VPS + Docker** | Yes (your IP) | Full stack — `deploy/ORACLE_FREE.md` |
+| **Hugging Face Spaces** | **Docker = paid (PRO)** | Free = **Static only** — cannot run Streamlit Forge. `deploy/HUGGINGFACE.md` |
 
-**I cannot log into your HF / Render / Streamlit account** — you click once; then you own the permanent URL.
+**PySpark on free cloud hosts will usually fail or OOM.** Public demos use **`requirements-cloud.txt`**.
 
-**PySpark on free cloud hosts will usually fail or OOM.** Always use **`requirements-cloud.txt`** for public demos.
+### Option A — Render (recommended free link)
 
-### Option A — Hugging Face Spaces (preferred free link)
+1. https://dashboard.render.com → sign up with GitHub  
+2. **New → Blueprint** → repo `shaikmohammedshoaib666/analytics-forge-v2`  
+3. Uses root **`render.yaml`**  
+4. Secret: `GEMINI_API_KEY`  
+5. Details: **`deploy/RENDER.md`**
 
-1. https://huggingface.co/new-space → SDK **Docker** → name `analytics-forge-v2`  
-2. Push this branch into the Space (see **`deploy/HUGGINGFACE.md`**) or connect GitHub branch `cursor/forge-v2-foundation-f3f9`  
-3. Secret: `GEMINI_API_KEY` (+ optional `GEMINI_MODEL=gemini-flash-latest`)  
-4. App URL: `https://<YOUR_HF_USER>-analytics-forge-v2.hf.space`
-
-### Option B — Render Blueprint
-
-1. https://dashboard.render.com/select-repo?type=blueprint  
-2. Repo uses root **`render.yaml`** (installs `requirements-cloud.txt`)  
-3. Details: **`deploy/RENDER.md`**
-
-### Option C — Streamlit Cloud (slower)
+### Option B — Streamlit Cloud
 
 1. [share.streamlit.io](https://share.streamlit.io) → **New app**
 2. Repo: `shaikmohammedshoaib666/analytics-forge-v2`
@@ -86,6 +76,11 @@ python smoke_test.py
 5. Secrets: `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-flash-latest`
 
 Cloud demos: use **MANUAL** or LIVE **`buffer_only`**. Private plant `192.168.x` Modbus will not reach from the internet.
+
+### Option C — Hugging Face (only if you pay PRO)
+
+Free HF accounts can only create **Static** Spaces — those cannot run this Python app.  
+Docker Spaces need [HF PRO](https://huggingface.co/pricing). Details: **`deploy/HUGGINGFACE.md`**.
 
 ### Option D — Docker on your VM (full heavy app)
 
