@@ -240,6 +240,20 @@ models:
     estimator: pulp.LpProblem
     optional: true
     note: Student-friendly LP (open-source). Packaged in requirements.txt; no commercial license needed.
+  - id: ARIMA
+    group: forecasting
+    library: statsmodels
+    task: forecast
+    estimator: statsmodels.tsa.arima.model.ARIMA
+    optional: false
+    note: ARIMA(1,1,1) time-series forecasting via statsmodels.
+  - id: DataInsights
+    group: insights
+    library: internal
+    task: insights
+    estimator: internal
+    optional: false
+    note: Runs quality pipeline (GE + ydata + Cleanlab) and returns data health summary. No target needed.
 
 viz_libraries:
   - plotly

@@ -24,6 +24,8 @@ def run_pipeline(
     ml_metrics: Optional[dict] = None,
     zip_member: Optional[str] = None,
     user_id: Optional[int] = None,
+    clean_engine: str = "pandas",
+    data_mode: str = "manual",
 ) -> dict[str, Any]:
     """
     Orchestrate ingest -> clean -> classify -> kpis, optionally save to SQLite.
@@ -47,7 +49,8 @@ def run_pipeline(
     else:
         raise ValueError("Provide source, raw_df, or file_bytes")
 
-    clean_df, clean_log = clean_dataframe(messy)
+    from core.engine import clean_with_engine
+    clean_df, clean_log = clean_with_engine(messy, engine=clean_engine)
     classification = classify(clean_df, override=domain_override)
     domain = classification["domain"]
     kpis = compute_kpis(clean_df, domain=domain, ml_metrics=ml_metrics)
@@ -57,6 +60,14 @@ def run_pipeline(
         kpis=kpis,
         classification=classification,
     )
+    # Run quality pipeline on cleaned data
+    quality_report = None
+    try:
+        from core.clean_quality import run_quality_pipeline
+        quality_report = run_quality_pipeline(clean_df)
+    except Exception:
+        pass
+
     schema = schema_summary(clean_df)
 
     result: dict[str, Any] = {
@@ -70,6 +81,8 @@ def run_pipeline(
         "briefing": briefing,
         "schema": schema,
         "run_id": None,
+        "quality_report": quality_report,
+        "data_mode": data_mode,
     }
 
     if persist:

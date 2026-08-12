@@ -1,10 +1,14 @@
 # Optional / heavy packages — NOT installed by Streamlit Cloud by default.
 # Install locally when needed:
 #   pip install -r requirements-optional.txt
-#
-# Prophet often hangs or fails on Community Cloud (cmdstan / long builds).
-# The app soft-fails Prophet if missing; use holdout regression models on Cloud.
-prophet>=1.1.5,<1.4.0
-#
+
+polars>=0.20
+optuna>=3.0
+prophet>=1.1.5
+great-expectations>=0.18
+ydata-profiling>=4.0
+cleanlab>=2.5
+llama-index-core>=0.10
+
 # Still NOT included (need special host / license — do not add here):
 #   gurobi, torch, pyspark

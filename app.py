@@ -18,13 +18,21 @@ if str(ROOT) not in sys.path:
 from config.settings import SAMPLES_DIR, UPLOADS_DIR
 from core import db
 from core.classify import classify, load_domains
+from core.engine import available_engines
+from core.filters import TopFilters, apply_buffer_filters
 from core.kpis import compute_kpis
+from core.live.stubs import VIRTUAL_UNIVERSE_SIZE, fetch_live_data, list_connectors
+from core.mode import DataMode
 from core.pack import build_html_pack
 from core.pipeline import run_pipeline
 from modules.ai_guide import ask_ai
+from modules.auto_dashboard import build_auto_dashboard
+from modules.business_alerts import generate_alerts
 from modules.charts import build_chart, load_charts_catalog
 from modules.ml_registry import list_models
 from modules.ml_runner import run_model
+from modules.optuna_tuner import optuna_available, tune_model
+from modules.rag import build_index, query_rag, rag_available
 from ui.auth_gate import render_user_sidebar, require_login
 from ui.components import (
     download_df_button,
@@ -211,13 +219,25 @@ def render_recent_projects() -> None:
 def page_upload() -> None:
     page_hero(
         "Upload",
-        "Drop a table file (or a ZIP that contains one). Any industry data works — not only sales or PdM.",
+        "Drop a table file (or a ZIP that contains one). Or connect live (demo simulator).",
         st.session_state.get("domain"),
     )
+
+    # --- Mode selector ---
+    mode_choice = st.radio("Data mode", ["Manual (upload/sample)", "Live (demo simulator)"], horizontal=True)
+    data_mode = DataMode.MANUAL if "Manual" in mode_choice else DataMode.LIVE
+
+    # --- Engine selector ---
+    engines = available_engines()
+    engine = st.selectbox("Clean engine", engines, index=0, help="Polars/PySpark for bigger data")
+
+    if data_mode == DataMode.LIVE:
+        _page_upload_live(engine)
+        return
+
     st.write(
         "Supported formats: **CSV, TSV, Excel (.xlsx / .xls), JSON, Parquet**, "
-        "or a **ZIP** that contains one of those. "
-        "ZIP is only a container — after extract we still run the same cleaning pipeline."
+        "or a **ZIP** that contains one of those."
     )
     st.caption(
         "Tip for managers: export from Excel / Google Sheets / your ERP as CSV or Excel, "
@@ -323,6 +343,57 @@ def page_upload() -> None:
             st.rerun()
 
 
+def _page_upload_live(engine: str) -> None:
+    """Live mode upload — demo simulator with top filters."""
+    st.markdown(f"**Virtual plant universe:** ~{VIRTUAL_UNIVERSE_SIZE:,} rows (never fully loaded)")
+    connectors = list_connectors()
+    conn_id = st.selectbox("Connector", list(connectors.keys()),
+                           format_func=lambda k: connectors[k]["label"])
+
+    st.subheader("Top Filters (gate the fetch)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        site = st.text_input("Site", placeholder="e.g. Site-1")
+        line = st.text_input("Line", placeholder="e.g. Line-1")
+    with c2:
+        machine = st.text_input("Machine", placeholder="e.g. M-001")
+        product = st.text_input("Product", placeholder="e.g. ProductA")
+    with c3:
+        region = st.text_input("Region", placeholder="e.g. North")
+        max_rows = st.number_input("Max rows", min_value=10, max_value=50000, value=500)
+
+    filters = TopFilters(
+        site=site or None, line=line or None, machine=machine or None,
+        product=product or None, region=region or None, max_rows=int(max_rows),
+    )
+
+    if st.button("Fetch filtered live slice", type="primary"):
+        with st.spinner("Fetching from simulator..."):
+            raw_df = fetch_live_data(conn_id, filters)
+            result = run_pipeline(
+                raw_df=raw_df,
+                filename=f"live_{conn_id}",
+                domain_override=st.session_state.domain_override,
+                persist=True,
+                user_id=_current_user_id(),
+                clean_engine=engine,
+                data_mode="live",
+            )
+        apply_pipeline_to_state(result)
+        st.session_state["data_mode"] = "live"
+        st.success(f"Loaded **{len(raw_df):,}** rows from {connectors[conn_id]['label']} · domain `{result['domain']}`")
+        st.dataframe(result["clean_df"].head(20), use_container_width=True)
+
+    if st.session_state.pipeline_done and st.session_state.get("data_mode") == "live":
+        st.divider()
+        st.subheader("Buffer filters (refine loaded data)")
+        if st.button("Apply buffer filters"):
+            filtered = apply_buffer_filters(st.session_state.clean_df, filters)
+            st.session_state.clean_df = filtered
+            st.success(f"Filtered to {len(filtered):,} rows")
+            st.dataframe(filtered.head(20), use_container_width=True)
+
+
 def page_clean() -> None:
     page_hero(
         "Clean",
@@ -358,6 +429,17 @@ def page_clean() -> None:
     st.subheader("Cleaning log (pandas ops)")
     log = st.session_state.clean_log or []
     st.dataframe(pd.DataFrame(log), use_container_width=True)
+
+    # Quality report section
+    st.subheader("Quality Report (GE · ydata · Cleanlab)")
+    if st.button("Run quality checks"):
+        with st.spinner("Running quality pipeline..."):
+            from core.clean_quality import run_quality_pipeline
+            qr = run_quality_pipeline(st.session_state.clean_df)
+            st.session_state["quality_report"] = qr
+    qr = st.session_state.get("quality_report")
+    if qr:
+        st.markdown(qr.get("summary", ""))
 
 
 def page_field() -> None:
@@ -624,9 +706,21 @@ def page_ml() -> None:
             "Why: forecasting needs a timeline plus a number to predict."
         )
 
+    # Optuna tuning option
+    use_optuna = False
+    if optuna_available() and meta.get("task") in ("regression", "classification"):
+        use_optuna = st.checkbox("🔧 Optuna auto-tune (20 trials)", value=False)
+
     if st.button("Run model", type="primary"):
         with st.spinner("Training…"):
             result = run_model(df, model_id=model_id, target=target_arg)
+            if use_optuna and result.get("ok") and result.get("target") and result.get("features"):
+                with st.spinner("Optuna tuning..."):
+                    tune_res = tune_model(df, model_id, result["target"], result["features"],
+                                          task=result.get("task", "regression"))
+                    if tune_res.get("ok"):
+                        result["optuna"] = tune_res
+                        st.info(f"Optuna best: {tune_res['scoring']}={tune_res['best_score']:.4f} | params: {tune_res['best_params']}")
         if result.get("ok"):
             briefing = build_manager_insight(result)
             result["manager_briefing"] = briefing
@@ -771,8 +865,10 @@ def page_ai() -> None:
         selectable.append("gemini")
     if openai_configured():
         selectable.append("openai")
+    if rag_available():
+        selectable.append("rag")
     selectable.append("offline")
-    provider = st.selectbox("AI provider", selectable, index=0, help="Gemini often has a free tier.")
+    provider = st.selectbox("AI provider", selectable, index=0, help="Gemini often has a free tier. RAG uses your data offline.")
 
     st.caption(
         "Try: `which model did I use?` · `show kpis` · `which machine will fail?` · `how to reduce machine failure?`"
@@ -791,17 +887,24 @@ def page_ai() -> None:
             db.save_chat_message(
                 uid, "user", prompt, run_id=st.session_state.get("run_id")
             )
-        result = ask_ai(
-            prompt,
-            domain=st.session_state.domain,
-            schema=st.session_state.schema,
-            kpis=st.session_state.kpis,
-            df=st.session_state.clean_df,
-            briefing=st.session_state.briefing or "",
-            history=st.session_state.chat_history[:-1],
-            ml_result=st.session_state.ml_result,
-            provider=provider,
-        )
+        if provider == "rag":
+            idx = st.session_state.get("_rag_index")
+            if idx is None:
+                idx = build_index(st.session_state.clean_df, st.session_state.domain)
+                st.session_state["_rag_index"] = idx
+            result = query_rag(idx, prompt)
+        else:
+            result = ask_ai(
+                prompt,
+                domain=st.session_state.domain,
+                schema=st.session_state.schema,
+                kpis=st.session_state.kpis,
+                df=st.session_state.clean_df,
+                briefing=st.session_state.briefing or "",
+                history=st.session_state.chat_history[:-1],
+                ml_result=st.session_state.ml_result,
+                provider=provider,
+            )
         answer = result.get("answer", "")
         st.session_state.chat_history.append({"role": "assistant", "content": answer})
         if uid is not None:
@@ -822,6 +925,35 @@ def page_dashboard() -> None:
     if st.session_state.clean_df is None:
         st.warning("Upload or load a sample first.")
         return
+
+    # Auto SCADA dashboard for live mode
+    if st.session_state.get("data_mode") == "live":
+        st.subheader("🏭 Auto SCADA Dashboard (Live)")
+        auto = build_auto_dashboard(st.session_state.clean_df, st.session_state.domain)
+        # KPI cards
+        kcols = st.columns(min(6, len(auto["kpi_cards"])) or 1)
+        for i, kpi in enumerate(auto["kpi_cards"]):
+            kcols[i % len(kcols)].metric(kpi["label"], kpi["value"])
+        # Alerts
+        if auto["alerts"]:
+            for a in auto["alerts"]:
+                st.warning(a)
+        # Auto charts
+        for chart_cfg in auto["charts"]:
+            try:
+                fig = build_chart(st.session_state.clean_df, **chart_cfg)
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception:
+                pass
+        st.divider()
+
+    # Business alerts
+    alerts = generate_alerts(st.session_state.clean_df, st.session_state.domain, st.session_state.ml_result)
+    if alerts:
+        st.subheader("Business Alerts")
+        for a in alerts:
+            icon = {"critical": "🔴", "high": "🟠", "warning": "🟡", "info": "ℹ️"}.get(a["severity"], "ℹ️")
+            st.markdown(f"{icon} **{a['severity'].upper()}:** {a['message']}")
 
     center, right = st.columns([3, 1])
     with right:

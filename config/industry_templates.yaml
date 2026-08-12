@@ -1,0 +1,50 @@
+templates:
+  predictive_maintenance:
+    label: "Predictive Maintenance (Manufacturing)"
+    connectors: ["pymodbus", "opcua"]
+    kpi_focus: ["failure_rate", "mean_rul", "mean_temperature", "uptime_pct"]
+    alert_rules:
+      - metric: failure_rate
+        threshold: 0.1
+        severity: high
+      - metric: min_rul
+        threshold: 50
+        severity: critical
+    recommended_charts: ["line", "scatter", "bar"]
+
+  sales_forecasting:
+    label: "Sales & Revenue Forecasting"
+    connectors: ["api"]
+    kpi_focus: ["total_revenue", "avg_units", "growth_pct"]
+    alert_rules:
+      - metric: revenue_drop
+        threshold: 0.3
+        severity: warning
+    recommended_charts: ["line", "bar", "pie"]
+
+  healthcare:
+    label: "Healthcare / Patient Analytics"
+    connectors: ["api"]
+    kpi_focus: ["patient_count", "avg_wait_time", "readmission_rate"]
+    alert_rules:
+      - metric: readmission_rate
+        threshold: 0.15
+        severity: high
+    recommended_charts: ["bar", "line", "histogram"]
+
+  supply_chain:
+    label: "Supply Chain & Logistics"
+    connectors: ["api", "opcua"]
+    kpi_focus: ["delivery_time", "inventory_turnover", "defect_rate"]
+    alert_rules:
+      - metric: defect_rate
+        threshold: 0.05
+        severity: warning
+    recommended_charts: ["bar", "scatter", "line"]
+
+  generic:
+    label: "Generic Analytics"
+    connectors: ["api", "demo_simulator"]
+    kpi_focus: ["row_count", "col_count", "missing_pct"]
+    alert_rules: []
+    recommended_charts: ["bar", "line", "scatter"]

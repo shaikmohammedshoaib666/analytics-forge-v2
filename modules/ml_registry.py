@@ -31,6 +31,10 @@ _ALIASES = {
     "dbscan": "DBSCAN",
     "pulp": "PuLP",
     "optimization_pulp": "PuLP",
+    "arima": "ARIMA",
+    "data_insights": "DataInsights",
+    "datainsights": "DataInsights",
+    "insights": "DataInsights",
 }
 
 

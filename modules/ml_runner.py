@@ -262,6 +262,10 @@ def run_model(
         return _run_anomaly(df, model_id, meta, features, random_state=random_state)
     if task in {"dimensionality", "pca"} or model_id == "PCA":
         return _run_pca(df, model_id, meta, features, random_state=random_state)
+    if model_id == "ARIMA":
+        return _run_arima(df, target=target)
+    if model_id == "DataInsights":
+        return _run_data_insights(df)
     if library == "statsmodels" or model_id == "StatsmodelsOLS":
         return _run_statsmodels_ols(
             df,
@@ -1155,6 +1159,20 @@ MODEL_GUIDANCE: dict[str, dict[str, str]] = {
         "target": "Optional — leave (auto); uses numeric columns as options.",
         "good_for": "Suggests how to allocate a limited budget across options.",
     },
+    "ARIMA": {
+        "what": "Forecasts a number using ARIMA(1,1,1) time-series model.",
+        "why": "Classic statistical forecasting — no date column needed if data is ordered.",
+        "what_it_does": "Fits autoregressive integrated moving average and forecasts ahead.",
+        "target": "Pick the numeric column to forecast (revenue, sales, RUL).",
+        "good_for": "Time-series forecasting without Prophet dependency.",
+    },
+    "DataInsights": {
+        "what": "Runs data quality checks (GE, ydata, Cleanlab) — no target needed.",
+        "why": "Understand your data health before modeling.",
+        "what_it_does": "Reports nulls, outliers, duplicates, and quality scores.",
+        "target": "Leave as (auto) — no target column needed.",
+        "good_for": "Data quality assessment and profiling.",
+    },
     "GradientBoostingRegressor": {
         "what": "Predicts a number with sklearn boosting (no extra packages).",
         "why": "Middle ground between Random Forest and XGBoost.",
@@ -1237,3 +1255,77 @@ def model_guidance(model_id: str) -> dict[str, str]:
         },
     }
     return _normalize_guidance(defaults.get(task, defaults["regression"]))
+
+
+def _run_arima(df: pd.DataFrame, target: Optional[str] = None) -> dict[str, Any]:
+    """ARIMA forecasting via statsmodels."""
+    try:
+        from statsmodels.tsa.arima.model import ARIMA
+    except ImportError as exc:
+        return {"ok": False, "model_id": "ARIMA", "task": "forecast", "error": f"statsmodels ARIMA unavailable: {exc}"}
+
+    date_col = _find_date_column(df)
+    num_cols = [c for c in df.select_dtypes(include=[np.number]).columns if not _is_leak_id_column(c, df[c], len(df))]
+    if not num_cols:
+        return {"ok": False, "model_id": "ARIMA", "task": "forecast", "error": "No numeric columns for ARIMA."}
+
+    ycol = target if target and target in num_cols else num_cols[0]
+    series = pd.to_numeric(df[ycol], errors="coerce").dropna().reset_index(drop=True)
+    if len(series) < 10:
+        return {"ok": False, "model_id": "ARIMA", "task": "forecast", "error": "Need >=10 rows for ARIMA."}
+
+    n_test = max(3, int(len(series) * 0.2))
+    train, test = series.iloc[:-n_test], series.iloc[-n_test:]
+
+    try:
+        model = ARIMA(train, order=(1, 1, 1))
+        fit = model.fit()
+        preds = fit.forecast(steps=n_test)
+    except Exception as exc:
+        return {"ok": False, "model_id": "ARIMA", "task": "forecast", "error": f"ARIMA fit failed: {exc}"}
+
+    from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+    metrics = {
+        "r2": round(float(r2_score(test.values, preds.values)), 4),
+        "rmse": round(float(np.sqrt(mean_squared_error(test.values, preds.values))), 4),
+        "mae": round(float(mean_absolute_error(test.values, preds.values)), 4),
+        "target": ycol,
+        "order": "(1,1,1)",
+        "holdout_rows": n_test,
+    }
+
+    preview = pd.DataFrame({"actual": test.values, "forecast": preds.values}).reset_index(drop=True)
+    return {
+        "ok": True,
+        "model_id": "ARIMA",
+        "task": "forecast",
+        "target": ycol,
+        "features": [ycol],
+        "metrics": metrics,
+        "predictions_preview": preview,
+        "n_train": len(train),
+        "n_test": n_test,
+        "leakage_safe": True,
+    }
+
+
+def _run_data_insights(df: pd.DataFrame) -> dict[str, Any]:
+    """DataInsights — runs quality pipeline and returns summary."""
+    try:
+        from core.clean_quality import run_quality_pipeline
+        report = run_quality_pipeline(df)
+        return {
+            "ok": True,
+            "model_id": "DataInsights",
+            "task": "insights",
+            "target": None,
+            "features": list(df.columns),
+            "metrics": report["basic"],
+            "predictions_preview": pd.DataFrame([report["basic"]]),
+            "n_train": len(df),
+            "n_test": 0,
+            "quality_report": report,
+            "manager_briefing": report["summary"],
+        }
+    except Exception as exc:
+        return {"ok": False, "model_id": "DataInsights", "task": "insights", "error": str(exc)}

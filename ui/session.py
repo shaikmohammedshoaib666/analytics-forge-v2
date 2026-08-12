@@ -23,6 +23,8 @@ DEFAULTS = {
     "dashboard_insights": [],
     "pipeline_done": False,
     "user": None,
+    "data_mode": "manual",
+    "quality_report": None,
 }
 
 
