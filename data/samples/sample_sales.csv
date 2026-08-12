@@ -1,0 +1,61 @@
+order_date,region,category,revenue,units
+2024-01-02,North,Electronics,1250.50,4
+2024-01-02,South,Furniture,890.00,2
+2024-01-03,East,Office Supplies,145.25,10
+2024-01-03,West,Electronics,2100.00,3
+2024-01-04,North,Furniture,1560.75,3
+2024-01-04,South,Electronics,980.00,2
+2024-01-05,East,Electronics,3200.00,5
+2024-01-05,West,Office Supplies,220.40,15
+2024-01-06,North,Office Supplies,175.00,12
+2024-01-06,South,Furniture,2400.00,4
+2024-01-07,East,Furniture,1100.50,2
+2024-01-07,West,Electronics,4500.00,6
+2024-01-08,North,Electronics,1890.25,3
+2024-01-08,South,Office Supplies,310.00,20
+2024-01-09,East,Electronics,2750.00,4
+2024-01-09,West,Furniture,1320.80,2
+2024-01-10,North,Furniture,980.00,1
+2024-01-10,South,Electronics,1600.00,2
+2024-01-11,East,Office Supplies,95.50,8
+2024-01-11,West,Electronics,3800.00,5
+2024-01-12,North,Electronics,2200.00,3
+2024-01-12,South,Furniture,1750.25,3
+2024-01-13,East,Furniture,890.00,1
+2024-01-13,West,Office Supplies,410.00,25
+2024-01-14,North,Office Supplies,260.75,18
+2024-01-14,South,Electronics,2950.00,4
+2024-01-15,East,Electronics,5100.00,7
+2024-01-15,West,Furniture,2100.50,3
+2024-01-16,North,Furniture,1450.00,2
+2024-01-16,South,Office Supplies,180.00,14
+2024-01-17,East,Office Supplies,125.40,9
+2024-01-17,West,Electronics,3300.00,4
+2024-01-18,North,Electronics,1700.00,2
+2024-01-18,South,Furniture,2600.00,4
+2024-01-19,East,Furniture,990.75,2
+2024-01-19,West,Electronics,4100.00,6
+2024-01-20,North,Electronics,2400.50,3
+2024-01-20,South,Office Supplies,350.00,22
+2024-01-21,East,Electronics,1850.00,3
+2024-01-21,West,Furniture,1200.00,2
+2024-01-22,North,Furniture,1680.25,3
+2024-01-22,South,Electronics,920.00,1
+2024-01-23,East,Office Supplies,205.00,16
+2024-01-23,West,Electronics,3600.00,5
+2024-01-24,North,Office Supplies,140.50,11
+2024-01-24,South,Furniture,1950.00,3
+2024-01-25,East,Furniture,875.00,1
+2024-01-25,West,Office Supplies,480.00,30
+2024-01-26,North,Electronics,2800.00,4
+2024-01-26,South,Electronics,1500.75,2
+2024-01-27,East,Electronics,4200.00,6
+2024-01-27,West,Furniture,2300.00,4
+2024-01-28,North,Furniture,1120.50,2
+2024-01-28,South,Office Supplies,210.00,15
+2024-01-29,East,Office Supplies,165.25,12
+2024-01-29,West,Electronics,3900.00,5
+2024-01-30,North,Electronics,2050.00,3
+2024-01-30,South,Furniture,1780.00,3
+2024-01-31,East,Furniture,1340.75,2
+2024-01-31,West,Electronics,4700.00,7

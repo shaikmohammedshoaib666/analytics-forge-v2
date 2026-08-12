@@ -1,0 +1,37 @@
+charts:
+  - id: line
+    name: Line Chart
+    needs: [x, y]
+  - id: bar
+    name: Bar Chart
+    needs: [x, y]
+  - id: area
+    name: Area Chart
+    needs: [x, y]
+  - id: scatter
+    name: Scatter Plot
+    needs: [x, y]
+  - id: hist
+    name: Histogram
+    needs: [x]
+  - id: box
+    name: Box Plot
+    needs: [y]
+  - id: violin
+    name: Violin Plot
+    needs: [y]
+  - id: heatmap
+    name: Correlation Heatmap
+    needs: []
+  - id: pie
+    name: Pie Chart
+    needs: [names, values]
+  - id: kpi_card
+    name: KPI Style Bar
+    needs: [x, y]
+  - id: time_series
+    name: Time Series
+    needs: [x, y]
+  - id: table
+    name: Data Table
+    needs: []
