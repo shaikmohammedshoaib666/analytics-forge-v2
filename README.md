@@ -32,7 +32,7 @@ pip install -r requirements.txt
 
 # .env (gitignored)
 # GEMINI_API_KEY=...
-# GEMINI_MODEL=gemini-flash-latest
+# GEMINI_MODEL=gemini-2.0-flash
 
 streamlit run app.py
 # http://127.0.0.1:8501
@@ -71,7 +71,7 @@ If an existing Render service is still pinned to `cursor/forge-v2-foundation-f3f
 2. Repo: `shaikmohammedshoaib666/analytics-forge-v2`
 3. Branch: `main` · Main file: `app.py`
 4. Requirements file: **`requirements-cloud.txt`**
-5. Secrets: `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-flash-latest`
+5. Secrets: `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-2.0-flash`
 
 Cloud demos: use **MANUAL** or LIVE **`buffer_only`**. Private plant `192.168.x` Modbus will not reach from the internet.
 
@@ -107,7 +107,7 @@ uvicorn gateway:app --host 0.0.0.0 --port 8088
 
 ```
 GEMINI_API_KEY=...
-GEMINI_MODEL=gemini-flash-latest
+GEMINI_MODEL=gemini-2.0-flash
 EMAIL_USER=
 EMAIL_PASSWORD=
 ```

@@ -71,6 +71,12 @@ def main() -> int:
             sql_lab_result=None,
             sql_lab_engine=None,
             sql_lab_query=None,
+            usd_per_hour=0.0,
+            usd_per_unit=0.0,
+            column_roles={},
+            forge_session_id=None,
+            forge_session_title="",
+            last_gemini_error="",
         )
 
     rng = np.random.default_rng(0)
@@ -182,6 +188,70 @@ def main() -> int:
         assert "last_service_days" not in got.columns
 
     check("LIVE ignores joined clean_df", live_ignores_join)
+
+    def forge_os_helpers():
+        import os
+        from modules import forge_os as F
+
+        assert F.get_gemini_model()
+        prev = os.environ.get("GEMINI_MODEL")
+        os.environ["GEMINI_MODEL"] = "gemini-flash-latest"
+        try:
+            assert F.get_gemini_model() == "gemini-2.0-flash"
+        finally:
+            if prev is None:
+                os.environ.pop("GEMINI_MODEL", None)
+            else:
+                os.environ["GEMINI_MODEL"] = prev
+        assert F.gemini_issue_from_raw("", attempted=False) is None
+        assert F.gemini_issue_from_raw("", attempted=True)
+        assert str(F.gemini_issue_from_raw("[Gemini error] quota", attempted=True)).startswith("[Gemini error]")
+
+        plant = pd.DataFrame(
+            {
+                "availability": [0.8],
+                "downtime_minutes": [40],
+                "scrap": [3],
+                "asset_id": ["A1"],
+                "oee": [0.6],
+            }
+        )
+        assert F.looks_like_plant_oee(plant)["match"]
+        assert not F.looks_like_plant_oee(sales)["match"]
+
+        impact = F.estimate_dollar_impact(plant, usd_per_hour=120.0, usd_per_unit=5.0)
+        assert impact["ok"] and impact["total_usd"] > 0
+
+        F.save_named_mapping("smoke_map", {"downtime_minutes": "downtime", "asset_id": "asset"}, source_columns=list(plant.columns))
+        loaded = F.load_named_mapping("smoke_map")
+        assert loaded and loaded.get("downtime_minutes") == "downtime"
+        applied = F.resolve_mapping_to_frame(["Downtime Minutes", "Asset", "qty"], loaded)
+        assert applied
+
+        sid = F.new_session_id()
+        F.save_session(sid, title="smoke", source_name="pdm.csv", frames={"clean_df": pdm}, meta={"domain": "predictive_maintenance"})
+        frames = F.load_frames(sid)
+        assert isinstance(frames.get("clean_df"), pd.DataFrame) and len(frames["clean_df"]) == len(pdm)
+        meta = F.load_session_meta(sid)
+        assert meta.get("domain") == "predictive_maintenance"
+        brief = F.build_top3_actions(
+            insights=["Vibration spike on M1"],
+            dollar_impact=impact,
+            use_gemini=False,
+        )
+        assert len(brief["actions"]) == 3
+
+        prev_key = os.environ.get("GEMINI_API_KEY")
+        os.environ["GEMINI_API_KEY"] = "forge-env-key-smoke"
+        try:
+            assert F.get_gemini_api_key() == "forge-env-key-smoke"
+        finally:
+            if prev_key is None:
+                os.environ.pop("GEMINI_API_KEY", None)
+            else:
+                os.environ["GEMINI_API_KEY"] = prev_key
+
+    check("forge_os helpers", forge_os_helpers)
 
     if errors:
         print(f"\n{len(errors)} FAILURE(S)")
