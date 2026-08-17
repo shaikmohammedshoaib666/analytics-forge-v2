@@ -36,8 +36,16 @@ STORE_DIR = ROOT / ".forge_sessions"
 DB_PATH = STORE_DIR / "forge_os.db"
 ENV_PATH = ROOT / ".env"
 
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
-BROKEN_GEMINI_ALIASES = frozenset({"gemini-flash-latest", "gemini-flash-latest-latest"})
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+RETIRED_GEMINI_ALIASES = frozenset(
+    {
+        "gemini-2.0-flash",
+        "gemini-flash-latest",
+        "gemini-flash-latest-latest",
+        "gemini-1.5-flash",
+        "gemini-pro",
+    }
+)
 
 OEE_PULSE_GITHUB = "https://github.com/shaikmohammedshoaib666/oee-pulse"
 PHASE3_CAPTION = "SaaS login + Monday scheduled email = next phase."
@@ -125,16 +133,17 @@ def get_gemini_api_key() -> str:
 
 
 def get_gemini_model() -> str:
-    """Prefer GEMINI_MODEL env/secrets/.env; remap aliases that often fail."""
+    """Prefer GEMINI_MODEL env/secrets/.env; remap retired aliases to gemini-3.6-flash."""
     raw = (
         str(os.environ.get("GEMINI_MODEL") or "").strip()
         or _from_secrets("GEMINI_MODEL")
         or _dotenv_get("GEMINI_MODEL")
         or DEFAULT_GEMINI_MODEL
     )
-    if not raw or raw.lower() in BROKEN_GEMINI_ALIASES:
+    name = raw[7:] if raw.lower().startswith("models/") else raw
+    if not name or name.lower() in RETIRED_GEMINI_ALIASES:
         return DEFAULT_GEMINI_MODEL
-    return raw
+    return name
 
 
 def persist_gemini_key(key: str, write_dotenv: bool = True) -> dict[str, Any]:

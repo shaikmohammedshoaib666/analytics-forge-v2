@@ -64,4 +64,4 @@ git remote add hf https://huggingface.co/spaces/YOUR_HF_USER/analytics-forge-v2
 git push hf cursor/forge-v2-foundation-f3f9:main --force
 ```
 
-Secrets: `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-2.0-flash`
+Secrets: `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-3.6-flash`

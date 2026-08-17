@@ -18,7 +18,7 @@ To follow `main` going forward:
 4. **Branch** → change `cursor/forge-v2-foundation-f3f9` → **`main`** → Save
 5. If it does not start a deploy: **Manual Deploy** → **Deploy latest commit**
 
-Optional: **Environment** → confirm `GEMINI_API_KEY` (and `GEMINI_MODEL=gemini-2.0-flash`).
+Optional: **Environment** → confirm `GEMINI_API_KEY` (and `GEMINI_MODEL=gemini-3.6-flash`). Old values such as `gemini-2.0-flash` are remapped in code.
 Paste-in-UI keys are session-only on Render — they do not persist. Use **Environment** + Manual Deploy.
 
 ## New Blueprint (only if the service does not exist)

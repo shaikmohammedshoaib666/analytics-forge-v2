@@ -199,9 +199,15 @@ def main() -> int:
 
         assert F.get_gemini_model()
         prev = os.environ.get("GEMINI_MODEL")
-        os.environ["GEMINI_MODEL"] = "gemini-flash-latest"
         try:
-            assert F.get_gemini_model() == "gemini-2.0-flash"
+            for alias in (
+                "gemini-flash-latest",
+                "gemini-2.0-flash",
+                "gemini-1.5-flash",
+                "gemini-pro",
+            ):
+                os.environ["GEMINI_MODEL"] = alias
+                assert F.get_gemini_model() == "gemini-3.6-flash"
         finally:
             if prev is None:
                 os.environ.pop("GEMINI_MODEL", None)
