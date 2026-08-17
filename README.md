@@ -1,117 +1,113 @@
-# Analytics Forge v2.0
+---
+title: Analytics Forge v2
+emoji: 🏭
+colorFrom: gray
+colorTo: blue
+sdk: docker
+app_port: 8501
+pinned: false
+license: mit
+short_description: Dual-mode industrial analytics — Manual upload + LIVE SCADA buffer
+---
 
-Industry-grade fork of [analytics-forge](https://github.com/shaikmohammedshoaib666/analytics-forge).
+# Analytics Forge v2
 
-- **v1 (`analytics-forge`)** — keep as Streamlit Cloud demo; do not break it.
-- **v2 (this repo)** — dual mode (manual + live SCADA-style), engine choice, Optuna, LlamaIndex RAG, etc.
+Industry dual-mode analytics OS — **Manual upload** + **LIVE SCADA** — shared core for clean → field → KPIs → charts → ML → Ask AI → dashboard → email.
 
-Read **[FORGE_V2_OVERVIEW.md](FORGE_V2_OVERVIEW.md)** before building.
+Repo: `shaikmohammedshoaib666/analytics-forge-v2` (keep separate from `analytics-forge` v1 demo).
+
+> **Deploy:** Free public host = **Render** (`deploy/RENDER.md`).  
+> Hugging Face free tier is **Static only** now — Docker needs **HF PRO** and cannot run Forge on free Static. See `deploy/HUGGINGFACE.md`.
+
+## Try now (localhost)
+
+```bash
+cd /Users/sk.md.shoaib.raza/Projects/analytics-forge-v2
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# macOS only — XGBoost needs OpenMP (fixes Field "libomp.dylib" crash).
+# Without this, Forge still runs and falls back to RandomForest.
+# brew install libomp && pip install --force-reinstall xgboost
+
+# .env (gitignored)
+# GEMINI_API_KEY=...
+# GEMINI_MODEL=gemini-flash-latest
+
+streamlit run app.py
+# http://127.0.0.1:8501
+```
+
+```bash
+python smoke_test.py
+```
 
 ---
 
-# Analytics Forge (base)
+## Deploy: pick a host
 
-Reusable Streamlit analytics OS (8 fields) with OpenAI + Gemini Ask/AI, ML studio, dashboard pack, and email automation.
+| Platform | Free public URL? | Notes |
+|----------|------------------|-------|
+| **Render** (Blueprint) | **Yes — use this** | Root `render.yaml` + `deploy/RENDER.md` |
+| **Streamlit Cloud** | Yes | Often slow / OOM — use `requirements-cloud.txt` |
+| **Oracle Free / Azure / VPS + Docker** | Yes (your IP) | Full stack — `deploy/ORACLE_FREE.md` |
+| **Hugging Face Spaces** | **Docker = paid (PRO)** | Free = **Static only** — cannot run Streamlit Forge. `deploy/HUGGINGFACE.md` |
 
-## Auth (new)
+**PySpark on free cloud hosts will usually fail or OOM.** Public demos use **`requirements-cloud.txt`**.
 
-On launch you **sign up / sign in** with email + password. Passwords are stored as **PBKDF2 hashes only** (never plain text) in SQLite (`data/analytics_forge.db`). Each upload is saved under your user with a **Recent projects** sidebar so history survives refresh. Same app later runs on **Oracle Free** with the DB file on the VM (swap to Postgres when you outgrow SQLite).
+### Option A — Render (recommended free link)
 
-## Local run
+1. https://dashboard.render.com → sign up with GitHub  
+2. **New → Blueprint** → repo `shaikmohammedshoaib666/analytics-forge-v2`  
+3. Uses root **`render.yaml`** (branch **`main`**)  
+4. Secret: `GEMINI_API_KEY`  
+5. Details: **`deploy/RENDER.md`**
 
-```bash
-cd analytics-forge-v2
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env        # Windows: copy .env.example .env
-streamlit run app.py
-```
+If an existing Render service is still pinned to `cursor/forge-v2-foundation-f3f9`: Dashboard → service → **Settings → Build & Deploy → Branch → `main`**.
 
-Open http://localhost:8501
+### Option B — Streamlit Cloud
 
-## AI keys (OpenAI + Gemini)
+1. [share.streamlit.io](https://share.streamlit.io) → **New app**
+2. Repo: `shaikmohammedshoaib666/analytics-forge-v2`
+3. Branch: `main` · Main file: `app.py`
+4. Requirements file: **`requirements-cloud.txt`**
+5. Secrets: `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-flash-latest`
 
-In `.env` (local) or Streamlit Cloud **Secrets**:
+Cloud demos: use **MANUAL** or LIVE **`buffer_only`**. Private plant `192.168.x` Modbus will not reach from the internet.
 
-```
-GEMINI_API_KEY=your_gemini_key
-GEMINI_MODEL=gemini-2.0-flash
-OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-4o-mini
-AI_DEFAULT_PROVIDER=gemini
-```
+### Option C — Hugging Face (only if you pay PRO)
 
-- Gemini key: https://aistudio.google.com/apikey (free tier available)
-- OpenAI key: https://platform.openai.com/api-keys
+Free HF accounts can only create **Static** Spaces — those cannot run this Python app.  
+Docker Spaces need [HF PRO](https://huggingface.co/pricing). Details: **`deploy/HUGGINGFACE.md`**.
 
-**Never commit real `.env` or secrets to GitHub.**
-
-## Deploy (Streamlit Community Cloud)
-
-1. Push this repo to GitHub
-2. Go to https://share.streamlit.io → New app (or open an existing app’s **⚙️ settings**)
-3. Select repo, branch `main`, main file `app.py`
-4. **Required — pin Python 3.12:** open **Advanced settings** → set **Python version** to **3.12** → Save  
-   (Community Cloud does **not** honor `runtime.txt` for the runtime; the UI dropdown is the source of truth. This repo still ships `runtime.txt` with `python-3.12.8` as a local/docs signal.)
-5. Add secrets from `.streamlit/secrets.toml.example`
-6. Deploy / **Reboot** the app once after changing Python or `requirements.txt`
-
-If logs show `Using Python 3.13` / `3.14` and install hangs after `uv pip install` / `Resolved … packages`, switch the UI to **3.12** and reboot — many ML wheels are unreliable on bleeding-edge Python.
-
-## Deploy (Oracle Cloud Always Free VM)
-
-Full steps: [deploy/ORACLE_FREE.md](deploy/ORACLE_FREE.md)
-
-Short path after the VM + port **8501** ingress exist:
+### Option D — Docker on your VM (full heavy app)
 
 ```bash
-git clone https://github.com/shaikmohammedshoaib666/analytics-forge.git
-cd analytics-forge
-chmod +x deploy/setup-oracle.sh && ./deploy/setup-oracle.sh
-# open http://YOUR_PUBLIC_IP:8501
+docker compose up --build
+# http://127.0.0.1:8501  (or http://VM_PUBLIC_IP:8501)
 ```
 
-## Deploy (Azure for Students — recommended while Oracle is stuck)
+See `deploy/ORACLE_FREE.md` / `deploy/AZURE_STUDENT.md`.
 
-Full steps: [deploy/AZURE_STUDENT.md](deploy/AZURE_STUDENT.md)
+---
 
-1. Claim [GitHub Student Pack](https://education.github.com/pack) → Azure credits  
-2. Create Ubuntu 22.04 VM (B2s/B2ms), open NSG port **8501**  
-3. SSH in and run:
+## Modes
+
+| Mode | What happens |
+|------|----------------|
+| **MANUAL UPLOAD** | CSV/Excel → Clean → Data Integration (SQL joins) → Field → KPIs/Charts/ML/Ask/Dashboard/Email |
+| **LIVE CONNECT** | `config.yaml`: OCP-U → pymodbus → optional FastAPI → `data/live.csv` → SCADA console |
 
 ```bash
-git clone https://github.com/shaikmohammedshoaib666/analytics-forge.git
-cd analytics-forge
-chmod +x deploy/setup-vm.sh && ./deploy/setup-vm.sh
-# open http://YOUR_PUBLIC_IP:8501
+# optional plant gateway
+uvicorn gateway:app --host 0.0.0.0 --port 8088
 ```
 
-### Updates after Azure is live
+## .env
 
-On your PC: change code → `git push`. On the VM:
-
-```bash
-cd ~/analytics-forge && git pull && docker compose up -d --build
 ```
-
-## Hosts & data limits
-
-| Host | Good for | Typical upload / data size |
-|------|----------|----------------------------|
-| **Streamlit Community Cloud (free)** | This app: CSV analytics, sklearn/XGBoost/LightGBM (Prophet optional locally) | Usually **tens of MB CSV** per session (memory ~1GB class). Avoid multi-GB files |
-| **Streamlit Cloud / paid tier** | Same app, more RAM | Larger CSVs (hundreds of MB) depending on plan |
-| **Oracle Always Free VM** | This app with login + DB persistence | Hundreds of MB depending on RAM (prefer 8–12 GB) |
-| **AWS / GCP / Azure VM or GPU** | PyTorch deep learning | GBs + GPU training |
-| **Databricks / EMR / Spark cluster** | PySpark big data | GBs–TBs across cluster |
-| **Local strong PC** | Gurobi (with license), heavier models | Depends on your RAM |
-
-### Why PyTorch / PySpark are listed but not installed here
-They are **too heavy** for Streamlit free cloud and need special infrastructure. They appear in ML Studio as **enterprise stubs** with guidance.
-
-### I4.0 models now runnable in this app
-RandomForest, ExtraTrees, **IsolationForest**, GradientBoosting, KMeans, DBSCAN, **PCA**, sklearn baselines.
-
-**Separate packages in main `requirements.txt`** (college / Streamlit Cloud after push + reboot): **XGBoost**, **LightGBM**, **statsmodels OLS**, **PuLP**. Soft-fail remains if import still fails. **Prophet** lives in `requirements-optional.txt` so Cloud builds do not hang on cmdstan; install locally with `pip install -r requirements-optional.txt` if you need forecasts.
-
-Gurobi / OR-Tools / PyTorch / PySpark = stronger host + license/cluster (not in requirements).
+GEMINI_API_KEY=...
+GEMINI_MODEL=gemini-flash-latest
+EMAIL_USER=
+EMAIL_PASSWORD=
+```

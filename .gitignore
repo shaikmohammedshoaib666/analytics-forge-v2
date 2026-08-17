@@ -12,3 +12,4 @@ data/raw/
 data/inbound/
 .pytest_cache/
 .DS_Store
+data/live.csv

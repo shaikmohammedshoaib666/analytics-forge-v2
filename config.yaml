@@ -1,0 +1,69 @@
+# Analytics Forge v2 — LIVE SCADA config (ONE place for Direct vs FastAPI)
+# Change connection_type only — Manual path is untouched.
+
+LIVE_MODE:
+  # direct  = Streamlit → pymodbus → OCP-U (same LAN / demo room)
+  # fastapi = Streamlit → HTTP → gateway.py (Pi/cloud near plant)
+  # buffer_only = Streamlit only reads data/live.csv (gateway writes it)
+  connection_type: "direct"
+
+  ocp_u_ip: "192.168.1.50"
+  ocp_u_port: 502
+  unit_id: 1
+  poll_interval_s: 5
+  modbus_timeout_s: 2.5
+
+  # Used when connection_type: fastapi
+  fastapi_url: "http://127.0.0.1:8088/live"
+  fastapi_health_url: "http://127.0.0.1:8088/health"
+
+  buffer_path: "data/live.csv"
+  max_buffer_rows: 50000
+
+  # Holding-register map (Modbus TCP). Adjust to your OCP-U / PLC map.
+  # scale: engineering = raw * scale  (or raw / divisor if you prefer — we use multiply)
+  registers:
+    temperature:
+      address: 0
+      scale: 0.1
+      unit: "°C"
+    vibration:
+      address: 1
+      scale: 0.001
+      unit: "mm/s"
+    pressure:
+      address: 2
+      scale: 0.1
+      unit: "bar"
+    smps_voltage:
+      address: 3
+      scale: 0.1
+      unit: "V"
+    smps_current:
+      address: 4
+      scale: 0.01
+      unit: "A"
+    speed:
+      address: 5
+      scale: 1.0
+      unit: "rpm"
+    torque:
+      address: 6
+      scale: 0.1
+      unit: "Nm"
+    rul:
+      address: 7
+      scale: 1.0
+      unit: "h"
+    failure:
+      address: 8
+      scale: 1.0
+      unit: "flag"
+    load:
+      address: 9
+      scale: 0.1
+      unit: "%"
+
+  # LIVE analytics defaults (right-rail)
+  default_insight_engine: "prophet"   # prophet | pandas | pyspark
+  auto_dashboard: true
