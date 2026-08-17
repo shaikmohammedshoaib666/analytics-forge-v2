@@ -23,10 +23,6 @@ Repo: `shaikmohammedshoaib666/analytics-forge-v2` (keep separate from `analytics
 
 ```bash
 cd /Users/sk.md.shoaib.raza/Projects/analytics-forge-v2
-git fetch origin
-git checkout cursor/forge-v2-foundation-f3f9
-git reset --hard origin/cursor/forge-v2-foundation-f3f9
-
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
@@ -63,15 +59,17 @@ python smoke_test.py
 
 1. https://dashboard.render.com → sign up with GitHub  
 2. **New → Blueprint** → repo `shaikmohammedshoaib666/analytics-forge-v2`  
-3. Uses root **`render.yaml`**  
+3. Uses root **`render.yaml`** (branch **`main`**)  
 4. Secret: `GEMINI_API_KEY`  
 5. Details: **`deploy/RENDER.md`**
+
+If an existing Render service is still pinned to `cursor/forge-v2-foundation-f3f9`: Dashboard → service → **Settings → Build & Deploy → Branch → `main`**.
 
 ### Option B — Streamlit Cloud
 
 1. [share.streamlit.io](https://share.streamlit.io) → **New app**
 2. Repo: `shaikmohammedshoaib666/analytics-forge-v2`
-3. Branch: `cursor/forge-v2-foundation-f3f9` · Main file: `app.py`
+3. Branch: `main` · Main file: `app.py`
 4. Requirements file: **`requirements-cloud.txt`**
 5. Secrets: `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-flash-latest`
 
@@ -97,7 +95,7 @@ See `deploy/ORACLE_FREE.md` / `deploy/AZURE_STUDENT.md`.
 
 | Mode | What happens |
 |------|----------------|
-| **MANUAL UPLOAD** | CSV/Excel → Clean → Field → KPIs/Charts/ML/Ask/Dashboard/Email |
+| **MANUAL UPLOAD** | CSV/Excel → Clean → Data Integration (SQL joins) → Field → KPIs/Charts/ML/Ask/Dashboard/Email |
 | **LIVE CONNECT** | `config.yaml`: OCP-U → pymodbus → optional FastAPI → `data/live.csv` → SCADA console |
 
 ```bash

@@ -24,6 +24,19 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
+from modules.data_integration import (
+    JOIN_TYPES,
+    join_many,
+    join_two,
+    load_tabular_file,
+    suggest_join_keys,
+)
+from modules.dwdm_sql import (
+    DWDM_CONCEPTS,
+    apply_dwdm_transforms,
+    default_sql_examples,
+    run_sql,
+)
 from sklearn.ensemble import (
     GradientBoostingClassifier,
     GradientBoostingRegressor,
@@ -124,6 +137,11 @@ def init_state() -> None:
         "llama_index_obj": None,
         "llama_index_meta": None,
         "selected_dash_kpis": None,
+        "uploaded_tables": {},
+        "join_log": None,
+        "sql_lab_result": None,
+        "sql_lab_engine": None,
+        "sql_lab_query": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -658,6 +676,45 @@ def get_data() -> pd.DataFrame:
             "No manual file loaded. Go to Upload (or sidebar file uploader) and upload a CSV/Excel."
         )
     return df.copy()
+
+
+def _is_nonempty_frame(obj: Any) -> bool:
+    """True only for a real DataFrame with rows — never `if df` / `df or ...`."""
+    return isinstance(obj, pd.DataFrame) and not obj.empty
+
+
+def join_table_registry() -> dict[str, pd.DataFrame]:
+    """Named tables for SQL joins. LIVE buffer is listed but not swapped into get_data()."""
+    tables: dict[str, pd.DataFrame] = {}
+    stored = st.session_state.get("uploaded_tables") or {}
+    if isinstance(stored, dict):
+        for name, df in stored.items():
+            if _is_nonempty_frame(df) and name not in ("joined", "_result"):
+                tables[str(name)] = df
+    manual = st.session_state.get("manual_df")
+    if _is_nonempty_frame(manual):
+        tables.setdefault("manual_df", manual)
+    clean = st.session_state.get("clean_df")
+    if _is_nonempty_frame(clean):
+        tables.setdefault("clean_df", clean)
+    if st.session_state.get("mode") == "LIVE CONNECT":
+        buf = read_live_buffer()
+        if _is_nonempty_frame(buf):
+            tables.setdefault("live_buffer", buf)
+    return tables
+
+
+def apply_joined_as_working(merged: pd.DataFrame, tables: dict[str, pd.DataFrame], logs: Any) -> None:
+    """
+    Join result becomes MANUAL working data via get_data() (clean_df + prefer_clean_df).
+    LIVE CONNECT still reads the SCADA buffer — modes stay isolated.
+    """
+    st.session_state.clean_df = merged
+    st.session_state.prefer_clean_df = True
+    st.session_state.join_log = logs
+    registry = dict(tables)
+    registry["joined"] = merged
+    st.session_state.uploaded_tables = registry
 
 
 def _basic_checks(df: pd.DataFrame) -> list[dict[str, Any]]:
@@ -3496,7 +3553,175 @@ def page_upload() -> None:
         elif st.session_state.get("domain_meta"):
             st.json(st.session_state.domain_meta)
 
-    st.dataframe(df.head(50), use_container_width=True)
+        st.dataframe(df.head(50), use_container_width=True)
+
+
+def page_data_integration() -> None:
+    st.header("Data Integration")
+    st.caption(
+        "SQL-style joins across 2 or 3+ tables (INNER / LEFT / RIGHT / OUTER). "
+        "The join result becomes the MANUAL working dataframe (`clean_df` → `get_data()`). "
+        "LIVE CONNECT still reads the SCADA buffer."
+    )
+    if st.session_state.get("mode") == "LIVE CONNECT":
+        st.info(
+            "You are in **LIVE CONNECT**. Joins can use `live_buffer` as a table, but applying a join "
+            "only updates MANUAL `clean_df`. Switch to **MANUAL UPLOAD** to analyze the joined frame."
+        )
+
+    tables = join_table_registry()
+    extra = st.file_uploader(
+        "Upload extra tables to join",
+        type=["csv", "tsv", "xlsx", "xls", "xlsm", "json", "parquet"],
+        accept_multiple_files=True,
+        key="join_uploader",
+    )
+    if extra:
+        for uf in extra:
+            try:
+                loaded = load_tabular_file(uf)
+                if not isinstance(loaded, pd.DataFrame):
+                    raise TypeError("file did not load as a DataFrame")
+                stem = Path(uf.name).stem.replace(" ", "_") or "table"
+                tables[stem] = loaded
+            except Exception as exc:
+                st.error(f"{uf.name}: {exc}")
+        st.session_state.uploaded_tables = {
+            **(st.session_state.get("uploaded_tables") or {}),
+            **tables,
+        }
+
+    if len(tables) < 2:
+        st.warning("Need at least 2 tables — upload more files or load pipeline data first.")
+        return
+
+    names = list(tables.keys())
+    st.write("Tables:", ", ".join(f"`{n}` ({len(tables[n]):,} rows)" for n in names))
+    c1, c2, c3 = st.columns(3)
+    left = c1.selectbox("Left", names, key="f_left")
+    right_opts = [n for n in names if n != left]
+    if not right_opts:
+        st.warning("Pick a different left table so a right table remains.")
+        return
+    right = c2.selectbox("Right", right_opts, key="f_right")
+    how = c3.selectbox("Join type", list(JOIN_TYPES.keys()), format_func=lambda k: JOIN_TYPES[k], key="f_how")
+    suggested = suggest_join_keys(tables[left], tables[right])
+    keys = st.multiselect(
+        "Join keys",
+        suggested,
+        default=suggested[:1],
+        key="f_keys",
+    )
+    if st.button("Run join", type="primary", key="f_join"):
+        try:
+            merged, meta = join_two(tables[left], tables[right], how=how, on=keys or None)
+            apply_joined_as_working(merged, tables, [meta])
+            st.success(
+                f"Joined → {len(merged):,} rows × {merged.shape[1]} cols "
+                f"(MANUAL working set via clean_df)"
+            )
+            st.json(meta)
+            st.dataframe(merged.head(30), use_container_width=True)
+        except Exception as exc:
+            st.error(str(exc))
+
+    if len(names) >= 3:
+        st.subheader("Chain 3+ tables")
+        r1 = st.selectbox("Join #1 right", [n for n in names if n != left], key="f_r1")
+        r2_opts = [n for n in names if n not in (left, r1)]
+        if not r2_opts:
+            st.caption("Need a third distinct table for a chain.")
+            return
+        r2 = st.selectbox("Join #2 right", r2_opts, key="f_r2")
+        how2 = st.selectbox("Join #2 type", list(JOIN_TYPES.keys()), format_func=lambda k: JOIN_TYPES[k], key="f_how2")
+        k1 = suggest_join_keys(tables[left], tables[r1])[:1]
+        if st.button("Run join chain", key="f_chain"):
+            try:
+                merged, logs = join_many(
+                    tables,
+                    [
+                        {"left": left, "right": r1, "how": how, "on": k1 or None},
+                        {"left": "_result", "right": r2, "how": how2},
+                    ],
+                )
+                apply_joined_as_working(merged, tables, logs)
+                st.success(f"Chain → {len(merged):,} rows × {merged.shape[1]} cols")
+                st.json(logs)
+                st.dataframe(merged.head(30), use_container_width=True)
+            except Exception as exc:
+                st.error(str(exc))
+
+    log = st.session_state.get("join_log")
+    if log is not None:
+        with st.expander("Last join log"):
+            st.json(log)
+
+
+def page_dwdm_sql() -> None:
+    st.header("DWDM & SQL Lab")
+    st.caption("Data warehousing / mining concepts + read-only SQL over registered tables.")
+    st.dataframe(pd.DataFrame(DWDM_CONCEPTS), use_container_width=True)
+
+    working: Optional[pd.DataFrame] = None
+    if st.session_state.get("mode") == "LIVE CONNECT":
+        buf = read_live_buffer()
+        if _is_nonempty_frame(buf):
+            working = buf
+    if working is None:
+        clean = st.session_state.get("clean_df")
+        manual = st.session_state.get("manual_df")
+        if _is_nonempty_frame(clean):
+            working = clean
+        elif _is_nonempty_frame(manual):
+            working = manual
+
+    if working is None:
+        st.warning("Upload, clean, or connect LIVE first.")
+        return
+
+    nums = working.select_dtypes(include="number").columns.tolist()
+    c1, c2, c3 = st.columns(3)
+    bins = c1.multiselect("Bin columns", nums, default=nums[:1], key="dwdm_bin")
+    smooth = c2.multiselect("Smooth columns", nums, default=nums[:1] if nums else [], key="dwdm_smooth")
+    norm = c3.multiselect("Z-normalize", nums, key="dwdm_norm")
+    if st.button("Apply DWDM transforms", key="dwdm_apply"):
+        out, log = apply_dwdm_transforms(working, bin_cols=bins, smooth_cols=smooth, normalize_cols=norm)
+        if st.session_state.get("mode") != "LIVE CONNECT":
+            st.session_state.clean_df = out
+            st.session_state.prefer_clean_df = True
+        st.success("; ".join(log) or "done")
+        st.dataframe(out.head(20), use_container_width=True)
+
+    tables = join_table_registry()
+    if _is_nonempty_frame(working):
+        tables.setdefault("working", working)
+    examples = default_sql_examples(list(tables.keys()))
+    st.subheader("SQL Lab")
+    st.code("\n\n".join(examples), language="sql")
+    q = st.text_area("SQL", value=examples[0], height=120, key="forge_sql")
+    if st.button("Run SQL", type="primary", key="forge_sql_run"):
+        try:
+            result, eng = run_sql(q, tables)
+            st.session_state.sql_lab_result = result
+            st.session_state.sql_lab_engine = eng
+            st.session_state.sql_lab_query = q
+        except Exception as exc:
+            st.session_state.sql_lab_result = None
+            st.error(str(exc))
+
+    sql_result = st.session_state.get("sql_lab_result")
+    if isinstance(sql_result, pd.DataFrame):
+        st.caption(f"Engine: {st.session_state.get('sql_lab_engine')}")
+        st.dataframe(sql_result, use_container_width=True)
+        if st.session_state.get("mode") != "LIVE CONNECT":
+            if st.button("Use SQL result as working dataframe", key="sql_as_working"):
+                apply_joined_as_working(
+                    sql_result,
+                    tables,
+                    {"sql": st.session_state.get("sql_lab_query"), "engine": st.session_state.get("sql_lab_engine")},
+                )
+                st.success(f"Working set → {len(sql_result):,} rows")
+
 
 def page_clean() -> None:
     st.header("Clean")
@@ -4045,6 +4270,8 @@ def page_email() -> None:
 PAGES = [
     "Upload",
     "Clean",
+    "Data Integration",
+    "DWDM & SQL",
     "Field",
     "Auto KPIs",
     "Charts",
@@ -4160,6 +4387,8 @@ def main() -> None:
     routers = {
         "Upload": page_upload,
         "Clean": page_clean,
+        "Data Integration": page_data_integration,
+        "DWDM & SQL": page_dwdm_sql,
         "Field": page_field,
         "Auto KPIs": page_kpis,
         "Charts": page_charts,

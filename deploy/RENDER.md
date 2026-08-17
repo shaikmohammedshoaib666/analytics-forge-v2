@@ -1,37 +1,43 @@
-# Deploy on Render (Blueprint) — do this now
+# Deploy on Render (Blueprint)
 
-## Git status (already OK on remote)
+Live URL: **https://analytics-forge-v2.onrender.com**
 
-Branch `cursor/forge-v2-foundation-f3f9` is pushed and includes `render.yaml`.  
-**Do not deploy from `main`** — `main` is an older layout and has no Blueprint file.
+`main` now has the full v2 app (including `render.yaml`). New Blueprint instances should track **`main`**.
 
-## Clicks (you are logged into Render)
+An existing service created from the old pin (`cursor/forge-v2-foundation-f3f9`) will keep auto-deploying that feature branch until you switch it.
 
-1. Open: **https://dashboard.render.com/blueprints**  
-   (or https://dashboard.render.com/select-repo?type=blueprint)
-2. **New Blueprint Instance** → connect GitHub if asked  
+## If the service already exists (typical)
+
+Pushing `cursor/forge-v2-foundation-f3f9` auto-redeploys **until** you change the branch.
+
+To follow `main` going forward:
+
+1. Open **https://dashboard.render.com**
+2. Click the **analytics-forge-v2** web service
+3. **Settings** → **Build & Deploy**
+4. **Branch** → change `cursor/forge-v2-foundation-f3f9` → **`main`** → Save
+5. If it does not start a deploy: **Manual Deploy** → **Deploy latest commit**
+
+Optional: **Environment** → confirm `GEMINI_API_KEY` (and `GEMINI_MODEL=gemini-flash-latest`).
+
+## New Blueprint (only if the service does not exist)
+
+1. Open: **https://dashboard.render.com/blueprints**
+2. **New Blueprint Instance** → connect GitHub if asked
 3. Select repo: **`shaikmohammedshoaib666/analytics-forge-v2`**
-4. **Branch:** `cursor/forge-v2-foundation-f3f9`  
-5. Blueprint path: `render.yaml` (default root)  
-6. Apply / Create — when prompted for **`GEMINI_API_KEY`**, paste your key (or leave blank and add later in Environment)  
-7. Wait for first deploy (pip install + Streamlit). Free builds often take **5–15 minutes**.
-
-## Your URL
-
-After deploy succeeds:
-
-`https://analytics-forge-v2.onrender.com`
-
-(Exact subdomain is shown on the service page if Render renames it.)
+4. **Branch:** `main`
+5. Blueprint path: `render.yaml` (repo root)
+6. Apply / Create — paste **`GEMINI_API_KEY`** when asked (or add later)
+7. Wait 5–15 minutes on the free plan
 
 ## After it is live
 
-- Use mode **MANUAL UPLOAD** for demos  
-- LIVE without PLC → connection **`buffer_only`**  
+- Demos: mode **MANUAL UPLOAD** (joins, Clean, Field, Optuna, LlamaIndex)
+- LIVE without PLC → connection **`buffer_only`**
 - Free tier sleeps after ~15 min idle; first open after sleep can take ~30–60s
 
 ## If build fails
 
-- Confirm branch is `cursor/forge-v2-foundation-f3f9` (not `main`)  
-- Build command must be: `pip install -r requirements-cloud.txt`  
-- Logs → look for OOM / missing module → Factory clear cache / Manual Deploy
+- Branch must be **`main`** (or the feature branch if you have not switched yet)
+- Build command: `pip install -r requirements-cloud.txt`
+- Logs → OOM / missing module → Clear build cache / Manual Deploy

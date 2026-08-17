@@ -1,7 +1,8 @@
 # Render Blueprint — free public host for Analytics Forge v2
 # Deploy: https://dashboard.render.com/blueprints → New Blueprint Instance
 # Repo: shaikmohammedshoaib666/analytics-forge-v2
-# Branch MUST be: cursor/forge-v2-foundation-f3f9  (main is old v1-style layout)
+# Branch: main  (full dual-mode app + joins). Existing services pinned to
+# cursor/forge-v2-foundation-f3f9 must switch Branch → main in the dashboard.
 # LIVE Modbus to private plant IPs will NOT work from Render — use MANUAL or buffer_only.
 
 services:
@@ -10,7 +11,7 @@ services:
     runtime: python
     plan: free
     region: oregon
-    branch: cursor/forge-v2-foundation-f3f9
+    branch: main
     buildCommand: pip install -r requirements-cloud.txt
     startCommand: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true
     healthCheckPath: /_stcore/health
