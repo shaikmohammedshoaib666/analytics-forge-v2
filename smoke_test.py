@@ -74,6 +74,9 @@ def main() -> int:
             usd_per_hour=0.0,
             usd_per_unit=0.0,
             column_roles={},
+            forge_domain="generic",
+            column_types={},
+            forge_detect=None,
             forge_session_id=None,
             forge_session_title="",
             last_gemini_error="",
@@ -192,6 +195,7 @@ def main() -> int:
     def forge_os_helpers():
         import os
         from modules import forge_os as F
+        from modules import domain_detect as D
 
         assert F.get_gemini_model()
         prev = os.environ.get("GEMINI_MODEL")
@@ -218,15 +222,35 @@ def main() -> int:
         )
         assert F.looks_like_plant_oee(plant)["match"]
         assert not F.looks_like_plant_oee(sales)["match"]
+        ctypes = D.detect_column_types(sales)
+        assert ctypes.get("date") == "date"
+        dmeta = D.detect_domain(sales, ctypes)
+        assert dmeta["domain"] in {"sales", "forecasting"}
+        assert "revenue" in D.roles_for_domain("sales")
+        s_roles = D.suggest_roles(list(sales.columns), domain="sales", column_types=ctypes, df=sales)
+        assert s_roles.get("revenue") in {"revenue", "metric"}
 
         impact = F.estimate_dollar_impact(plant, usd_per_hour=120.0, usd_per_unit=5.0)
         assert impact["ok"] and impact["total_usd"] > 0
+        sales_impact = F.estimate_dollar_impact(
+            sales,
+            roles={"revenue": "revenue"},
+            domain="sales",
+        )
+        assert sales_impact["ok"] and sales_impact["total_usd"] > 0
 
-        F.save_named_mapping("smoke_map", {"downtime_minutes": "downtime", "asset_id": "asset"}, source_columns=list(plant.columns))
+        F.save_named_mapping(
+            "smoke_map",
+            {"downtime_minutes": "downtime", "asset_id": "asset"},
+            source_columns=list(plant.columns),
+            domain="plant_oee",
+        )
         loaded = F.load_named_mapping("smoke_map")
         assert loaded and loaded.get("downtime_minutes") == "downtime"
         applied = F.resolve_mapping_to_frame(["Downtime Minutes", "Asset", "qty"], loaded)
         assert applied
+        recs = F.list_named_mappings()
+        assert any(r.get("name") == "smoke_map" and r.get("domain") == "plant_oee" for r in recs)
 
         sid = F.new_session_id()
         F.save_session(sid, title="smoke", source_name="pdm.csv", frames={"clean_df": pdm}, meta={"domain": "predictive_maintenance"})

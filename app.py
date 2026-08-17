@@ -43,6 +43,9 @@ from modules.forge_os import (
     get_gemini_api_key,
     get_gemini_model,
     persist_gemini_key,
+    render_detection_ui,
+    render_domain_hints,
+    render_domain_selector,
     render_dollar_impact,
     render_gemini_key_ui,
     render_industry_banner,
@@ -159,6 +162,9 @@ def init_state() -> None:
         "usd_per_hour": 0.0,
         "usd_per_unit": 0.0,
         "column_roles": {},
+        "forge_domain": "generic",
+        "column_types": {},
+        "forge_detect": None,
         "forge_session_id": None,
         "forge_session_title": "",
         "last_gemini_error": "",
@@ -3507,8 +3513,12 @@ def page_upload() -> None:
         st.info("Upload a file to enable engine selection + field preview.")
         return
 
-    render_industry_banner(df)
+    detect = render_detection_ui(df, context="upload")
+    chosen_domain = render_domain_selector(context="upload")
+    if chosen_domain == "plant_oee":
+        render_industry_banner(df)
     render_mapping_ui(df, context="upload")
+    render_domain_hints(chosen_domain)
 
     suggested, reason = suggest_clean_engine(len(df), df.shape[1])
     available = list_available_engines()
@@ -3535,24 +3545,13 @@ def page_upload() -> None:
     with c3:
         st.metric("Suggested engine", suggested)
 
-    with st.expander("Quick field auto-detect preview (column names + dtypes + Gemini)"):
-        if st.button("Detect domain now", key="upload_detect_field"):
-            with st.spinner("Detecting field via heuristics + Gemini..."):
-                meta = detect_field(df, use_gemini=True)
-                st.session_state.domain = meta["domain"]
-                st.session_state.domain_meta = meta
-            show_gemini_issue(meta.get("gemini_error"))
-            st.json({k: v for k, v in meta.items() if k not in {"scoreboard", "vote_table", "optuna_proba_table"}})
-        elif st.session_state.get("domain_meta"):
-            show_gemini_issue((st.session_state.domain_meta or {}).get("gemini_error"))
-            st.json(
-                {
-                    k: v
-                    for k, v in (st.session_state.domain_meta or {}).items()
-                    if k not in {"scoreboard", "vote_table", "optuna_proba_table"}
-                }
-            )
-
+    with st.expander("Preview data (first 50 rows)"):
+        st.caption(
+            "Pipeline: **Detect → Map → Ask** (LlamaIndex/Gemini) or **Train** "
+            "(Optuna on ML page). LlamaIndex Q&A and Optuna ML are separate steps."
+        )
+        if isinstance(detect, dict):
+            show_gemini_issue(detect.get("gemini_error"))
         st.dataframe(df.head(50), use_container_width=True)
 
 
