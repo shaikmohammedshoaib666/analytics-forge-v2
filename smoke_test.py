@@ -283,6 +283,47 @@ def main() -> int:
 
     check("forge_os helpers", forge_os_helpers)
 
+    def dashboard_charts_helpers():
+        from modules import dashboard_charts as DC
+
+        roles = {"date": "date", "revenue": "revenue", "region": "region", "customer_id": "customer_id"}
+        core = DC.build_core_charts(sales, roles=roles, domain="sales")
+        ext = DC.build_extended_charts(sales, roles=roles, domain="sales")
+        assert len(core) == 4 and len(ext) == 5
+        rendered = sum(1 for s in core + ext if s.get("fig") is not None)
+        assert rendered >= 6
+        pack = DC.assemble_dashboard_export(
+            sales,
+            kpis={"Rows": len(sales), "Total_Revenue": float(sales["revenue"].sum())},
+            insights=["East region leads"],
+            actions=["Review West region"],
+            briefing="Smoke pack",
+            domain="Sales",
+            chart_domain="sales",
+            source_name="sales.csv",
+            roles=roles,
+        )
+        assert b"<!DOCTYPE html>" in pack["html"].encode("utf-8")
+        assert b"plotly" in pack["html"].encode("utf-8").lower()
+        assert pack["kpi_csv"]
+        assert "forge-dashboard-report" in pack["body"] or "HTML" in pack["body"]
+
+        plant = pd.DataFrame(
+            {
+                "date": pd.date_range("2024-01-01", periods=30, freq="D"),
+                "asset_id": rng.choice(["A1", "A2", "A3"], 30),
+                "downtime_minutes": rng.integers(5, 120, 30),
+                "scrap": rng.integers(0, 8, 30),
+                "oee": rng.uniform(0.5, 0.9, 30),
+            }
+        )
+        plant_roles = {"date": "date", "asset_id": "asset", "downtime_minutes": "downtime", "scrap": "scrap"}
+        plant_ext = DC.build_extended_charts(plant, roles=plant_roles, domain="plant_oee")
+        assert len(plant_ext) == 5
+        assert any(s.get("fig") is not None for s in plant_ext)
+
+    check("dashboard_charts helpers", dashboard_charts_helpers)
+
     if errors:
         print(f"\n{len(errors)} FAILURE(S)")
         for e in errors:

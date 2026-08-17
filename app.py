@@ -37,6 +37,12 @@ from modules.dwdm_sql import (
     default_sql_examples,
     run_sql,
 )
+from modules.dashboard_charts import (
+    assemble_dashboard_export,
+    render_core_charts,
+    render_export_controls,
+    render_extended_charts,
+)
 from modules.forge_os import (
     autosave_after_pipeline,
     gemini_issue_from_raw,
@@ -3239,6 +3245,8 @@ def send_forge_email_report(
     body: str,
     df: Optional[pd.DataFrame] = None,
     html_report: Optional[str] = None,
+    html_filename: str = "forge_report.html",
+    kpi_csv: Optional[bytes] = None,
 ) -> str:
     if not EMAIL_USER or not EMAIL_PASSWORD:
         raise RuntimeError(
@@ -3250,7 +3258,14 @@ def send_forge_email_report(
     msg["Subject"] = subject
     msg.set_content(body)
     if html_report:
-        msg.add_attachment(html_report.encode("utf-8"), maintype="text", subtype="html", filename="forge_report.html")
+        msg.add_attachment(
+            html_report.encode("utf-8"),
+            maintype="text",
+            subtype="html",
+            filename=html_filename,
+        )
+    if kpi_csv:
+        msg.add_attachment(kpi_csv, maintype="text", subtype="csv", filename="forge-kpis.csv")
     if df is not None:
         msg.add_attachment(df.to_csv(index=False).encode("utf-8"), maintype="text", subtype="csv", filename="forge_data.csv")
     context = ssl.create_default_context()
@@ -3259,6 +3274,29 @@ def send_forge_email_report(
         server.login(EMAIL_USER, EMAIL_PASSWORD)
         server.send_message(msg)
     return f"Sent to {to_addr}"
+
+
+def send_full_dashboard_email(
+    to_addr: str,
+    *,
+    subject: str,
+    body: str,
+    html_report: str,
+    kpi_csv: Optional[bytes] = None,
+    df: Optional[pd.DataFrame] = None,
+) -> str:
+    """Email full dashboard pack (HTML charts + KPI CSV + optional data CSV)."""
+    if not to_addr.strip():
+        raise RuntimeError("Enter a recipient email.")
+    return send_forge_email_report(
+        to_addr.strip(),
+        subject,
+        body,
+        df=df,
+        html_report=html_report,
+        html_filename="forge-dashboard-report.html",
+        kpi_csv=kpi_csv,
+    )
 
 
 # =============================================================================
@@ -3930,6 +3968,25 @@ def page_kpis() -> None:
         field_actions=field_actions,
         key_prefix="kpi",
     )
+    domain_label = DOMAIN_CATALOG.get(st.session_state.get("domain") or "generic", {}).get(
+        "label", st.session_state.get("domain") or "generic"
+    )
+    roles = dict(st.session_state.get("column_roles") or {})
+    forge_domain = str(st.session_state.get("forge_domain") or st.session_state.get("domain") or "generic")
+    export_pack = assemble_dashboard_export(
+        filtered,
+        kpis=kpis,
+        insights=st.session_state.get("dashboard_insights") or [],
+        actions=brief.get("actions") or [],
+        briefing=brief.get("body") or "",
+        domain=domain_label,
+        chart_domain=forge_domain,
+        source_name=str(st.session_state.get("manual_name") or "forge.csv"),
+        roles=roles,
+        pins=st.session_state.get("dashboard_charts") or [],
+    )
+
+    st.markdown("##### Share KPIs / insights only")
     if EMAIL_USER and EMAIL_PASSWORD and brief.get("body"):
         if st.button("Email this brief", key="kpi_email_brief"):
             try:
@@ -3951,6 +4008,28 @@ def page_kpis() -> None:
                 st.success(msg)
             except Exception as exc:
                 st.error(str(exc))
+    else:
+        st.caption("Set EMAIL_USER + EMAIL_PASSWORD to email Top 3 only. Full dashboard export below works without SMTP.")
+
+    def _email_full_kpi(to: str, body: str, html: str, kpi_csv: bytes) -> str:
+        return send_full_dashboard_email(
+            to,
+            subject=f"[Analytics Forge v2] Dashboard — {domain_label}",
+            body=body,
+            html_report=html,
+            kpi_csv=kpi_csv,
+            df=filtered,
+        )
+
+    render_export_controls(
+        html_report=export_pack["html"],
+        kpi_csv=export_pack["kpi_csv"],
+        email_body=export_pack["body"],
+        smtp_ok=bool(EMAIL_USER and EMAIL_PASSWORD),
+        default_to=OPERATOR_EMAIL,
+        key_prefix="kpi",
+        send_fn=_email_full_kpi,
+    )
 
     comparisons = kpi_group_comparisons(filtered)
     st.subheader("Comparisons")
@@ -4188,7 +4267,10 @@ def page_ask() -> None:
 
 def page_dashboard() -> None:
     st.header("Dashboard")
-    st.caption("Power BI / Tableau style — filters change the whole board. Select KPIs + pinned charts from Charts page.")
+    st.caption(
+        "Power BI / Tableau style — filters change the whole board. "
+        "**Core** (4) + **Extended** (5) charts plus pinned views from Charts."
+    )
     df0 = require_data()
     if df0 is None:
         return
@@ -4199,6 +4281,12 @@ def page_dashboard() -> None:
     if filtered.empty:
         st.warning("Filters removed all rows — clear location/people filters.")
         return
+
+    roles = dict(st.session_state.get("column_roles") or {})
+    forge_domain = str(st.session_state.get("forge_domain") or st.session_state.get("domain") or "generic")
+    domain_label = DOMAIN_CATALOG.get(st.session_state.get("domain") or "generic", {}).get(
+        "label", st.session_state.get("domain") or "generic"
+    )
 
     kpis_all = get_kpis(filtered)
     kpi_keys = [k for k in kpis_all.keys() if k != "Domain"]
@@ -4216,7 +4304,7 @@ def page_dashboard() -> None:
             st.caption(f"Last ML: {ml.get('model_id')} · {ml.get('metrics')}")
         risk = field_predict(filtered if len(filtered) >= 10 else df0)
         st.metric("Live risk", f"{risk}%")
-        render_manager_brief(
+        brief = render_manager_brief(
             insights=st.session_state.get("dashboard_insights") or [],
             quality_checks=st.session_state.get("clean_checks"),
             ml_result=st.session_state.get("ml_result"),
@@ -4228,6 +4316,9 @@ def page_dashboard() -> None:
         )
 
     with left:
+        core_specs = render_core_charts(filtered, roles=roles, domain=forge_domain)
+        extended_specs = render_extended_charts(filtered, roles=roles, domain=forge_domain)
+
         st.subheader("Pinned charts")
         charts = st.session_state.get("dashboard_charts") or []
         if not charts:
@@ -4252,15 +4343,53 @@ def page_dashboard() -> None:
                 st.session_state.dashboard_charts = charts
                 st.rerun()
 
+    export_pack = assemble_dashboard_export(
+        filtered,
+        kpis=kpis_all,
+        insights=st.session_state.get("dashboard_insights") or [],
+        actions=brief.get("actions") or [],
+        briefing=brief.get("body") or "",
+        domain=domain_label,
+        chart_domain=forge_domain,
+        source_name=str(st.session_state.get("manual_name") or "forge.csv"),
+        roles=roles,
+        pins=charts,
+        core_specs=core_specs,
+        extended_specs=extended_specs,
+    )
+
+    def _email_full(to: str, body: str, html: str, kpi_csv: bytes) -> str:
+        return send_full_dashboard_email(
+            to,
+            subject=f"[Analytics Forge v2] Dashboard — {domain_label}",
+            body=body,
+            html_report=html,
+            kpi_csv=kpi_csv,
+            df=filtered,
+        )
+
     st.divider()
-    if st.button("Clear dashboard charts"):
+    render_export_controls(
+        html_report=export_pack["html"],
+        kpi_csv=export_pack["kpi_csv"],
+        email_body=export_pack["body"],
+        smtp_ok=bool(EMAIL_USER and EMAIL_PASSWORD),
+        default_to=OPERATOR_EMAIL,
+        key_prefix="dash",
+        send_fn=_email_full,
+    )
+
+    if st.button("Clear pinned dashboard charts"):
         st.session_state.dashboard_charts = []
         st.rerun()
 
 
 def page_email() -> None:
     st.header("Email")
-    st.caption("Forge Analytics style — send HTML report pack + CSV to any inbox (Gmail App Password).")
+    st.caption(
+        "Forge Analytics style — send **full dashboard** HTML (KPIs + insights + charts) + CSV, "
+        "or use Auto KPIs for Top-3-only email."
+    )
     status_ok = bool(EMAIL_USER and EMAIL_PASSWORD)
     if status_ok:
         st.success(f"SMTP ready · {EMAIL_SMTP_HOST}:{EMAIL_SMTP_PORT} · from {EMAIL_FROM or EMAIL_USER}")
@@ -4277,42 +4406,81 @@ def page_email() -> None:
         st.info("Load data (Upload / LIVE) to attach CSV + KPI report.")
 
     domain = st.session_state.get("domain") or "generic"
+    domain_label = DOMAIN_CATALOG.get(domain, {}).get("label", domain)
     kpis = get_kpis(df) if df is not None else {}
     insights = st.session_state.get("dashboard_insights") or []
     ml = st.session_state.get("ml_result")
-    briefing = ""
-    if st.session_state.get("field_result") and st.session_state.field_result.get("model_card", {}).get("actions"):
-        briefing = " | ".join(st.session_state.field_result["model_card"]["actions"][:3])
-    elif ml and ml.get("manager_briefing"):
-        briefing = ml["manager_briefing"]
-    else:
-        briefing = f"Analytics Forge report for {DOMAIN_CATALOG.get(domain, {}).get('label', domain)}."
+    cached_brief = st.session_state.get("kpi_manager_brief") or st.session_state.get("dash_manager_brief") or {}
+    actions = list(cached_brief.get("actions") or [])
+    briefing = str(cached_brief.get("body") or "")
+    if not briefing:
+        if st.session_state.get("field_result") and st.session_state.field_result.get("model_card", {}).get("actions"):
+            briefing = " | ".join(st.session_state.field_result["model_card"]["actions"][:3])
+        elif ml and ml.get("manager_briefing"):
+            briefing = ml["manager_briefing"]
+        else:
+            briefing = f"Analytics Forge report for {domain_label}."
+
+    export_pack = None
+    if df is not None:
+        export_pack = assemble_dashboard_export(
+            df,
+            kpis=kpis,
+            insights=insights,
+            actions=actions,
+            briefing=briefing,
+            domain=domain_label,
+            chart_domain=str(st.session_state.get("forge_domain") or domain),
+            source_name=str(st.session_state.get("manual_name") or "live.csv"),
+            roles=dict(st.session_state.get("column_roles") or {}),
+            pins=st.session_state.get("dashboard_charts") or [],
+        )
 
     with st.form("email_send_form"):
         to_addr = st.text_input("Recipient", value=OPERATOR_EMAIL)
-        subject = st.text_input("Subject", value=f"[Analytics Forge v2] {DOMAIN_CATALOG.get(domain, {}).get('label', domain)} report")
-        note = st.text_area("Extra note", value="Attached: HTML pack + current data CSV.")
-        send_clicked = st.form_submit_button("Send report now", type="primary")
+        subject = st.text_input("Subject", value=f"[Analytics Forge v2] Dashboard — {domain_label}")
+        note = st.text_area(
+            "Extra note",
+            value="Attached: forge-dashboard-report.html (KPIs + insights + charts) + KPI CSV + data CSV.",
+        )
+        send_clicked = st.form_submit_button("Email full report", type="primary")
         if send_clicked:
             if not to_addr.strip():
                 st.error("Enter recipient email.")
-            elif df is None:
+            elif df is None or export_pack is None:
                 st.error("No data loaded.")
             else:
                 try:
-                    html = build_html_report(
-                        domain=domain,
-                        source_name=str(st.session_state.get("manual_name") or "live.csv"),
-                        kpis=kpis,
-                        insights=insights,
-                        ml_result=ml,
-                        briefing=briefing,
+                    body = note + "\n\n" + export_pack["body"]
+                    msg = send_full_dashboard_email(
+                        to_addr.strip(),
+                        subject=subject,
+                        body=body,
+                        html_report=export_pack["html"],
+                        kpi_csv=export_pack["kpi_csv"],
+                        df=df,
                     )
-                    body = note + "\n\n" + briefing
-                    msg = send_forge_email_report(to_addr.strip(), subject, body, df=df, html_report=html)
                     st.success(msg)
                 except Exception as exc:
                     st.error(str(exc))
+
+    if export_pack:
+        render_export_controls(
+            html_report=export_pack["html"],
+            kpi_csv=export_pack["kpi_csv"],
+            email_body=export_pack["body"],
+            smtp_ok=bool(EMAIL_USER and EMAIL_PASSWORD),
+            default_to=OPERATOR_EMAIL,
+            key_prefix="email",
+            send_fn=lambda to, body, html, kpi_csv: send_full_dashboard_email(
+                to,
+                subject=f"[Analytics Forge v2] Dashboard — {domain_label}",
+                body=body,
+                html_report=html,
+                kpi_csv=kpi_csv,
+                df=df,
+            ),
+        )
 
     st.subheader("Report preview KPIs")
     if kpis:
