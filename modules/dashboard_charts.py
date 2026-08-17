@@ -79,7 +79,11 @@ def _col_from_roles(df: pd.DataFrame, roles: dict[str, str], *wanted: str) -> Op
 
 
 def _find_col(df: pd.DataFrame, *names: str) -> Optional[str]:
-    lower = {str(c).lower(): c for c in df.columns}
+    return _find_col_among([str(c) for c in df.columns], *names)
+
+
+def _find_col_among(candidates: list[str], *names: str) -> Optional[str]:
+    lower = {str(c).lower(): c for c in candidates}
     for n in names:
         if n.lower() in lower:
             return lower[n.lower()]
@@ -103,33 +107,101 @@ def _numeric_cols(df: pd.DataFrame) -> list[str]:
     return out
 
 
-def _category_cols(df: pd.DataFrame, max_unique: int = 40) -> list[str]:
+def _is_valid_metric(df: pd.DataFrame, col: Optional[str]) -> bool:
+    if not col or col not in df.columns:
+        return False
+    if pd.api.types.is_numeric_dtype(df[col]):
+        return bool(_to_numeric(df[col]).notna().any())
+    return bool(_to_numeric(df[col]).notna().sum() >= 5)
+
+
+def _is_valid_category(df: pd.DataFrame, col: Optional[str], max_unique: int = 40) -> bool:
+    if not col or col not in df.columns:
+        return False
+    if pd.api.types.is_datetime64_any_dtype(df[col]):
+        return False
+    nuniq = int(df[col].nunique(dropna=True))
     n_rows = max(len(df), 1)
+    if nuniq < 2 or nuniq > max_unique:
+        return False
+    if nuniq >= n_rows * 0.9:
+        return False
+    return True
+
+
+def _category_cols(df: pd.DataFrame, max_unique: int = 40) -> list[str]:
     out: list[str] = []
     for c in df.columns:
-        nuniq = int(df[c].nunique(dropna=True))
-        if nuniq < 2 or nuniq > max_unique:
-            continue
-        if nuniq >= n_rows * 0.9:
-            continue
-        out.append(str(c))
+        if _is_valid_category(df, str(c), max_unique=max_unique):
+            out.append(str(c))
     return out
 
 
+def _looks_like_dates(series: pd.Series) -> bool:
+    if series is None or getattr(series, "empty", True):
+        return False
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return True
+    sample = series.dropna()
+    if sample.empty:
+        return False
+    if len(sample) > 80:
+        sample = sample.iloc[:80]
+    parsed = pd.to_datetime(sample, errors="coerce")
+    if float(parsed.notna().mean()) < 0.6:
+        return False
+    if int(parsed.nunique(dropna=True)) < 3:
+        return False
+    years = parsed.dt.year.dropna()
+    if years.empty:
+        return False
+    if int(years.min()) < 1970 or int(years.max()) > 2100:
+        return False
+    span = parsed.max() - parsed.min()
+    return bool(pd.notna(span) and span >= pd.Timedelta(hours=1))
+
+
 def _date_col(df: pd.DataFrame, roles: dict[str, str]) -> Optional[str]:
+    """Mapped date role if valid, else datetime dtype / parseable strings. No Field lock."""
     hit = _col_from_roles(df, roles, *_DATE_ROLES)
-    if hit:
+    if hit and _looks_like_dates(df[hit]):
         return hit
     for c in df.columns:
         if pd.api.types.is_datetime64_any_dtype(df[c]):
             return str(c)
-    return _find_col(df, "timestamp", "datetime", "date", "time", "month")
+    scored: list[tuple[float, str]] = []
+    for c in df.columns:
+        series = df[c]
+        if pd.api.types.is_numeric_dtype(series):
+            continue
+        if not _looks_like_dates(series):
+            continue
+        sample = series.dropna()
+        if len(sample) > 80:
+            sample = sample.iloc[:80]
+        rate = float(pd.to_datetime(sample, errors="coerce").notna().mean())
+        scored.append((rate, str(c)))
+    if scored:
+        scored.sort(reverse=True)
+        return scored[0][1]
+    named = _find_col(df, "timestamp", "datetime", "date", "time", "month")
+    if named and _looks_like_dates(df[named]):
+        return named
+    return None
 
 
 def _metric_col(df: pd.DataFrame, roles: dict[str, str], domain: str) -> Optional[str]:
+    """Mapped metric if numeric, else first numeric column. Names are hints only."""
     hit = _col_from_roles(df, roles, *_METRIC_ROLES)
-    if hit:
+    if hit and _is_valid_metric(df, hit):
         return hit
+    nums = _numeric_cols(df)
+    if not nums:
+        for c in df.columns:
+            if str(c) not in nums and _is_valid_metric(df, str(c)):
+                nums.append(str(c))
+    if not nums:
+        return None
     prefs: dict[str, tuple[str, ...]] = {
         "plant_oee": ("oee", "availability", "downtime_hours", "downtime_minutes", "downtime", "scrap"),
         "quality": ("scrap", "defect", "reject", "fpy"),
@@ -140,17 +212,22 @@ def _metric_col(df: pd.DataFrame, roles: dict[str, str], domain: str) -> Optiona
         "generic": ("revenue", "sales", "amount", "qty", "value"),
     }
     names = prefs.get(domain, ()) + prefs["generic"]
-    found = _find_col(df, *names)
+    found = _find_col_among(nums, *names)
     if found:
         return found
-    nums = _numeric_cols(df)
-    return nums[0] if nums else None
+    return nums[0]
 
 
 def _category_col(df: pd.DataFrame, roles: dict[str, str], domain: str) -> Optional[str]:
+    """Mapped category if low-cardinality, else dtype inference. Names are hints only."""
     hit = _col_from_roles(df, roles, *_CAT_ROLES)
-    if hit:
+    if hit and _is_valid_category(df, hit):
         return hit
+    cats = _category_cols(df)
+    if not cats:
+        return None
+    cats_text = [c for c in cats if not pd.api.types.is_numeric_dtype(df[c])]
+    pool = cats_text or cats
     prefs: dict[str, tuple[str, ...]] = {
         "plant_oee": ("asset_id", "asset", "machine_id", "machine", "line", "shift"),
         "quality": ("batch", "sku", "line", "defect_type"),
@@ -160,34 +237,33 @@ def _category_col(df: pd.DataFrame, roles: dict[str, str], domain: str) -> Optio
         "predictive_maintenance": ("machine_id", "asset_id", "asset", "machine", "location"),
         "generic": ("region", "location", "category", "product", "store"),
     }
-    found = _find_col(df, *prefs.get(domain, ()), *prefs["generic"])
+    found = _find_col_among(pool, *prefs.get(domain, ()), *prefs["generic"])
     if found:
         return found
-    cats = _category_cols(df)
-    return cats[0] if cats else None
+    return pool[0]
 
 
 def _second_category(df: pd.DataFrame, roles: dict[str, str], domain: str, used: Optional[str]) -> Optional[str]:
     extra_roles = ("region", "product", "shift", "batch", "subscription")
     hit = _col_from_roles(df, roles, *extra_roles)
-    if hit and hit != used:
+    if hit and hit != used and _is_valid_category(df, hit):
         return hit
+    cats = [c for c in _category_cols(df) if c != used]
+    if not cats:
+        return None
     prefs = ("shift", "region", "location", "line", "month", "product", "sku")
-    found = _find_col(df, *prefs)
-    if found and found != used:
+    found = _find_col_among(cats, *prefs)
+    if found:
         return found
-    for c in _category_cols(df):
-        if c != used:
-            return c
-    return None
+    return cats[0]
 
 
 def _loss_col(df: pd.DataFrame, roles: dict[str, str], domain: str) -> Optional[str]:
     hit = _col_from_roles(df, roles, *_LOSS_ROLES)
-    if hit:
+    if hit and _is_valid_metric(df, hit):
         return hit
     if domain in ("plant_oee", "quality", "predictive_maintenance"):
-        return _find_col(
+        found = _find_col(
             df,
             "downtime_minutes",
             "downtime_hours",
@@ -197,6 +273,8 @@ def _loss_col(df: pd.DataFrame, roles: dict[str, str], domain: str) -> Optional[
             "defect",
             "idle_hours",
         )
+        if found and _is_valid_metric(df, found):
+            return found
     return None
 
 
@@ -624,19 +702,27 @@ def pins_to_specs(df: pd.DataFrame, pins: Optional[list[Any]], limit: int = 8) -
 # Streamlit render
 # -----------------------------------------------------------------------------
 
-def render_chart_specs(specs: list[dict[str, Any]], key_prefix: str = "dash") -> None:
+def render_chart_specs(
+    specs: list[dict[str, Any]],
+    key_prefix: str = "dash",
+    *,
+    silent_skip: bool = False,
+) -> None:
     import streamlit as st
 
-    for i in range(0, len(specs), 2):
+    visible = [s for s in specs if s.get("fig") is not None] if silent_skip else list(specs)
+    if not visible:
+        return
+    for i in range(0, len(visible), 2):
         cols = st.columns(2)
-        pair = specs[i : i + 2]
+        pair = visible[i : i + 2]
         for j, spec in enumerate(pair):
             with cols[j]:
                 st.markdown(f"**{spec.get('title') or spec.get('id')}**")
                 fig = spec.get("fig")
                 if fig is not None:
                     st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_{spec.get('id')}")
-                else:
+                elif not silent_skip:
                     st.caption(spec.get("skip_reason") or "Skipped — required columns are missing.")
 
 
@@ -651,13 +737,16 @@ def render_core_charts(df: pd.DataFrame, roles: Optional[dict[str, str]] = None,
 
 
 def render_extended_charts(df: pd.DataFrame, roles: Optional[dict[str, str]] = None, domain: Optional[str] = None) -> list[dict[str, Any]]:
-    """Five extra business charts. Skip a slot with a caption when columns are missing."""
+    """Five extra business charts. Heading always visible; skip a slot silently if it cannot be built."""
     import streamlit as st
 
     specs = build_extended_charts(df, roles, domain)
     st.subheader("Extended charts")
-    st.caption("Time series, Top-N, Pareto, distribution, heatmap — skipped if the frame lacks the needed columns.")
-    render_chart_specs(specs, key_prefix="ext")
+    st.caption(
+        "Time series, Top-N, Pareto, distribution, heatmap — inferred from date / numeric / category columns. "
+        "Column mapping is optional."
+    )
+    render_chart_specs(specs, key_prefix="ext", silent_skip=True)
     return specs
 
 
@@ -738,8 +827,6 @@ def chart_specs_to_html(specs: list[dict[str, Any]]) -> str:
         title = html_lib.escape(str(spec.get("title") or spec.get("id") or "Chart"))
         fig = spec.get("fig")
         if fig is None:
-            reason = html_lib.escape(str(spec.get("skip_reason") or "Skipped"))
-            chunks.append(f"<section class='chart skip'><h3>{title}</h3><p>{reason}</p></section>")
             continue
         fragment = fig.to_html(include_plotlyjs=js_mode, full_html=False, config={"displayModeBar": False})
         js_mode = False

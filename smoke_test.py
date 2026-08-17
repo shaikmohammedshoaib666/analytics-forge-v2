@@ -322,6 +322,32 @@ def main() -> int:
         assert len(plant_ext) == 5
         assert any(s.get("fig") is not None for s in plant_ext)
 
+        messy = pd.DataFrame(
+            {
+                "sold_on": pd.date_range("2024-01-01", periods=40, freq="D").astype(str),
+                "amount_usd": rng.integers(10, 500, 40),
+                "qty_units": rng.integers(1, 20, 40),
+                "margin_pct": rng.uniform(0.1, 0.4, 40),
+                "zone": rng.choice(["N", "S", "E", "W"], 40),
+                "channel": rng.choice(["web", "store"], 40),
+                "sales_rep": rng.choice(["Ana", "Bo", "Cy"], 40),
+            }
+        )
+        ext_free = DC.build_extended_charts(messy, roles={}, domain="generic")
+        assert len(ext_free) == 5
+        assert sum(1 for s in ext_free if s.get("fig") is not None) == 5
+        assert DC._metric_col(messy, {}, "sales") != "sales_rep"
+        assert DC._date_col(messy, {}) == "sold_on"
+
+        joined = messy.rename(columns={"zone": "warehouse_zone"})
+        reset()
+        A.st.session_state.manual_df = messy
+        A.st.session_state.clean_df = joined
+        A.st.session_state.uploaded_tables = {"joined": joined}
+        src, label = A.dashboard_source_frame(messy)
+        assert "warehouse_zone" in src.columns
+        assert "cleaned" in label or "joined" in label
+
     check("dashboard_charts helpers", dashboard_charts_helpers)
 
     if errors:

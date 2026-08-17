@@ -736,6 +736,21 @@ def join_table_registry() -> dict[str, pd.DataFrame]:
     return tables
 
 
+def dashboard_source_frame(fallback: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    """Prefer cleaned / joined / warehouse session table for Dashboard charts."""
+    tables = st.session_state.get("uploaded_tables") or {}
+    joined = tables.get("joined") if isinstance(tables, dict) else None
+    clean = st.session_state.get("clean_df")
+    sql = st.session_state.get("sql_lab_result")
+    if _is_nonempty_frame(clean):
+        return clean.copy(), "cleaned / DWDM"
+    if _is_nonempty_frame(joined):
+        return joined.copy(), "joined / warehouse"
+    if _is_nonempty_frame(sql):
+        return sql.copy(), "SQL result"
+    return fallback, "working"
+
+
 def apply_joined_as_working(merged: pd.DataFrame, tables: dict[str, pd.DataFrame], logs: Any) -> None:
     """
     Join result becomes MANUAL working data via get_data() (clean_df + prefer_clean_df).
@@ -4274,13 +4289,16 @@ def page_dashboard() -> None:
     df0 = require_data()
     if df0 is None:
         return
+    src, src_label = dashboard_source_frame(df0)
     if not st.session_state.get("domain"):
-        st.session_state.domain = detect_field(df0, use_gemini=False, optuna_trials=8)["domain"]
+        st.session_state.domain = detect_field(src, use_gemini=False, optuna_trials=8)["domain"]
 
-    filtered = render_filter_bar(df0, key_prefix="dash")
+    filtered = render_filter_bar(src, key_prefix="dash")
     if filtered.empty:
         st.warning("Filters removed all rows — clear location/people filters.")
         return
+    if src_label != "working":
+        st.caption(f"Charts use the **{src_label}** table from this session.")
 
     roles = dict(st.session_state.get("column_roles") or {})
     forge_domain = str(st.session_state.get("forge_domain") or st.session_state.get("domain") or "generic")
@@ -4302,7 +4320,7 @@ def page_dashboard() -> None:
         ml = st.session_state.get("ml_result")
         if ml and ml.get("ok"):
             st.caption(f"Last ML: {ml.get('model_id')} · {ml.get('metrics')}")
-        risk = field_predict(filtered if len(filtered) >= 10 else df0)
+        risk = field_predict(filtered if len(filtered) >= 10 else src)
         st.metric("Live risk", f"{risk}%")
         brief = render_manager_brief(
             insights=st.session_state.get("dashboard_insights") or [],
@@ -4317,31 +4335,32 @@ def page_dashboard() -> None:
 
     with left:
         core_specs = render_core_charts(filtered, roles=roles, domain=forge_domain)
-        extended_specs = render_extended_charts(filtered, roles=roles, domain=forge_domain)
 
-        st.subheader("Pinned charts")
-        charts = st.session_state.get("dashboard_charts") or []
-        if not charts:
-            st.info("Go to **Charts**, build a view, click **Add to Dashboard**.")
-        for i, meta in enumerate(charts):
-            st.markdown(f"**{meta.get('title')}**")
-            try:
-                render_adaptive_chart(
-                    filtered,
-                    meta.get("x"),
-                    meta.get("y"),
-                    meta.get("chart_type", "bar"),
-                    meta.get("lib", "plotly"),
-                    meta.get("color"),
-                )
-            except Exception as exc:
-                st.warning(f"Chart {i+1} failed on filtered data: {exc}")
-            if meta.get("insight"):
-                st.caption(meta["insight"])
-            if st.button(f"Remove chart {i+1}", key=f"rm_chart_{i}"):
-                charts.pop(i)
-                st.session_state.dashboard_charts = charts
-                st.rerun()
+    extended_specs = render_extended_charts(filtered, roles=roles, domain=forge_domain)
+
+    charts = list(st.session_state.get("dashboard_charts") or [])
+    st.subheader("Pinned charts")
+    if not charts:
+        st.info("Go to **Charts**, build a view, click **Add to Dashboard**.")
+    for i, meta in enumerate(charts):
+        st.markdown(f"**{meta.get('title')}**")
+        try:
+            render_adaptive_chart(
+                filtered,
+                meta.get("x"),
+                meta.get("y"),
+                meta.get("chart_type", "bar"),
+                meta.get("lib", "plotly"),
+                meta.get("color"),
+            )
+        except Exception as exc:
+            st.warning(f"Chart {i+1} failed on filtered data: {exc}")
+        if meta.get("insight"):
+            st.caption(meta["insight"])
+        if st.button(f"Remove chart {i+1}", key=f"rm_chart_{i}"):
+            charts.pop(i)
+            st.session_state.dashboard_charts = charts
+            st.rerun()
 
     export_pack = assemble_dashboard_export(
         filtered,
