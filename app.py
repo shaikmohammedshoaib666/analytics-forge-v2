@@ -37,6 +37,20 @@ from modules.dwdm_sql import (
     default_sql_examples,
     run_sql,
 )
+from modules.forge_os import (
+    autosave_after_pipeline,
+    gemini_issue_from_raw,
+    get_gemini_api_key,
+    get_gemini_model,
+    persist_gemini_key,
+    render_dollar_impact,
+    render_gemini_key_ui,
+    render_industry_banner,
+    render_manager_brief,
+    render_mapping_ui,
+    render_session_sidebar,
+    show_gemini_issue,
+)
 from sklearn.ensemble import (
     GradientBoostingClassifier,
     GradientBoostingRegressor,
@@ -74,9 +88,9 @@ MODBUS_PORT = int(os.getenv("MODBUS_PORT", "502"))
 MODBUS_UNIT = int(os.getenv("MODBUS_UNIT", "1"))
 MODBUS_START = int(os.getenv("MODBUS_START", "0"))  # 40001 -> address 0
 MODBUS_COUNT = int(os.getenv("MODBUS_COUNT", "10"))
-_ENV_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+_ENV_GEMINI_API_KEY = get_gemini_api_key()
 GEMINI_API_KEY = _ENV_GEMINI_API_KEY
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest").strip() or "gemini-flash-latest"
+GEMINI_MODEL = get_gemini_model()
 EMAIL_USER = os.getenv("EMAIL_USER", "").strip()
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "").strip()
 EMAIL_FROM = os.getenv("EMAIL_FROM", "").strip() or EMAIL_USER
@@ -142,6 +156,12 @@ def init_state() -> None:
         "sql_lab_result": None,
         "sql_lab_engine": None,
         "sql_lab_query": None,
+        "usd_per_hour": 0.0,
+        "usd_per_unit": 0.0,
+        "column_roles": {},
+        "forge_session_id": None,
+        "forge_session_title": "",
+        "last_gemini_error": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1186,6 +1206,10 @@ def clean_data(df: pd.DataFrame, engine: Optional[str] = None) -> tuple[pd.DataF
     st.session_state.clean_df = clean_df
     st.session_state.clean_checks = table
     st.session_state.clean_report = {**report, "engine_logs": engine_logs, "engine": engine}
+    try:
+        autosave_after_pipeline(title=f"Clean · {st.session_state.get('manual_name') or 'session'}")
+    except Exception:
+        pass
     return clean_df, table
 
 
@@ -1409,8 +1433,10 @@ def detect_field(df: pd.DataFrame, use_gemini: bool = True, optuna_trials: int =
     gemini_domain = None
     gemini_raw = ""
     gemini_why = ""
+    gemini_error = None
     gconf = 0.0
-    if use_gemini and get_gemini_api_key():
+    gemini_attempted = bool(use_gemini and get_gemini_api_key())
+    if gemini_attempted:
         schema = [
             {"column": str(c), "dtype": str(df[c].dtype), "sample": [str(x) for x in df[c].dropna().head(3).tolist()]}
             for c in df.columns[:40]
@@ -1424,6 +1450,7 @@ def detect_field(df: pd.DataFrame, use_gemini: bool = True, optuna_trials: int =
             f"Columns/dtypes/samples: {json.dumps(schema)[:4500]}"
         )
         gemini_raw = _gemini_answer(prompt)
+        gemini_error = gemini_issue_from_raw(gemini_raw, attempted=True)
         try:
             start = gemini_raw.find("{")
             end = gemini_raw.rfind("}") + 1
@@ -1435,7 +1462,13 @@ def detect_field(df: pd.DataFrame, use_gemini: bool = True, optuna_trials: int =
                     gconf = float(payload.get("confidence", 0.85))
                     gemini_why = str(payload.get("why", ""))
         except Exception:
-            pass
+            if gemini_error is None and gemini_raw and not gemini_raw.startswith("[Gemini error]"):
+                gemini_error = f"Gemini response was not valid JSON: {gemini_raw[:240]}"
+        if gemini_error:
+            try:
+                st.session_state.last_gemini_error = gemini_error
+            except Exception:
+                pass
 
     # Weighted ensemble (exclusive heuristic hard-wins when strong)
     vote: dict[str, float] = {}
@@ -1478,6 +1511,8 @@ def detect_field(df: pd.DataFrame, use_gemini: bool = True, optuna_trials: int =
         "gemini_domain": gemini_domain,
         "gemini_why": gemini_why,
         "gemini_raw": gemini_raw[:500],
+        "gemini_error": gemini_error,
+        "gemini_attempted": gemini_attempted,
         "optuna": {
             "domain": opt_domain,
             "confidence": opt_conf,
@@ -2368,75 +2403,20 @@ def prophet_forecast(df: pd.DataFrame, target: str) -> str:
     )
 
 
-def get_gemini_api_key() -> str:
-    """Prefer session override (Upload/Field UI), else .env."""
-    try:
-        key = str(st.session_state.get("gemini_api_key_override") or "").strip()
-        if key:
-            return key
-    except Exception:
-        pass
-    return _ENV_GEMINI_API_KEY
-
-
-# Back-compat alias used throughout the app (re-resolved via get_gemini_api_key in helpers)
-GEMINI_API_KEY = _ENV_GEMINI_API_KEY
-
-
-def persist_gemini_key(key: str, write_dotenv: bool = True) -> None:
-    """Store Gemini key in session and optionally append/update .env."""
-    key = (key or "").strip()
-    st.session_state.gemini_api_key_override = key
-    global GEMINI_API_KEY
-    GEMINI_API_KEY = key or _ENV_GEMINI_API_KEY
-    if write_dotenv and key:
-        env_path = ROOT / ".env"
-        lines = env_path.read_text() if env_path.exists() else ""
-        if "GEMINI_API_KEY=" in lines:
-            out = []
-            for line in lines.splitlines():
-                if line.startswith("GEMINI_API_KEY="):
-                    out.append(f"GEMINI_API_KEY={key}")
-                else:
-                    out.append(line)
-            env_path.write_text("\n".join(out) + ("\n" if out else ""))
-        else:
-            with env_path.open("a") as f:
-                f.write(f"\nGEMINI_API_KEY={key}\n")
-                if "GEMINI_MODEL=" not in lines:
-                    f.write(f"GEMINI_MODEL={GEMINI_MODEL}\n")
-
-
 def gemini_key_ui(context: str = "upload") -> None:
-    st.subheader("Gemini API key")
-    current = get_gemini_api_key()
-    masked = (current[:6] + "…" + current[-4:]) if len(current) > 12 else ("set" if current else "missing")
-    st.caption(f"Status: **{masked}** · model `{GEMINI_MODEL}` · used for field auto-detect + Ask/AI ({context})")
-    new_key = st.text_input(
-        "Paste Gemini API key",
-        value="",
-        type="password",
-        key=f"gemini_key_input_{context}",
-        help="Stored in session + .env (gitignored). Improves domain detection ~95% with column+dtype+metadata.",
-    )
-    if st.button("Save Gemini key", key=f"save_gemini_{context}"):
-        if new_key.strip():
-            persist_gemini_key(new_key.strip(), write_dotenv=True)
-            st.success("Gemini key saved for this session and `.env`.")
-            st.rerun()
-        else:
-            st.warning("Paste a non-empty key.")
+    render_gemini_key_ui(context)
 
 
 def _gemini_answer(prompt: str) -> str:
     key = get_gemini_api_key()
     if not key:
         return ""
+    model_name = get_gemini_model()
     try:
         import google.generativeai as genai
 
         genai.configure(api_key=key)
-        model = genai.GenerativeModel(GEMINI_MODEL)
+        model = genai.GenerativeModel(model_name)
         resp = model.generate_content(prompt)
         return (getattr(resp, "text", None) or str(resp)).strip()
     except Exception as exc:
@@ -3157,7 +3137,9 @@ def ask_llama_gemini(question: str, df: pd.DataFrame) -> dict[str, Any]:
     # Offline extractive answer: pull key numbers from hits
     offline = _offline_answer_from_hits(question, hits, df)
     gemini_ans = ""
-    if get_gemini_api_key():
+    gemini_error = None
+    gemini_attempted = bool(get_gemini_api_key())
+    if gemini_attempted:
         prompt = (
             "You are Analytics Forge industrial OS. Answer ONLY using the retrieved CSV rows.\n"
             "Cite concrete numbers (vibration, temperature, machine_id, revenue, etc.).\n"
@@ -3165,13 +3147,20 @@ def ask_llama_gemini(question: str, df: pd.DataFrame) -> dict[str, Any]:
             "Give a short operational answer with recommended action."
         )
         gemini_ans = _gemini_answer(prompt)
-        if gemini_ans.startswith("[Gemini error]"):
+        gemini_error = gemini_issue_from_raw(gemini_ans, attempted=True)
+        if gemini_error:
             gemini_ans = ""
+            try:
+                st.session_state.last_gemini_error = gemini_error
+            except Exception:
+                pass
     final = gemini_ans.strip() if gemini_ans and not gemini_ans.startswith("[Gemini") else offline
     return {
         "answer": final,
         "offline_answer": offline,
         "gemini_answer": gemini_ans,
+        "gemini_error": gemini_error,
+        "used_offline_fallback": bool(gemini_error) or (gemini_attempted and not gemini_ans),
         "hits": hits,
         "index_meta": st.session_state.get("llama_index_meta"),
     }
@@ -3518,6 +3507,9 @@ def page_upload() -> None:
         st.info("Upload a file to enable engine selection + field preview.")
         return
 
+    render_industry_banner(df)
+    render_mapping_ui(df, context="upload")
+
     suggested, reason = suggest_clean_engine(len(df), df.shape[1])
     available = list_available_engines()
     st.subheader("Cleaning engine (you choose)")
@@ -3549,9 +3541,17 @@ def page_upload() -> None:
                 meta = detect_field(df, use_gemini=True)
                 st.session_state.domain = meta["domain"]
                 st.session_state.domain_meta = meta
-                st.json(meta)
+            show_gemini_issue(meta.get("gemini_error"))
+            st.json({k: v for k, v in meta.items() if k not in {"scoreboard", "vote_table", "optuna_proba_table"}})
         elif st.session_state.get("domain_meta"):
-            st.json(st.session_state.domain_meta)
+            show_gemini_issue((st.session_state.domain_meta or {}).get("gemini_error"))
+            st.json(
+                {
+                    k: v
+                    for k, v in (st.session_state.domain_meta or {}).items()
+                    if k not in {"scoreboard", "vote_table", "optuna_proba_table"}
+                }
+            )
 
         st.dataframe(df.head(50), use_container_width=True)
 
@@ -3809,6 +3809,7 @@ def page_field() -> None:
     if df is None:
         return
 
+    render_industry_banner(df)
     use_gem = st.checkbox("Use Gemini in domain ensemble", value=bool(get_gemini_api_key()))
     trials = st.slider("Optuna trials for field detect", 8, 40, 20)
     run = st.button("Detect field + build LlamaIndex + best model", type="primary")
@@ -3844,9 +3845,14 @@ def page_field() -> None:
                 "model_card": card,
                 "engineered_cols": [c for c in engineered.columns if c not in df.columns],
             }
+            try:
+                autosave_after_pipeline(title=f"Field · {st.session_state.get('manual_name') or meta.get('domain')}")
+            except Exception:
+                pass
 
     res = st.session_state.field_result
     meta, explain, card = res["meta"], res["explain"], res.get("model_card") or {}
+    show_gemini_issue(meta.get("gemini_error"))
     st.subheader(f"Detected: {meta.get('label')} (`{meta.get('domain')}`)")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Domain confidence", f"{float(meta.get('confidence', 0))*100:.1f}%")
@@ -3906,10 +3912,46 @@ def page_kpis() -> None:
 
     st.write(f"Active field: **{DOMAIN_CATALOG.get(st.session_state.domain, {}).get('label')}** "
              f"(confidence {float(meta.get('confidence', 0))*100:.1f}%)")
+    show_gemini_issue(meta.get("gemini_error") if isinstance(meta, dict) else None)
+    render_industry_banner(df)
 
     filtered = render_filter_bar(df, key_prefix="kpi")
     kpis = get_kpis(filtered)
     render_kpi_boxes(kpis, per_row=4)
+
+    impact = render_dollar_impact(filtered, key_prefix="kpi")
+    field_actions = []
+    if st.session_state.get("field_result"):
+        field_actions = list((st.session_state.field_result.get("model_card") or {}).get("actions") or [])
+    brief = render_manager_brief(
+        insights=st.session_state.get("dashboard_insights") or [],
+        quality_checks=st.session_state.get("clean_checks"),
+        ml_result=st.session_state.get("ml_result"),
+        dollar_impact=impact,
+        field_actions=field_actions,
+        key_prefix="kpi",
+    )
+    if EMAIL_USER and EMAIL_PASSWORD and brief.get("body"):
+        if st.button("Email this brief", key="kpi_email_brief"):
+            try:
+                html = build_html_report(
+                    domain=st.session_state.get("domain") or "generic",
+                    source_name=str(st.session_state.get("manual_name") or "forge.csv"),
+                    kpis=kpis,
+                    insights=brief.get("actions") or [],
+                    ml_result=st.session_state.get("ml_result"),
+                    briefing=brief.get("body") or "",
+                )
+                msg = send_forge_email_report(
+                    OPERATOR_EMAIL,
+                    f"[Analytics Forge v2] Top 3 actions",
+                    brief.get("body") or "",
+                    df=filtered,
+                    html_report=html,
+                )
+                st.success(msg)
+            except Exception as exc:
+                st.error(str(exc))
 
     comparisons = kpi_group_comparisons(filtered)
     st.subheader("Comparisons")
@@ -4100,8 +4142,7 @@ def page_ask() -> None:
     c1.metric("Gemini", "Ready" if gem_ok else "No key")
     c2.metric("LlamaIndex", "Ready" if st.session_state.get("llama_docs") else "Build in Field")
     c3.metric("Offline search", "Always on")
-    if not gem_ok:
-        gemini_key_ui("ask")
+    gemini_key_ui("ask")
 
     df = require_data()
     if df is None:
@@ -4132,6 +4173,10 @@ def page_ask() -> None:
             with st.spinner("LlamaIndex search → Gemini answer..."):
                 out = ask_llama_gemini(q, df)
             st.markdown(out["answer"])
+            if out.get("gemini_error"):
+                show_gemini_issue(out.get("gemini_error"))
+            elif out.get("used_offline_fallback") and gem_ok:
+                st.warning("Gemini did not return an answer — showing the offline Llama/keyword fallback.")
             with st.expander("Search hits (LlamaIndex / keyword)"):
                 for h in out.get("hits") or []:
                     st.write(f"[{h.get('source')} · score={h.get('score')}] {h.get('text')[:350]}")
@@ -4164,6 +4209,7 @@ def page_dashboard() -> None:
     left, right = st.columns([3, 1])
     with right:
         st.subheader("Insights")
+        st.caption("SaaS login + Monday scheduled email = next phase.")
         for insight in st.session_state.get("dashboard_insights") or []:
             st.markdown(f"- {insight}")
         ml = st.session_state.get("ml_result")
@@ -4171,6 +4217,16 @@ def page_dashboard() -> None:
             st.caption(f"Last ML: {ml.get('model_id')} · {ml.get('metrics')}")
         risk = field_predict(filtered if len(filtered) >= 10 else df0)
         st.metric("Live risk", f"{risk}%")
+        render_manager_brief(
+            insights=st.session_state.get("dashboard_insights") or [],
+            quality_checks=st.session_state.get("clean_checks"),
+            ml_result=st.session_state.get("ml_result"),
+            dollar_impact=None,
+            field_actions=list(
+                ((st.session_state.get("field_result") or {}).get("model_card") or {}).get("actions") or []
+            ),
+            key_prefix="dash",
+        )
 
     with left:
         st.subheader("Pinned charts")
@@ -4348,8 +4404,14 @@ def render_sidebar() -> str:
         st.session_state.page = page
 
         st.divider()
+        render_session_sidebar()
+        st.divider()
         if st.button("Start FORGE", type="primary"):
             st.session_state.pipeline_started = True
+            try:
+                autosave_after_pipeline(title=f"FORGE · {st.session_state.get('manual_name') or 'session'}")
+            except Exception:
+                pass
             st.success("Pipeline started")
         st.caption(f"Gemini key: {'yes' if get_gemini_api_key() else 'missing'} · engine={st.session_state.get('clean_engine')}")
         return page

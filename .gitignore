@@ -10,6 +10,8 @@ data/runs/
 data/clean/
 data/raw/
 data/inbound/
+data/sessions/
+.forge_sessions/
 .pytest_cache/
 .DS_Store
 data/live.csv
