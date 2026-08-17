@@ -37,6 +37,17 @@ Paste-in-UI keys are session-only on Render — they do not persist. Use **Envir
 - LIVE without PLC → connection **`buffer_only`**
 - Free tier sleeps after ~15 min idle; first open after sleep can take ~30–60s
 
+## Start command
+
+Render scans `$PORT` (default **10000**). Do **not** put `$PORT` in `render.yaml` — YAML does not expand it, so Streamlit binds the default **8501** and the deploy fails with *Port scan timeout / no open ports*.
+
+`start.sh` binds `${PORT:-10000}` on `0.0.0.0`. Blueprint `startCommand` is `bash start.sh`.
+
+If the service already exists, set it in the dashboard too (Blueprint updates are not always applied):
+
+1. Service → **Settings** → **Build & Deploy** → **Start Command** → `bash start.sh` → Save
+2. **Manual Deploy** → **Deploy latest commit** (the SHA that added `start.sh`)
+
 ## If build fails
 
 - Branch must be **`main`** (or the feature branch if you have not switched yet)
