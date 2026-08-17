@@ -339,6 +339,45 @@ def main() -> int:
         assert DC._metric_col(messy, {}, "sales") != "sales_rep"
         assert DC._date_col(messy, {}) == "sold_on"
 
+        few = pd.DataFrame(
+            {
+                "region": ["East-Region-Name-Long", "West"],
+                "revenue": [10.0, 20.0],
+            }
+        )
+        bar_v = DC.make_readable_bar(few, "region", "revenue", title="rev by region")
+        assert bar_v.data[0].type == "bar"
+        assert getattr(bar_v.data[0], "orientation", None) != "h"
+        assert float(bar_v.layout.xaxis.tickangle) == -40
+        assert int(bar_v.layout.margin.b or 0) >= 120
+        assert bar_v.layout.xaxis.automargin is True
+        ticktext = [str(t) for t in (bar_v.layout.xaxis.ticktext or [])]
+        assert any("…" in t for t in ticktext)
+        assert "East-Region-Name-Long" in [str(v) for v in bar_v.data[0].x]
+        hover = str(bar_v.data[0].hovertemplate or "")
+        assert "customdata" in hover
+
+        many = pd.DataFrame(
+            {
+                "product": [f"Very Long Product Name {i} Extra" for i in range(12)],
+                "revenue": list(range(12, 0, -1)),
+            }
+        )
+        bar_h = DC.make_readable_bar(many, "product", "revenue", title="rev by product")
+        assert getattr(bar_h.data[0], "orientation", None) == "h"
+        assert int(bar_h.layout.margin.l or 0) >= 96
+        assert "Very Long Product Name 0 Extra" in [str(v) for v in bar_h.data[0].y]
+
+        vol = next(s for s in core if s["id"] == "core_volume")
+        assert vol.get("fig") is not None
+        pulse = next(s for s in core if s["id"] == "core_pulse")
+        assert pulse.get("fig") is not None
+        assert float(pulse["fig"].layout.xaxis.tickangle) == -40
+
+        pin_fig = DC.fig_from_pin(few, {"chart_type": "bar", "x": "region", "y": "revenue", "title": "pin bar"})
+        assert pin_fig is not None
+        assert int(pin_fig.layout.margin.b or 0) >= 120
+
         joined = messy.rename(columns={"zone": "warehouse_zone"})
         reset()
         A.st.session_state.manual_df = messy

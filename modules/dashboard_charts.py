@@ -302,14 +302,139 @@ def _sample(df: pd.DataFrame, n: int = 3500) -> pd.DataFrame:
     return df.sample(n, random_state=42)
 
 
-def _apply_layout(fig: go.Figure, title: str) -> go.Figure:
+def _short_tick(val: Any, max_len: int = 18) -> str:
+    text = "" if val is None or (isinstance(val, float) and pd.isna(val)) else str(val)
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
+
+
+def _unique_tick_vals(values: Any) -> list[Any]:
+    out: list[Any] = []
+    seen = set()
+    if values is None:
+        return out
+    for v in list(values):
+        key = "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append("" if key == "" else v)
+    return out
+
+
+def _apply_layout(fig: go.Figure, title: str, *, kind: str = "default", n_cats: int = 0) -> go.Figure:
+    margin = dict(l=48, r=28, t=56, b=56)
+    height = 400
+    if kind == "bar":
+        margin = dict(l=56, r=28, t=56, b=140)
+        height = 480
+    elif kind == "bar_h":
+        margin = dict(l=168, r=28, t=56, b=56)
+        height = max(420, 30 * max(int(n_cats), 4) + 100)
     fig.update_layout(
         title=title,
-        margin=dict(l=40, r=24, t=48, b=40),
+        margin=margin,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-        height=380,
+        height=height,
+        bargap=0.25,
     )
+    tickfont = dict(size=12)
+    if kind == "bar":
+        x_kwargs: dict[str, Any] = dict(tickangle=-40, tickfont=tickfont, automargin=True)
+        try:
+            fig.update_xaxes(ticklabeloverflow="allow", **x_kwargs)
+        except (ValueError, TypeError):
+            fig.update_xaxes(**x_kwargs)
+        fig.update_yaxes(tickfont=tickfont, automargin=True)
+    elif kind == "bar_h":
+        fig.update_yaxes(tickfont=tickfont, automargin=True)
+        fig.update_xaxes(tickfont=tickfont, automargin=True)
+    else:
+        fig.update_xaxes(automargin=True, tickfont=tickfont)
+        fig.update_yaxes(automargin=True, tickfont=tickfont)
     return fig
+
+
+def style_bar_figure(
+    fig: go.Figure,
+    *,
+    n_cats: Optional[int] = None,
+    horizontal: Optional[bool] = None,
+    title: Optional[str] = None,
+) -> go.Figure:
+    """Readable bar ticks: rotate / pad, truncate labels, keep full name on hover."""
+    if fig is None:
+        return fig
+    bar_traces = [tr for tr in fig.data if getattr(tr, "type", None) == "bar"]
+    if not bar_traces:
+        return fig
+    if horizontal is None:
+        horizontal = any(getattr(tr, "orientation", None) == "h" for tr in bar_traces)
+
+    labels: list[str] = []
+    for tr in fig.data:
+        seq = tr.y if horizontal else tr.x
+        labels.extend(_unique_tick_vals(seq))
+    labels = _unique_tick_vals(labels)
+    shorts = [_short_tick(v) for v in labels]
+    n = int(n_cats or len(labels) or 0)
+
+    for tr in bar_traces:
+        seq = tr.y if horizontal else tr.x
+        if seq is None:
+            continue
+        full = ["" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v) for v in list(seq)]
+        tr.customdata = np.array(full).reshape(-1, 1)
+        if horizontal:
+            tr.hovertemplate = "%{customdata[0]}<br>%{x}<extra></extra>"
+        else:
+            tr.hovertemplate = "%{customdata[0]}<br>%{y}<extra></extra>"
+
+    resolved_title = title
+    if resolved_title is None:
+        try:
+            resolved_title = str(fig.layout.title.text or "")
+        except Exception:
+            resolved_title = ""
+    fig = _apply_layout(fig, resolved_title or "", kind="bar_h" if horizontal else "bar", n_cats=n)
+    if labels:
+        tick_kwargs = dict(tickmode="array", tickvals=labels, ticktext=shorts, automargin=True, tickfont=dict(size=12))
+        if horizontal:
+            fig.update_yaxes(**tick_kwargs)
+        else:
+            fig.update_xaxes(tickangle=-40, **tick_kwargs)
+    return fig
+
+
+def make_readable_bar(
+    plot_df: pd.DataFrame,
+    x: str,
+    y: str,
+    *,
+    color: Optional[str] = None,
+    title: str = "",
+    barmode: Optional[str] = None,
+    labels: Optional[dict[str, str]] = None,
+) -> go.Figure:
+    """Charts page / pins / Dashboard bars: horizontal when many categories."""
+    nuniq = 0
+    categorical = False
+    if plot_df is not None and x in plot_df.columns:
+        nuniq = int(plot_df[x].nunique(dropna=False))
+        categorical = not pd.api.types.is_numeric_dtype(plot_df[x])
+    kwargs: dict[str, Any] = {"title": title or f"{y} by {x}"}
+    if color and plot_df is not None and color in plot_df.columns:
+        kwargs["color"] = color
+    if barmode:
+        kwargs["barmode"] = barmode
+    if labels:
+        kwargs["labels"] = labels
+    if categorical and nuniq >= 8:
+        fig = px.bar(plot_df, x=y, y=x, orientation="h", **kwargs)
+        return style_bar_figure(fig, n_cats=nuniq, horizontal=True, title=kwargs["title"])
+    fig = px.bar(plot_df, x=x, y=y, **kwargs)
+    return style_bar_figure(fig, n_cats=nuniq, horizontal=False, title=kwargs["title"])
 
 
 # -----------------------------------------------------------------------------
@@ -329,7 +454,11 @@ def _core_pulse(df: pd.DataFrame, roles: dict[str, str], domain: str) -> dict[st
             if means:
                 plot = pd.DataFrame({"metric": list(means.keys()), "mean": list(means.values())})
                 fig = px.bar(plot, x="metric", y="mean", title="OEE-style component means")
-                return _spec("core_pulse", "Core · OEE-style bars", _apply_layout(fig, "OEE-style component means"))
+                return _spec(
+                    "core_pulse",
+                    "Core · OEE-style bars",
+                    style_bar_figure(fig, n_cats=len(plot), title="OEE-style component means"),
+                )
     nums = _numeric_cols(df)[:6]
     metric = _metric_col(df, roles, domain)
     if metric and metric not in nums:
@@ -342,7 +471,7 @@ def _core_pulse(df: pd.DataFrame, roles: dict[str, str], domain: str) -> dict[st
         return _spec("core_pulse", title, skip_reason="Numeric columns have no finite values.")
     plot = pd.DataFrame({"metric": list(means.keys()), "mean": list(means.values())})
     fig = px.bar(plot, x="metric", y="mean")
-    return _spec("core_pulse", title, _apply_layout(fig, title))
+    return _spec("core_pulse", title, style_bar_figure(fig, n_cats=len(plot), title=title))
 
 
 def _core_volume(df: pd.DataFrame, roles: dict[str, str], domain: str) -> dict[str, Any]:
@@ -362,8 +491,15 @@ def _core_volume(df: pd.DataFrame, roles: dict[str, str], domain: str) -> dict[s
         ylab = "row count"
     g = g.sort_values("value", ascending=False).head(12)
     g[cat] = g[cat].astype(str)
-    fig = px.bar(g, x=cat, y="value", labels={"value": ylab})
-    return _spec("core_volume", title, _apply_layout(fig, f"{ylab} by {cat}"))
+    n_cats = len(g)
+    if n_cats >= 8:
+        g = g.sort_values("value", ascending=True)
+        fig = px.bar(g, x="value", y=cat, orientation="h", labels={"value": ylab})
+        fig = style_bar_figure(fig, n_cats=n_cats, horizontal=True, title=f"{ylab} by {cat}")
+    else:
+        fig = px.bar(g, x=cat, y="value", labels={"value": ylab})
+        fig = style_bar_figure(fig, n_cats=n_cats, horizontal=False, title=f"{ylab} by {cat}")
+    return _spec("core_volume", title, fig)
 
 
 def _core_scatter(df: pd.DataFrame, roles: dict[str, str], domain: str) -> dict[str, Any]:
@@ -504,7 +640,8 @@ def _ext_topn(df: pd.DataFrame, roles: dict[str, str], domain: str) -> dict[str,
     g = g.sort_values("value", ascending=True).tail(n)
     g[cat] = g[cat].astype(str)
     fig = px.bar(g, x="value", y=cat, orientation="h", labels={"value": ylab})
-    return _spec("ext_topn", title, _apply_layout(fig, f"Top {n} {cat} by {ylab}"))
+    fig = style_bar_figure(fig, n_cats=len(g), horizontal=True, title=f"Top {n} {cat} by {ylab}")
+    return _spec("ext_topn", title, fig)
 
 
 def _pareto_frame(labels: pd.Series, values: pd.Series) -> Optional[pd.DataFrame]:
@@ -537,11 +674,12 @@ def _ext_pareto(df: pd.DataFrame, roles: dict[str, str], domain: str) -> dict[st
     g = _pareto_frame(df[cat], df[metric])
     if g is None:
         return _spec("ext_pareto", title, skip_reason=f"`{metric}` by `{cat}` has fewer than 2 positive groups.")
+    ticks = g["label"].astype(str)
     fig = go.Figure()
-    fig.add_bar(x=g["label"], y=g["value"], name=str(metric))
-    fig.add_scatter(x=g["label"], y=g["cum_pct"], name="Cumulative %", yaxis="y2", mode="lines+markers")
+    fig.add_bar(x=ticks, y=g["value"], name=str(metric))
+    fig.add_scatter(x=ticks, y=g["cum_pct"], name="Cumulative %", yaxis="y2", mode="lines+markers")
     fig.add_scatter(
-        x=g["label"],
+        x=ticks,
         y=[80] * len(g),
         name="80%",
         yaxis="y2",
@@ -551,10 +689,10 @@ def _ext_pareto(df: pd.DataFrame, roles: dict[str, str], domain: str) -> dict[st
     fig.update_layout(
         yaxis=dict(title=str(metric)),
         yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0, 105]),
-        xaxis=dict(tickangle=-35),
         barmode="group",
     )
-    return _spec("ext_pareto", title, _apply_layout(fig, f"Pareto of {metric} by {cat}"))
+    fig = style_bar_figure(fig, n_cats=len(g), horizontal=False, title=f"Pareto of {metric} by {cat}")
+    return _spec("ext_pareto", title, fig)
 
 
 def _ext_hist(df: pd.DataFrame, roles: dict[str, str], domain: str) -> dict[str, Any]:
@@ -605,7 +743,8 @@ def _ext_heatmap(df: pd.DataFrame, roles: dict[str, str], domain: str) -> dict[s
                 return _spec("ext_heatmap", f"Extended · {cat1} × {cat2}", _apply_layout(fig, f"{metric} by {cat1} × {cat2}"))
             grouped = work.groupby([cat1, cat2], dropna=False)["_v"].mean().reset_index()
             fig = px.bar(grouped, x=cat1, y="_v", color=cat2, barmode="group", labels={"_v": metric})
-            return _spec("ext_heatmap", title, _apply_layout(fig, f"{metric} by {cat1} × {cat2}"))
+            fig = style_bar_figure(fig, n_cats=int(n1), title=f"{metric} by {cat1} × {cat2}")
+            return _spec("ext_heatmap", title, fig)
 
     nums = _numeric_cols(df)[:8]
     if len(nums) >= 3:
@@ -678,7 +817,8 @@ def fig_from_pin(df: pd.DataFrame, meta: dict[str, Any]) -> Optional[go.Figure]:
             else:
                 fig = px.density_heatmap(plot_df, x=x, y=y)
         else:
-            fig = px.bar(plot_df, x=x, y=y, color=color)
+            fig = make_readable_bar(plot_df, x, y, color=color, title=str(meta.get("title") or f"{y} by {x}"))
+            return fig
         return _apply_layout(fig, str(meta.get("title") or f"{y} by {x}"))
     except Exception:
         return None

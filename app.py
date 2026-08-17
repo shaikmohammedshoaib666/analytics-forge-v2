@@ -39,6 +39,7 @@ from modules.dwdm_sql import (
 )
 from modules.dashboard_charts import (
     assemble_dashboard_export,
+    make_readable_bar,
     render_core_charts,
     render_export_controls,
     render_extended_charts,
@@ -1999,7 +2000,7 @@ def render_adaptive_chart(df: pd.DataFrame, x: str, y: str, chart_type: str, lib
         if chart_type == "line":
             fig = px.line(plot_df, x=x, y=y, color=color, title=f"{y} by {x}")
         elif chart_type == "bar":
-            fig = px.bar(plot_df, x=x, y=y, color=color, title=f"{y} by {x}")
+            fig = make_readable_bar(plot_df, x, y, color=color, title=f"{y} by {x}")
         elif chart_type == "scatter":
             fig = px.scatter(plot_df, x=x, y=y, color=color, title=f"{y} vs {x}")
         elif chart_type == "pie":
@@ -2017,13 +2018,20 @@ def render_adaptive_chart(df: pd.DataFrame, x: str, y: str, chart_type: str, lib
     import matplotlib.pyplot as plt
     import seaborn as sns
 
-    fig, ax = plt.subplots(figsize=(9, 4.5))
+    n_cats = int(plot_df[x].nunique(dropna=False)) if x in plot_df.columns else 0
+    categorical = x in plot_df.columns and not pd.api.types.is_numeric_dtype(plot_df[x])
+    use_h = chart_type == "bar" and categorical and n_cats >= 8
+    fig_w, fig_h = (9, max(4.8, 0.32 * n_cats + 1.6)) if use_h else (9, 5.4)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     try:
         if library == "seaborn":
             if chart_type == "line":
                 sns.lineplot(data=plot_df, x=x, y=y, hue=color, ax=ax)
             elif chart_type == "bar":
-                sns.barplot(data=plot_df, x=x, y=y, hue=color, ax=ax, errorbar=None)
+                if use_h:
+                    sns.barplot(data=plot_df, x=y, y=x, hue=color, ax=ax, errorbar=None, orient="h")
+                else:
+                    sns.barplot(data=plot_df, x=x, y=y, hue=color, ax=ax, errorbar=None)
             elif chart_type == "scatter":
                 sns.scatterplot(data=plot_df, x=x, y=y, hue=color, ax=ax)
             elif chart_type == "pie":
@@ -2041,8 +2049,11 @@ def render_adaptive_chart(df: pd.DataFrame, x: str, y: str, chart_type: str, lib
                 ax.plot(plot_df[x], pd.to_numeric(plot_df[y], errors="coerce"))
             elif chart_type == "bar":
                 g = plot_df.groupby(x, dropna=False)[y].mean()
-                ax.bar(g.index.astype(str), g.values)
-                ax.tick_params(axis="x", rotation=45)
+                labels = [str(i) if len(str(i)) <= 18 else str(i)[:17] + "…" for i in g.index]
+                if use_h:
+                    ax.barh(labels, g.values)
+                else:
+                    ax.bar(labels, g.values)
             elif chart_type == "scatter":
                 ax.scatter(pd.to_numeric(plot_df[x], errors="coerce"), pd.to_numeric(plot_df[y], errors="coerce"), alpha=0.7)
             elif chart_type == "pie":
@@ -2051,6 +2062,20 @@ def render_adaptive_chart(df: pd.DataFrame, x: str, y: str, chart_type: str, lib
             else:
                 ax.hist(pd.to_numeric(plot_df[y], errors="coerce").dropna(), bins=20)
         ax.set_title(f"{y} by {x}")
+        if chart_type == "bar":
+            tick_labels = ax.get_yticklabels() if use_h else ax.get_xticklabels()
+            for lbl in tick_labels:
+                text = lbl.get_text()
+                if len(text) > 18:
+                    lbl.set_text(text[:17] + "…")
+            if use_h:
+                ax.tick_params(axis="y", labelsize=11)
+                fig.subplots_adjust(left=0.28, bottom=0.12, right=0.98, top=0.90)
+            else:
+                plt.setp(ax.get_xticklabels(), rotation=40, ha="right", fontsize=11)
+                fig.subplots_adjust(bottom=0.32, left=0.10, right=0.98, top=0.90)
+        else:
+            fig.tight_layout()
         st.pyplot(fig, clear_figure=True)
     finally:
         plt.close(fig)
