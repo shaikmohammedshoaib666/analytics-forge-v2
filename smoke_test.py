@@ -429,6 +429,23 @@ def main() -> int:
         assert DC._metric_col(messy, {}, "sales") != "sales_rep"
         assert DC._date_col(messy, {}) == "sold_on"
 
+        # Short hourly span uses resample("h") — uppercase "H" crashes pandas 2.2+/3.
+        hourly = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=48, freq="h"),
+                "vibration": rng.normal(0.5, 0.08, 48),
+                "machine_id": rng.choice(["M1", "M2"], 48),
+            }
+        )
+        hourly_roles = {"timestamp": "timestamp", "vibration": "sensor", "machine_id": "asset"}
+        hourly_ext = DC.build_extended_charts(
+            hourly, roles=hourly_roles, domain="predictive_maintenance"
+        )
+        hourly_ts = next(s for s in hourly_ext if s["id"] == "ext_timeseries")
+        assert hourly_ts.get("fig") is not None, hourly_ts.get("skip_reason")
+        pd.date_range("2024-01-01", periods=3, freq="h")
+        hourly.set_index("timestamp")["vibration"].resample("h").mean()
+
         few = pd.DataFrame(
             {
                 "region": ["East-Region-Name-Long", "West"],

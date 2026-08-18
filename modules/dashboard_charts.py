@@ -608,7 +608,8 @@ def _ext_timeseries(df: pd.DataFrame, roles: dict[str, str], domain: str) -> dic
     if work.empty:
         return _spec("ext_timeseries", title, skip_reason=f"`{dcol}` did not parse as dates or `{metric}` is empty.")
     span = work["_dt"].max() - work["_dt"].min()
-    rule = "H" if pd.notna(span) and span <= pd.Timedelta(days=3) else "D"
+    # pandas 2.2+/3 dropped uppercase offset aliases (H → h); lowercase works on 2.0+.
+    rule = "h" if pd.notna(span) and span <= pd.Timedelta(days=3) else "D"
     grouped = work.set_index("_dt")["_v"].resample(rule).sum().reset_index()
     grouped.columns = ["period", metric]
     if grouped[metric].fillna(0).sum() == 0:

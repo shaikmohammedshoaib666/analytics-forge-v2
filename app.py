@@ -2534,7 +2534,8 @@ def prophet_forecast(df: pd.DataFrame, target: str) -> str:
                 break
     if date_col is None:
         # synthesize index timeline for SCADA buffer
-        ds = pd.date_range(end=datetime.utcnow(), periods=len(df), freq="H")
+        # pandas 2.2+/3 dropped uppercase offset aliases (H → h); lowercase works on 2.0+.
+        ds = pd.date_range(end=datetime.utcnow(), periods=len(df), freq="h")
     else:
         ds = pd.to_datetime(df[date_col], errors="coerce")
 
@@ -2548,12 +2549,12 @@ def prophet_forecast(df: pd.DataFrame, target: str) -> str:
 
     m = Prophet(uncertainty_samples=100)
     m.fit(tmp)
-    # Infer freq
+    # Infer freq (pandas 2.0 may still return H/T; 2.2+/3 require h/min)
     freq = pd.infer_freq(tmp["ds"]) or "D"
-    # 90 days ahead — if hourly-ish use 90*24
     if freq in {"H", "h", "T", "min"}:
         periods = 90 * 24
         horizon_days = 90
+        freq = {"H": "h", "T": "min"}.get(freq, freq)
     else:
         periods = 90
         horizon_days = 90
