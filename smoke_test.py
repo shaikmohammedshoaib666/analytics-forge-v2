@@ -80,6 +80,7 @@ def main() -> int:
             forge_session_id=None,
             forge_session_title="",
             last_gemini_error="",
+            domain_user_override=False,
         )
 
     rng = np.random.default_rng(0)
@@ -118,8 +119,73 @@ def main() -> int:
         assert len(checks) >= 15
 
     check("clean", clean)
-    check("field PdM", lambda: (_ for _ in ()).throw(AssertionError(A.detect_field(pdm, False, 8)["domain"])) if A.detect_field(pdm, False, 8)["domain"] != "predictive_maintenance" else None)
-    check("field sales", lambda: (_ for _ in ()).throw(AssertionError(A.detect_field(sales, False, 8)["domain"])) if A.detect_field(sales, False, 8)["domain"] != "sales_forecasting" else None)
+    check("field PdM", lambda: (_ for _ in ()).throw(AssertionError(A.detect_field(pdm, False, 3)["domain"])) if A.detect_field(pdm, False, 3)["domain"] != "predictive_maintenance" else None)
+    check("field sales", lambda: (_ for _ in ()).throw(AssertionError(A.detect_field(sales, False, 3)["domain"])) if A.detect_field(sales, False, 3)["domain"] != "sales_forecasting" else None)
+
+    students = pd.DataFrame(
+        {
+            "student_id": [f"S{i}" for i in range(30)],
+            "age": rng.integers(16, 22, 30),
+            "math_score": rng.integers(40, 100, 30),
+            "reading_score": rng.integers(40, 100, 30),
+            "writing_score": rng.integers(40, 100, 30),
+            "gender": rng.choice(["M", "F"], 30),
+        }
+    )
+
+    def field_student():
+        import time as _t
+        t0 = _t.perf_counter()
+        meta = A.detect_field(students, False, 3)
+        elapsed = _t.perf_counter() - t0
+        assert meta["domain"] == "education", meta["domain"]
+        assert meta["domain"] != "healthcare"
+        assert elapsed < 12, elapsed
+        t1 = _t.perf_counter()
+        A.detect_field(students, False, 3)
+        assert (_t.perf_counter() - t1) < 1.5
+
+    check("field student fast", field_student)
+
+    def dwdm_labs():
+        from modules import dwdm_labs as L
+
+        star = L.build_star_schema(
+            students,
+            date_col=None,
+            entity_col="student_id",
+            fact_cols=["math_score", "reading_score"],
+        )
+        assert star["ok"] and len(star["fact"]) >= 1 and "entity_dim" in star["dims"]
+        txn = pd.DataFrame(
+            {
+                "order_id": [f"o{i//2}" for i in range(24)],
+                "item": (["A", "B", "A", "C", "B", "C"] * 4),
+            }
+        )
+        mined = L.mine_apriori(L.baskets_from_txn(txn, "order_id", "item"), min_support=0.2, min_confidence=0.4)
+        assert mined["ok"] and len(mined["rules"]) >= 1
+        empty = L.mine_apriori([])
+        assert not empty["ok"]
+        km = L.assign_kmeans(students, ["math_score", "reading_score"], k=3, silhouette=True)
+        assert km["ok"] and "cluster_id" in km["frame"].columns
+        dirty = students.copy()
+        dirty.loc[0:3, "math_score"] = np.nan
+        mice = L.mice_impute(dirty, ["math_score", "reading_score"], max_iter=4)
+        assert mice["ok"] and mice["n_imputed"] >= 1 and mice["frame"]["math_score"].isna().sum() == 0
+
+    check("dwdm labs helpers", dwdm_labs)
+
+    def override_wins():
+        reset()
+        A.st.session_state.domain_user_override = True
+        A.st.session_state.domain = "education"
+        A.st.session_state.forge_domain = "education"
+        meta = A.detect_field(pdm, False, 3)
+        assert meta["domain"] == "education"
+        assert meta.get("overridden")
+
+    check("domain override wins", override_wins)
     check("ml RF", lambda: (_ for _ in ()).throw(AssertionError("ml")) if not A.run_forge_model(pdm, "RandomForestRegressor", target="rul").get("ok") else None)
     check("llama", lambda: A.ensure_llama_index(pdm, True))
 
@@ -271,6 +337,28 @@ def main() -> int:
         )
         assert len(brief["actions"]) == 3
 
+        students = pd.DataFrame(
+            {
+                "student_id": [f"S{i}" for i in range(24)],
+                "age": rng.integers(16, 22, 24),
+                "math_score": rng.integers(40, 100, 24),
+                "reading_score": rng.integers(40, 100, 24),
+                "gender": rng.choice(["M", "F"], 24),
+            }
+        )
+        stypes = D.detect_column_types(students)
+        smeta = D.detect_domain(students, stypes)
+        assert smeta["domain"] == "education", smeta
+        weak = pd.DataFrame({"age": rng.integers(10, 18, 12), "score": rng.integers(50, 90, 12)})
+        wmeta = D.detect_domain(weak, D.detect_column_types(weak))
+        assert wmeta["domain"] not in {"health", "healthcare"}
+
+        gone = F.new_session_id()
+        F.save_session(gone, title="to_delete", source_name="x.csv", frames={"clean_df": pdm}, meta={})
+        assert F.session_exists(gone)
+        assert F.delete_session(gone)
+        assert not F.session_exists(gone)
+
         prev_key = os.environ.get("GEMINI_API_KEY")
         os.environ["GEMINI_API_KEY"] = "forge-env-key-smoke"
         try:
@@ -285,6 +373,8 @@ def main() -> int:
 
     def dashboard_charts_helpers():
         from modules import dashboard_charts as DC
+
+        rng = np.random.default_rng(0)
 
         roles = {"date": "date", "revenue": "revenue", "region": "region", "customer_id": "customer_id"}
         core = DC.build_core_charts(sales, roles=roles, domain="sales")

@@ -18,6 +18,8 @@ FORGE_DOMAINS = (
     "predictive_maintenance",
     "plant_oee",
     "quality",
+    "education",
+    "health",
 )
 
 FORGE_DOMAIN_LABELS: dict[str, str] = {
@@ -28,6 +30,8 @@ FORGE_DOMAIN_LABELS: dict[str, str] = {
     "predictive_maintenance": "Predictive Maintenance",
     "plant_oee": "Plant / OEE",
     "quality": "Quality / Defects",
+    "education": "Education / Student",
+    "health": "Health / Hospital",
 }
 
 # Bridge OS domain → app.py DOMAIN_CATALOG key for downstream KPIs / ML hints.
@@ -39,7 +43,21 @@ OS_TO_APP_DOMAIN: dict[str, str] = {
     "predictive_maintenance": "predictive_maintenance",
     "plant_oee": "generic",
     "quality": "warehouse_logistics",
+    "education": "education",
+    "health": "healthcare",
 }
+
+APP_TO_OS_DOMAIN: dict[str, str] = {
+    "generic": "generic",
+    "sales_forecasting": "sales",
+    "telecom_churn": "churn",
+    "predictive_maintenance": "predictive_maintenance",
+    "warehouse_logistics": "quality",
+    "healthcare": "health",
+    "education": "education",
+}
+
+DOMAIN_OVERRIDE_LOW_CONF = 0.70
 
 BASE_ROLES: tuple[str, ...] = ("id", "date", "category", "metric", "unused")
 
@@ -60,6 +78,8 @@ DOMAIN_ROLE_PACKS: dict[str, tuple[str, ...]] = {
         "quality",
     ),
     "quality": ("scrap", "defect", "fpy", "batch", "spec_limit"),
+    "education": ("student_id", "grade", "score", "course", "attendance"),
+    "health": ("patient_id", "diagnosis", "bmi", "readmission"),
 }
 
 # Legacy alias — full role list for plant-heavy default (backward compat in tests).
@@ -198,6 +218,18 @@ def _score_domain(
             "strong": ("defect", "fpy", "first_pass", "reject", "ncr", "spec_limit", "batch"),
             "weak": ("scrap", "quality", "inspection", "ppm", "cpk"),
         },
+        "education": {
+            "strong": (
+                "student", "gpa", "marks", "exam", "attendance", "assignment", "course",
+                "math_score", "reading_score", "writing_score", "cgpa",
+            ),
+            "weak": ("grade", "school", "university", "subject", "credits"),
+        },
+        "health": {
+            "strong": ("patient", "hospital", "bmi", "glucose", "readmission", "diagnosis", "icd", "ward", "spo2"),
+            "weak": ("age", "weight", "height", "bp", "blood", "pulse"),
+            "require_strong": True,
+        },
     }
 
     if dom == "generic":
@@ -211,8 +243,14 @@ def _score_domain(
 
     for k in meta.get("weak", ()):
         if k in toks or k in col_join:
-            score += 1.2
+            score += 0.6
             reasons.append(f"signal: {k}")
+
+    if meta.get("require_strong"):
+        strong_hit = any(k in toks or k in col_join for k in meta.get("strong", ()))
+        if not strong_hit:
+            score = min(score, 0.4)
+            reasons.append("weak names only — not locked")
 
     if meta.get("needs_date"):
         date_cols = sum(1 for t in column_types.values() if t == "date")
@@ -227,12 +265,14 @@ def _score_domain(
             reasons.append(f"numeric sensor ratio {num_ratio:.0%}")
 
     neg_rules = {
-        "sales": ("vibration", "rul", "patient", "churn", "downtime", "oee"),
-        "forecasting": ("vibration", "patient", "churn", "failure"),
-        "churn": ("vibration", "revenue", "sku", "oee", "sensor"),
-        "predictive_maintenance": ("revenue", "sku", "churn", "patient", "order"),
-        "plant_oee": ("churn", "patient", "revenue", "sku"),
-        "quality": ("churn", "patient", "revenue"),
+        "sales": ("vibration", "rul", "patient", "churn", "downtime", "oee", "student", "gpa"),
+        "forecasting": ("vibration", "patient", "churn", "failure", "student"),
+        "churn": ("vibration", "revenue", "sku", "oee", "sensor", "student", "gpa"),
+        "predictive_maintenance": ("revenue", "sku", "churn", "patient", "order", "student", "gpa"),
+        "plant_oee": ("churn", "patient", "revenue", "sku", "student", "gpa"),
+        "quality": ("churn", "patient", "revenue", "student", "gpa"),
+        "education": ("patient", "hospital", "bmi", "glucose", "readmission", "vibration", "oee", "rul"),
+        "health": ("student", "gpa", "marks", "exam", "attendance", "assignment", "course", "sku", "churn"),
     }
     for k in neg_rules.get(dom, ()):
         if k in toks or k in col_join:
@@ -367,6 +407,15 @@ def suggest_roles(
         "fpy": ("fpy", "first_pass", "first_pass_yield"),
         "batch": ("batch", "lot", "run_id"),
         "spec_limit": ("spec", "usl", "lsl", "tolerance", "limit"),
+        "student_id": ("student_id", "student", "learner_id", "roll_no", "roll_number"),
+        "grade": ("grade", "letter_grade", "final_grade"),
+        "score": ("score", "marks", "gpa", "cgpa", "points"),
+        "course": ("course", "subject", "class_name", "module"),
+        "attendance": ("attendance", "absent", "present"),
+        "patient_id": ("patient_id", "patient", "mrn"),
+        "diagnosis": ("diagnosis", "icd", "condition"),
+        "bmi": ("bmi",),
+        "readmission": ("readmission", "readmit"),
         "category": ("category", "type", "class", "shift", "location", "department"),
         "metric": ("metric", "value", "score", "rate", "index"),
     }
@@ -433,6 +482,8 @@ def domain_pipeline_hint(domain: str) -> str:
         "predictive_maintenance": "Map **failure_label** if available; **ML** for risk scores. Deep reliability → dedicated PdM app.",
         "plant_oee": "Plant / OEE pack — use **OEE Pulse** for weekly plant ritual; Forge handles clean + insights here.",
         "quality": "Map **defect** / **fpy** columns; **Ask** for defect patterns; **ML** for defect-rate models.",
+        "education": "Map **student_id** / **score**; **Ask** for cohort questions; **ML** for grade models. Override if this is not student data.",
+        "health": "Map **patient_id** / clinical fields; **ML** is triage support — not a diagnosis. Override if this is not health data.",
         "generic": "Pipeline: **Detect → Map → Ask** (LlamaIndex/Gemini) or **Train** (Optuna on ML page).",
     }
     return hints.get(domain, hints["generic"])

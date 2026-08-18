@@ -22,7 +22,8 @@ _APP_TO_FORGE = {
     "predictive_maintenance": "predictive_maintenance",
     "warehouse_logistics": "quality",
     "finance_risk": "generic",
-    "healthcare": "generic",
+    "healthcare": "health",
+    "education": "education",
     "energy_utilities": "generic",
     "agriculture_iot": "generic",
     "hr_people": "churn",
@@ -279,6 +280,8 @@ def _loss_col(df: pd.DataFrame, roles: dict[str, str], domain: str) -> Optional[
 
 
 def _to_numeric(series: pd.Series) -> pd.Series:
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
     return pd.to_numeric(series, errors="coerce")
 
 

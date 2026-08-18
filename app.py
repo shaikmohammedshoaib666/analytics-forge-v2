@@ -44,6 +44,17 @@ from modules.dashboard_charts import (
     render_export_controls,
     render_extended_charts,
 )
+from modules.dwdm_labs import (
+    apriori_need_txn_hint,
+    assign_kmeans,
+    baskets_from_txn,
+    baskets_row_bins,
+    build_star_schema,
+    mice_impute,
+    mine_apriori,
+    numeric_columns as lab_numeric_columns,
+)
+from modules.domain_detect import APP_TO_OS_DOMAIN, OS_TO_APP_DOMAIN
 from modules.forge_os import (
     autosave_after_pipeline,
     gemini_issue_from_raw,
@@ -59,6 +70,7 @@ from modules.forge_os import (
     render_manager_brief,
     render_mapping_ui,
     render_session_sidebar,
+    reset_domain_pick_for_new_frame,
     show_gemini_issue,
 )
 from sklearn.ensemble import (
@@ -175,6 +187,7 @@ def init_state() -> None:
         "forge_session_id": None,
         "forge_session_title": "",
         "last_gemini_error": "",
+        "domain_user_override": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -198,14 +211,17 @@ DOMAIN_CATALOG: dict[str, dict[str, Any]] = {
     "healthcare": {
         "label": "Healthcare / Hospital",
         "keywords": [
-            "patient", "age", "bmi", "bp", "blood", "glucose", "heart", "diagnosis",
-            "admit", "ward", "doctor", "hospital", "readmission", "weight", "height",
+            "patient", "bmi", "bp", "blood", "glucose", "heart", "diagnosis",
+            "admit", "ward", "doctor", "hospital", "readmission",
             "cholesterol", "pulse", "spo2", "systolic", "diastolic", "icd",
         ],
-        "exclusive": ["patient", "bmi", "glucose", "readmission", "spo2", "cholesterol", "ward"],
-        "negative": ["vibration", "rul", "sku", "churn", "kwh", "modbus"],
+        "exclusive": ["patient", "bmi", "glucose", "readmission", "spo2", "cholesterol", "ward", "hospital", "icd"],
+        "negative": [
+            "vibration", "rul", "sku", "churn", "kwh", "modbus",
+            "student", "gpa", "marks", "exam", "attendance", "assignment", "course",
+        ],
         "dtypes_hint": "mixed_clinical",
-        "value_hints": {"age": (0, 120), "bmi": (10, 60), "glucose": (40, 600)},
+        "value_hints": {"bmi": (10, 60), "glucose": (40, 600)},
     },
     "sales_forecasting": {
         "label": "Sales / Retail / Revenue",
@@ -243,11 +259,11 @@ DOMAIN_CATALOG: dict[str, dict[str, Any]] = {
     "finance_risk": {
         "label": "Finance / Credit Risk",
         "keywords": [
-            "loan", "credit", "score", "default", "interest", "balance", "emi", "income",
+            "loan", "credit", "credit_score", "default", "interest", "balance", "emi", "income",
             "fraud", "transaction", "amount", "apr", "collateral", "delinquent",
         ],
         "exclusive": ["loan", "credit", "default", "emi", "apr", "fraud", "delinquent"],
-        "negative": ["vibration", "patient", "soil", "modbus", "warehouse"],
+        "negative": ["vibration", "patient", "soil", "modbus", "warehouse", "student", "gpa", "marks", "exam"],
         "dtypes_hint": "tabular_finance",
         "value_hints": {},
     },
@@ -280,9 +296,21 @@ DOMAIN_CATALOG: dict[str, dict[str, Any]] = {
             "manager", "job", "satisfaction", "overtime", "hr", "headcount",
         ],
         "exclusive": ["employee", "attrition", "salary", "department", "headcount"],
-        "negative": ["vibration", "patient", "soil", "modbus", "kwh"],
+        "negative": ["vibration", "patient", "soil", "modbus", "kwh", "student", "gpa"],
         "dtypes_hint": "hrm",
         "value_hints": {},
+    },
+    "education": {
+        "label": "Education / Student",
+        "keywords": [
+            "student", "grade", "gpa", "marks", "exam", "course", "assignment",
+            "attendance", "school", "university", "subject", "credits", "cgpa",
+            "math_score", "reading_score", "writing_score",
+        ],
+        "exclusive": ["student", "gpa", "marks", "exam", "attendance", "assignment", "math_score", "reading_score", "writing_score"],
+        "negative": ["patient", "hospital", "bmi", "glucose", "vibration", "rul", "oee", "modbus"],
+        "dtypes_hint": "education",
+        "value_hints": {"gpa": (0, 10), "attendance": (0, 100)},
     },
     "generic": {
         "label": "Generic Analytics",
@@ -1283,10 +1311,15 @@ def _heuristic_field_scores(df: pd.DataFrame) -> tuple[dict[str, float], dict[st
             sc += 0.8
         if meta.get("dtypes_hint") == "commerce" and any(k in toks for k in ("revenue", "sales", "order", "gmv")):
             sc += 1.5
-        if meta.get("dtypes_hint") == "mixed_clinical" and any(k in toks for k in ("patient", "bmi", "glucose")):
+        if meta.get("dtypes_hint") == "mixed_clinical" and any(k in toks for k in ("patient", "bmi", "glucose", "hospital")):
             sc += 1.5
         if meta.get("dtypes_hint") == "crm" and any(k in toks for k in ("churn", "arpu", "tenure")):
             sc += 1.5
+        if meta.get("dtypes_hint") == "education" and any(k in toks for k in ("student", "gpa", "marks", "exam", "attendance")):
+            sc += 1.5
+        if dom == "healthcare" and not any(str(h).startswith("EXCL:") for h in hit):
+            sc = min(sc, 0.8)
+            hit.append("weak-only")
         # value-range fingerprints
         for hint_col, (lo, hi) in (meta.get("value_hints") or {}).items():
             real = _col(df, hint_col)
@@ -1326,7 +1359,8 @@ def _schema_feature_vector(df: pd.DataFrame) -> np.ndarray:
     return np.asarray(feats, dtype=float)
 
 
-def _synthetic_domain_training_set(n_per: int = 40) -> tuple[np.ndarray, np.ndarray, list[str]]:
+def _synthetic_domain_training_set(n_per: int = 12) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Tiny fingerprint matrix (column-name features), not the full user df."""
     """Build synthetic schema vectors so Optuna can tune a domain classifier without labels."""
     rng = np.random.default_rng(42)
     domain_keys = [d for d in DOMAIN_CATALOG if d != "generic"]
@@ -1357,16 +1391,25 @@ def _synthetic_domain_training_set(n_per: int = 40) -> tuple[np.ndarray, np.ndar
     return np.vstack(X_rows), np.asarray(y), domain_keys
 
 
-@st.cache_resource(show_spinner=False)
-def _fit_optuna_field_model(n_trials: int = 25) -> dict[str, Any]:
-    """Optuna-tunes RF/GBM for domain classification on synthetic schema fingerprints."""
+_OPTUNA_FIELD_CACHE: dict[int, dict[str, Any]] = {}
+FIELD_DETECT_DEFAULT_TRIALS = 3
+FIELD_DETECT_MAX_TRIALS = 40
+FIELD_DETECT_HIGH_CONF = 0.72
+
+
+def _fit_optuna_field_model(n_trials: int = 3) -> dict[str, Any]:
+    """Optuna-tunes a small RF/GBM on schema fingerprints. Cached per n_trials."""
+    n_trials = max(1, min(FIELD_DETECT_MAX_TRIALS, int(n_trials or FIELD_DETECT_DEFAULT_TRIALS)))
+    hit = _OPTUNA_FIELD_CACHE.get(n_trials)
+    if hit and hit.get("ok"):
+        return hit
     try:
         import optuna
         optuna.logging.set_verbosity(optuna.logging.WARNING)
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
-    X, y, domains = _synthetic_domain_training_set(40)
+    X, y, domains = _synthetic_domain_training_set(12)
     le = LabelEncoder()
     y_enc = le.fit_transform(y)
 
@@ -1374,20 +1417,20 @@ def _fit_optuna_field_model(n_trials: int = 25) -> dict[str, Any]:
         model_name = trial.suggest_categorical("model", ["RandomForest", "GradientBoosting"])
         if model_name == "RandomForest":
             model = RandomForestClassifier(
-                n_estimators=trial.suggest_int("n_estimators", 80, 250),
-                max_depth=trial.suggest_int("max_depth", 3, 16),
-                min_samples_leaf=trial.suggest_int("min_samples_leaf", 1, 5),
+                n_estimators=trial.suggest_int("n_estimators", 20, 50),
+                max_depth=trial.suggest_int("max_depth", 3, 8),
+                min_samples_leaf=trial.suggest_int("min_samples_leaf", 1, 4),
                 random_state=42,
                 n_jobs=-1,
             )
         else:
             model = GradientBoostingClassifier(
-                n_estimators=trial.suggest_int("n_estimators", 60, 180),
-                max_depth=trial.suggest_int("max_depth", 2, 6),
-                learning_rate=trial.suggest_float("learning_rate", 0.03, 0.25, log=True),
+                n_estimators=trial.suggest_int("n_estimators", 20, 40),
+                max_depth=trial.suggest_int("max_depth", 2, 4),
+                learning_rate=trial.suggest_float("learning_rate", 0.05, 0.25, log=True),
                 random_state=42,
             )
-        scores = cross_val_score(model, X, y_enc, cv=4, scoring="accuracy")
+        scores = cross_val_score(model, X, y_enc, cv=2, scoring="accuracy")
         return float(scores.mean())
 
     study = optuna.create_study(direction="maximize")
@@ -1399,7 +1442,7 @@ def _fit_optuna_field_model(n_trials: int = 25) -> dict[str, Any]:
     else:
         model = GradientBoostingClassifier(random_state=42, **best)
     model.fit(X, y_enc)
-    return {
+    pack = {
         "ok": True,
         "model": model,
         "label_encoder": le,
@@ -1408,9 +1451,11 @@ def _fit_optuna_field_model(n_trials: int = 25) -> dict[str, Any]:
         "cv_accuracy": round(float(study.best_value), 4),
         "n_trials": n_trials,
     }
+    _OPTUNA_FIELD_CACHE[n_trials] = pack
+    return pack
 
 
-def _optuna_predict_field(df: pd.DataFrame, n_trials: int = 25) -> dict[str, Any]:
+def _optuna_predict_field(df: pd.DataFrame, n_trials: int = 3) -> dict[str, Any]:
     pack = _fit_optuna_field_model(n_trials=n_trials)
     if not pack.get("ok"):
         return {"ok": False, "error": pack.get("error", "optuna field model failed")}
@@ -1439,14 +1484,45 @@ def _optuna_predict_field(df: pd.DataFrame, n_trials: int = 25) -> dict[str, Any
     return {"ok": True, "domain": dom, "confidence": 0.7, "ranking": [{"domain": dom, "prob": 0.7}], "best_params": pack["best_params"], "cv_accuracy": pack["cv_accuracy"], "proba_table": pd.DataFrame([{"domain": dom, "prob": 0.7}])}
 
 
-def detect_field(df: pd.DataFrame, use_gemini: bool = True, optuna_trials: int = 25) -> dict[str, Any]:
-    """
-    Multi-signal field detection:
-    1) keyword/exclusive/negative + value-range heuristics
-    2) Optuna-tuned RF/GBM on schema fingerprints
-    3) Gemini LLM schema classify (optional)
-    Ensemble votes → final domain + confidence + scoreboard dataframes.
-    """
+def _field_col_signature(df: pd.DataFrame) -> str:
+    return f"{len(df)}|{df.shape[1]}|{','.join(str(c) for c in df.columns)}"
+
+
+def _lock_field_to_user_override(result: dict[str, Any]) -> dict[str, Any]:
+    if not st.session_state.get("domain_user_override"):
+        return result
+    app_dom = str(st.session_state.get("domain") or "generic")
+    if app_dom not in DOMAIN_CATALOG:
+        app_dom = "generic"
+    out = dict(result)
+    out["detected_domain"] = result.get("domain")
+    out["domain"] = app_dom
+    out["label"] = DOMAIN_CATALOG.get(app_dom, {}).get("label", app_dom)
+    out["overridden"] = True
+    out["forge_domain"] = st.session_state.get("forge_domain")
+    return out
+
+
+def apply_detected_domain(meta: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+    """Write Field/app domain unless the user already overrode on Upload or Field."""
+    meta = _lock_field_to_user_override(meta)
+    if st.session_state.get("domain_user_override") and not force:
+        return meta
+    st.session_state.domain = meta.get("domain") or "generic"
+    st.session_state.domain_meta = meta
+    os_key = APP_TO_OS_DOMAIN.get(str(meta.get("domain") or ""), st.session_state.get("forge_domain") or "generic")
+    st.session_state.forge_domain = os_key
+    return meta
+
+
+def detect_field(df: pd.DataFrame, use_gemini: bool = True, optuna_trials: int = 3) -> dict[str, Any]:
+    """Heuristic O(columns) first; Optuna on a tiny fingerprint matrix; Gemini optional."""
+    optuna_trials = max(1, min(FIELD_DETECT_MAX_TRIALS, int(optuna_trials or FIELD_DETECT_DEFAULT_TRIALS)))
+    sig = f"{_field_col_signature(df)}|g{int(bool(use_gemini))}|t{optuna_trials}"
+    cached = st.session_state.get("_field_detect_cache")
+    if isinstance(cached, dict) and cached.get("sig") == sig and isinstance(cached.get("result"), dict):
+        return _lock_field_to_user_override(cached["result"])
+
     scores, reasons, scoreboard = _heuristic_field_scores(df)
     if scores:
         heur = max(scores, key=scores.get)
@@ -1472,8 +1548,9 @@ def detect_field(df: pd.DataFrame, use_gemini: bool = True, optuna_trials: int =
         prompt = (
             "Classify this dataset into ONE domain key from: "
             + ", ".join(DOMAIN_CATALOG.keys())
-            + ".\nPrefer exclusive signals (e.g. churn→telecom_churn, patient/bmi→healthcare, "
-            "revenue/sku→sales_forecasting, vibration/rul→predictive_maintenance).\n"
+            + ".\nPrefer exclusive signals (e.g. churn→telecom_churn, student/gpa→education, "
+            "patient/bmi→healthcare, revenue/sku→sales_forecasting, vibration/rul→predictive_maintenance). "
+            "Do NOT pick healthcare from weak names like age or score.\n"
             "Return JSON only: {\"domain\": \"...\", \"confidence\": 0-1, \"why\": \"...\"}\n"
             f"Columns/dtypes/samples: {json.dumps(schema)[:4500]}"
         )
@@ -1498,7 +1575,6 @@ def detect_field(df: pd.DataFrame, use_gemini: bool = True, optuna_trials: int =
             except Exception:
                 pass
 
-    # Weighted ensemble (exclusive heuristic hard-wins when strong)
     vote: dict[str, float] = {}
     for d, sc in scores.items():
         vote[d] = vote.get(d, 0.0) + 0.35 * (sc / max(1.0, max(scores.values()) or 1.0))
@@ -1507,11 +1583,12 @@ def detect_field(df: pd.DataFrame, use_gemini: bool = True, optuna_trials: int =
     if gemini_domain and gemini_domain in DOMAIN_CATALOG:
         vote[gemini_domain] = vote.get(gemini_domain, 0.0) + 0.25 * gconf
 
-    # Hard boost: if exclusive hits ≥2 for a domain, lock preference
     for d, hits in reasons.items():
         excl = sum(1 for h in hits if str(h).startswith("EXCL:"))
         if excl >= 2:
             vote[d] = vote.get(d, 0.0) + 0.35
+        elif d == "healthcare" and excl == 0:
+            vote[d] = min(vote.get(d, 0.0), 0.15)
 
     if vote:
         final = max(vote, key=vote.get)
@@ -1519,19 +1596,46 @@ def detect_field(df: pd.DataFrame, use_gemini: bool = True, optuna_trials: int =
     else:
         final, conf = "generic", 0.25
 
-    # If heuristic exclusive clearly beats optuna (sales vs energy confusion), trust exclusive
     if scores.get(heur, 0) >= 6 and (not opt_domain or scores.get(opt_domain, 0) < scores.get(heur, 0) * 0.6):
         if any(str(h).startswith("EXCL:") for h in reasons.get(heur, [])):
             final = heur
             conf = max(conf, min(0.97, 0.55 + 0.05 * scores[heur]))
 
+    hc_excl = sum(1 for h in reasons.get("healthcare", []) if str(h).startswith("EXCL:"))
+    ed_excl = sum(1 for h in reasons.get("education", []) if str(h).startswith("EXCL:"))
+    if final == "healthcare" and hc_excl == 0:
+        if ed_excl >= 1:
+            final, conf = "education", max(conf, 0.7)
+        else:
+            final, conf = "generic", min(conf, 0.4)
+    elif ed_excl >= 1 and scores.get("education", 0) >= scores.get(final, 0):
+        final = "education"
+        conf = max(conf, min(0.95, 0.55 + 0.05 * scores["education"]))
+
+    prior = st.session_state.get("domain_meta") if isinstance(st.session_state.get("domain_meta"), dict) else {}
+    forge_prior = st.session_state.get("forge_detect") if isinstance(st.session_state.get("forge_detect"), dict) else {}
+    col_sig = _field_col_signature(df)
+    if not st.session_state.get("domain_user_override"):
+        prior_conf = float(prior.get("confidence") or 0)
+        prior_dom = str(prior.get("domain") or "")
+        if prior.get("col_sig") == col_sig and prior_conf >= FIELD_DETECT_HIGH_CONF and prior_dom in DOMAIN_CATALOG:
+            final = prior_dom
+            conf = max(conf, prior_conf)
+        elif float(forge_prior.get("confidence") or 0) >= FIELD_DETECT_HIGH_CONF:
+            fp = str(forge_prior.get("fingerprint") or "")
+            if fp.startswith(f"{len(df)}:{df.shape[1]}:"):
+                mapped = OS_TO_APP_DOMAIN.get(str(forge_prior.get("domain") or ""))
+                if mapped and mapped in DOMAIN_CATALOG:
+                    final = mapped
+                    conf = max(conf, float(forge_prior.get("confidence") or 0))
+
     vote_df = pd.DataFrame(
         [{"domain": d, "ensemble_vote": round(v, 4), "label": DOMAIN_CATALOG[d]["label"]} for d, v in vote.items()]
     ).sort_values("ensemble_vote", ascending=False).reset_index(drop=True)
 
-    return {
+    result = {
         "domain": final,
-        "label": DOMAIN_CATALOG[final]["label"],
+        "label": DOMAIN_CATALOG.get(final, DOMAIN_CATALOG["generic"])["label"],
         "confidence": round(conf, 3),
         "heuristic": heur,
         "heuristic_scores": scores,
@@ -1551,7 +1655,14 @@ def detect_field(df: pd.DataFrame, use_gemini: bool = True, optuna_trials: int =
         "scoreboard": scoreboard,
         "vote_table": vote_df,
         "optuna_proba_table": opt.get("proba_table"),
+        "col_sig": col_sig,
     }
+    result = _lock_field_to_user_override(result)
+    try:
+        st.session_state._field_detect_cache = {"sig": sig, "result": result}
+    except Exception:
+        pass
+    return result
 
 def discover_filter_columns(df: pd.DataFrame) -> dict[str, Optional[str]]:
     """Find loc / date / time / people columns across any domain."""
@@ -1648,7 +1759,9 @@ def get_kpis(df: pd.DataFrame) -> dict[str, Any]:
     """Domain-aware KPI dictionary (numbers for square metric boxes)."""
     n_rows, n_cols = df.shape
     miss = round(float(df.isna().sum().sum() / max(1, df.size) * 100), 2)
-    domain = st.session_state.get("domain") or detect_field(df, use_gemini=False, optuna_trials=8).get("domain", "generic")
+    domain = st.session_state.get("domain")
+    if not domain or (domain == "generic" and not st.session_state.get("domain_user_override") and not st.session_state.get("domain_meta")):
+        domain = detect_field(df, use_gemini=False, optuna_trials=FIELD_DETECT_DEFAULT_TRIALS).get("domain", "generic")
     base = {"Rows": int(n_rows), "Cols": int(n_cols), "Missing%": miss, "Domain": DOMAIN_CATALOG.get(domain, {}).get("label", domain)}
 
     if domain == "predictive_maintenance":
@@ -1678,6 +1791,13 @@ def get_kpis(df: pd.DataFrame) -> dict[str, Any]:
         readm = _col(df, "readmission")
         if readm:
             base["Readmission%"] = round(float(pd.to_numeric(df[readm], errors="coerce").fillna(0).mean() * 100), 1)
+    elif domain == "education":
+        sid = _col(df, "student", "student_id")
+        base.update({
+            "Students": int(df[sid].nunique()) if sid else n_rows,
+            "Mean_Score": _mean(df, "math_score", "score", "marks", "gpa"),
+            "Mean_Attendance": _mean(df, "attendance"),
+        })
     elif domain == "sales_forecasting":
         base.update({
             "Total_Revenue": _sum(df, "revenue", "sales", "gmv", "amount"),
@@ -1852,6 +1972,7 @@ def kpi_group_comparisons(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     metric_candidates = {
         "sales_forecasting": ["revenue", "sales", "gmv", "amount", "units"],
         "healthcare": ["age", "bmi", "glucose", "bp", "systolic", "readmission"],
+        "education": ["gpa", "marks", "score", "attendance", "grade"],
         "telecom_churn": ["churn", "arpu", "tenure", "monthly_charges"],
         "predictive_maintenance": ["temperature", "vibration", "pressure", "rul", "failure"],
         "finance_risk": ["loan_amount", "amount", "default", "credit_score", "income"],
@@ -2097,7 +2218,9 @@ def field_predict(df: pd.DataFrame) -> float:
 
 
 def field_risk_explain(df: pd.DataFrame) -> dict[str, Any]:
-    domain = st.session_state.get("domain") or detect_field(df, use_gemini=False, optuna_trials=12)["domain"]
+    domain = st.session_state.get("domain")
+    if not domain:
+        domain = detect_field(df, use_gemini=False, optuna_trials=FIELD_DETECT_DEFAULT_TRIALS)["domain"]
     work = apply_domain_feature_engineering(df, domain)
     X, label_col = _numeric_xy(work)
     explanations: list[str] = []
@@ -2574,6 +2697,7 @@ DOMAIN_RECOMMENDED_MODELS: dict[str, list[str]] = {
     "sales_forecasting": ["Prophet", "RandomForestRegressor", "XGBRegressor", "Ridge"],
     "telecom_churn": ["RandomForestClassifier", "XGBClassifier", "LogisticRegression"],
     "healthcare": ["RandomForestClassifier", "XGBClassifier", "LogisticRegression"],
+    "education": ["RandomForestRegressor", "XGBRegressor", "RandomForestClassifier"],
     "finance_risk": ["RandomForestClassifier", "XGBClassifier", "LogisticRegression"],
     "energy_utilities": ["Prophet", "RandomForestRegressor", "XGBRegressor", "PCA"],
     "warehouse_logistics": ["RandomForestRegressor", "XGBRegressor", "Prophet"],
@@ -2933,6 +3057,7 @@ def domain_default_target(df: pd.DataFrame, domain: str) -> Optional[str]:
         "sales_forecasting": ["revenue", "sales", "gmv"],
         "telecom_churn": ["churn"],
         "healthcare": ["readmission", "bmi"],
+        "education": ["gpa", "marks", "score", "grade"],
         "finance_risk": ["default", "loan_amount"],
         "energy_utilities": ["load", "kwh", "mw"],
         "warehouse_logistics": ["inventory", "lead_time"],
@@ -3507,9 +3632,8 @@ Edit `config.yaml` → `LIVE_MODE.connection_type`.
             st.subheader("Quick actions")
             if st.button("Detect field on live buffer"):
                 with st.spinner("Detecting..."):
-                    meta = detect_field(df, use_gemini=bool(get_gemini_api_key()), optuna_trials=10)
-                    st.session_state.domain = meta["domain"]
-                    st.session_state.domain_meta = meta
+                    meta = detect_field(df, use_gemini=bool(get_gemini_api_key()), optuna_trials=FIELD_DETECT_DEFAULT_TRIALS)
+                    apply_detected_domain(meta)
                     ensure_llama_index(df, force=True)
                 st.success(f"Field → {meta['label']} ({meta['confidence']})")
             if st.button("Pin latest trend to Dashboard"):
@@ -3573,6 +3697,7 @@ def page_upload() -> None:
     if uploaded is not None:
         try:
             df = load_uploaded_file(uploaded)
+            reset_domain_pick_for_new_frame(df)
             st.session_state.manual_df = df
             st.session_state.manual_name = uploaded.name
             st.session_state.clean_df = None
@@ -3800,6 +3925,140 @@ def page_dwdm_sql() -> None:
                 st.success(f"Working set → {len(sql_result):,} rows")
 
 
+def _labs_working_df() -> Optional[pd.DataFrame]:
+    if st.session_state.get("mode") == "LIVE CONNECT":
+        buf = read_live_buffer()
+        if _is_nonempty_frame(buf):
+            return buf
+    clean = st.session_state.get("clean_df")
+    manual = st.session_state.get("manual_df")
+    if _is_nonempty_frame(clean):
+        return clean
+    if _is_nonempty_frame(manual):
+        return manual
+    return None
+
+
+def page_dwdm_labs() -> None:
+    st.header("DWDM labs")
+    st.caption(
+        "Optional labs on the current working dataframe. "
+        "Leaves **DWDM & SQL** (DuckDB / transforms) unchanged."
+    )
+    working = _labs_working_df()
+    if working is None:
+        st.warning("Upload, clean, or connect LIVE first.")
+        return
+    live = st.session_state.get("mode") == "LIVE CONNECT"
+    nums = lab_numeric_columns(working)
+    date_opts = [c for c in working.columns if "date" in str(c).lower() or "time" in str(c).lower()]
+    for c in working.columns:
+        if pd.api.types.is_datetime64_any_dtype(working[c]) and str(c) not in date_opts:
+            date_opts.append(str(c))
+
+    tab_star, tab_apr, tab_km, tab_mice = st.tabs(["Star / OLAP", "Apriori", "K-means", "MICE"])
+
+    with tab_star:
+        st.subheader("Star / OLAP-style")
+        st.caption("Pick a date dim, entity dim (student / asset / …), and numeric facts. Pandas grain — not a cube server.")
+        c1, c2 = st.columns(2)
+        date_col = c1.selectbox("Date dimension", ["(none)"] + date_opts, key="lab_star_date")
+        entity_col = c2.selectbox("Entity dimension", ["(none)"] + list(map(str, working.columns)), key="lab_star_ent")
+        facts = st.multiselect("Fact numeric columns", nums, default=nums[:2], key="lab_star_facts")
+        if st.button("Build star tables", type="primary", key="lab_star_go"):
+            pack = build_star_schema(
+                working,
+                date_col=None if date_col == "(none)" else date_col,
+                entity_col=None if entity_col == "(none)" else entity_col,
+                fact_cols=facts,
+            )
+            if not pack.get("ok"):
+                st.warning(pack.get("error") or "Could not build star.")
+            else:
+                st.caption(pack.get("caption") or "")
+                st.write("**Fact**")
+                st.dataframe(pack["fact"].head(40), use_container_width=True)
+                for name, dim in (pack.get("dims") or {}).items():
+                    st.write(f"**{name}**")
+                    st.dataframe(dim.head(40), use_container_width=True)
+
+    with tab_apr:
+        st.subheader("Apriori")
+        txn = st.selectbox("Transaction id", ["(none)"] + list(map(str, working.columns)), key="lab_apr_txn")
+        item = st.selectbox("Item column", ["(none)"] + list(map(str, working.columns)), key="lab_apr_item")
+        row_bins = st.checkbox("Row-as-basket (high/low bins) — lab, not market-basket", value=False, key="lab_apr_row")
+        bin_cols = st.multiselect("Numeric items (row-as-basket)", nums, default=nums[:3], key="lab_apr_bins")
+        s1, s2 = st.columns(2)
+        min_sup = s1.slider("Min support", 0.05, 0.5, 0.15, 0.05, key="lab_apr_sup")
+        min_conf = s2.slider("Min confidence", 0.2, 0.9, 0.5, 0.05, key="lab_apr_conf")
+        if st.button("Mine itemsets", type="primary", key="lab_apr_go"):
+            mode = "row"
+            if txn != "(none)" and item != "(none)":
+                baskets = baskets_from_txn(working, txn, item)
+                mode = "txn"
+            elif row_bins:
+                baskets = baskets_row_bins(working, bin_cols)
+                st.warning("Row-as-basket is a lab, not market-basket.")
+            else:
+                baskets = []
+                st.info(apriori_need_txn_hint())
+            if baskets:
+                mined = mine_apriori(baskets, min_support=min_sup, min_confidence=min_conf)
+                if not mined.get("ok"):
+                    st.info(mined.get("hint") or mined.get("error") or "Need transaction shape.")
+                else:
+                    st.caption(f"{mined.get('n_baskets')} baskets · {mined.get('n_rules')} rules · mode={mode}")
+                    st.dataframe(mined["rules"], use_container_width=True)
+
+    with tab_km:
+        st.subheader("K-means clustering")
+        k = st.slider("k", 2, 12, 3, key="lab_km_k")
+        km_cols = st.multiselect("Numeric columns", nums, default=nums[: min(4, len(nums))], key="lab_km_cols")
+        want_sil = st.checkbox("Silhouette score", value=True, key="lab_km_sil")
+        if st.button("Run K-means", type="primary", key="lab_km_go"):
+            packed = assign_kmeans(working, km_cols, k=k, silhouette=want_sil)
+            if not packed.get("ok"):
+                st.warning(packed.get("error") or "K-means failed.")
+            else:
+                st.session_state._lab_kmeans = packed
+                bits = [f"assigned {packed.get('n_assigned')} rows"]
+                if packed.get("silhouette") is not None:
+                    bits.append(f"silhouette {packed['silhouette']}")
+                st.success(" · ".join(bits))
+                st.dataframe(packed["frame"][km_cols + ["cluster_id"]].head(30), use_container_width=True)
+        packed = st.session_state.get("_lab_kmeans")
+        if isinstance(packed, dict) and packed.get("ok") and not live:
+            if st.button("Apply cluster_id to working df", key="lab_km_apply"):
+                st.session_state.clean_df = packed["frame"]
+                st.session_state.prefer_clean_df = True
+                st.success("cluster_id written to working dataframe.")
+
+    with tab_mice:
+        st.subheader("MICE (IterativeImputer)")
+        st.caption("Numeric columns only. Opt-in lab — not default Clean. Preview before apply.")
+        mice_cols = st.multiselect("Columns to impute", nums, default=nums[: min(6, len(nums))], key="lab_mice_cols")
+        iters = st.slider("Max iterations", 2, 20, 8, key="lab_mice_iter")
+        if len(working) > 20000:
+            st.warning("Large frame — IterativeImputer can be slow.")
+        if st.button("Preview MICE", type="primary", key="lab_mice_go"):
+            packed = mice_impute(working, mice_cols, max_iter=iters)
+            st.session_state._lab_mice = packed
+        packed = st.session_state.get("_lab_mice")
+        if isinstance(packed, dict):
+            if packed.get("warning"):
+                st.warning(packed["warning"])
+            if not packed.get("ok"):
+                st.warning(packed.get("error") or "MICE failed.")
+            else:
+                st.caption(f"Imputed cells: {packed.get('n_imputed', 0)}")
+                st.dataframe(packed.get("preview"), use_container_width=True)
+                if packed.get("changed") and not live:
+                    if st.button("Apply imputed values to working df", key="lab_mice_apply"):
+                        st.session_state.clean_df = packed["frame"]
+                        st.session_state.prefer_clean_df = True
+                        st.success("MICE values written to working dataframe.")
+
+
 def page_clean() -> None:
     st.header("Clean")
     st.caption(
@@ -3887,14 +4146,20 @@ def page_field() -> None:
         return
 
     render_industry_banner(df)
+    render_domain_selector(context="field")
     use_gem = st.checkbox("Use Gemini in domain ensemble", value=bool(get_gemini_api_key()))
-    trials = st.slider("Optuna trials for field detect", 8, 40, 20)
+    trials = st.slider(
+        "Optuna trials for field detect",
+        1,
+        FIELD_DETECT_MAX_TRIALS,
+        FIELD_DETECT_DEFAULT_TRIALS,
+    )
     run = st.button("Detect field + build LlamaIndex + best model", type="primary")
-    if run or st.session_state.field_result is None:
+    if run:
         with st.spinner("Domain detect → LlamaIndex → model bake-off..."):
-            meta = detect_field(df, use_gemini=use_gem, optuna_trials=trials)
-            st.session_state.domain = meta["domain"]
-            st.session_state.domain_meta = meta
+            meta = apply_detected_domain(
+                detect_field(df, use_gemini=use_gem, optuna_trials=trials)
+            )
             try:
                 llama_meta = ensure_llama_index(df, force=True)
             except Exception as exc:
@@ -3928,6 +4193,18 @@ def page_field() -> None:
                 pass
 
     res = st.session_state.field_result
+    if not res:
+        guess = st.session_state.get("forge_detect") or st.session_state.get("domain_meta") or {}
+        label = guess.get("label") or DOMAIN_CATALOG.get(st.session_state.get("domain") or "generic", {}).get("label", "Generic")
+        conf = float(guess.get("confidence") or 0)
+        st.info(
+            f"Active pack **{label}** (`{st.session_state.get('domain')}`). "
+            "Click Detect to run Optuna + Gemini ensemble (default 3 trials). "
+            "Override above is kept."
+        )
+        if conf and conf < 0.7:
+            st.caption("guess — override if wrong.")
+        return
     meta, explain, card = res["meta"], res["explain"], res.get("model_card") or {}
     show_gemini_issue(meta.get("gemini_error"))
     st.subheader(f"Detected: {meta.get('label')} (`{meta.get('domain')}`)")
@@ -3979,13 +4256,15 @@ def page_kpis() -> None:
     df = require_data()
     if df is None:
         return
-    if not st.session_state.get("domain") or st.session_state.domain == "generic" or not st.session_state.get("domain_meta"):
+    if st.session_state.get("domain_user_override"):
+        meta = st.session_state.get("domain_meta") or {"domain": st.session_state.get("domain"), "confidence": 1.0, "overridden": True}
+    elif not st.session_state.get("domain") or (st.session_state.domain == "generic" and not st.session_state.get("domain_meta")):
         with st.spinner("Detecting field for KPI pack..."):
-            meta = detect_field(df, use_gemini=bool(get_gemini_api_key()), optuna_trials=15)
-            st.session_state.domain = meta["domain"]
-            st.session_state.domain_meta = meta
+            meta = apply_detected_domain(
+                detect_field(df, use_gemini=bool(get_gemini_api_key()), optuna_trials=FIELD_DETECT_DEFAULT_TRIALS)
+            )
     else:
-        meta = st.session_state.domain_meta
+        meta = st.session_state.domain_meta or {"domain": st.session_state.get("domain"), "confidence": 0}
 
     st.write(f"Active field: **{DOMAIN_CATALOG.get(st.session_state.domain, {}).get('label')}** "
              f"(confidence {float(meta.get('confidence', 0))*100:.1f}%)")
@@ -4101,10 +4380,12 @@ def page_charts() -> None:
     df0 = require_data()
     if df0 is None:
         return
-    if not st.session_state.get("domain") or st.session_state.domain == "generic":
-        meta = detect_field(df0, use_gemini=False, optuna_trials=10)
-        st.session_state.domain = meta["domain"]
-        st.session_state.domain_meta = meta
+    if st.session_state.get("domain_user_override"):
+        pass
+    elif not st.session_state.get("domain") or st.session_state.domain == "generic":
+        meta = apply_detected_domain(
+            detect_field(df0, use_gemini=False, optuna_trials=FIELD_DETECT_DEFAULT_TRIALS)
+        )
 
     filtered = render_filter_bar(df0, key_prefix="chart")
     if filtered.empty:
@@ -4179,8 +4460,12 @@ def page_ml() -> None:
     df = require_data()
     if df is None:
         return
-    domain = st.session_state.get("domain") or detect_field(df, use_gemini=False, optuna_trials=8)["domain"]
-    st.session_state.domain = domain
+    domain = st.session_state.get("domain")
+    if not domain:
+        domain = detect_field(df, use_gemini=False, optuna_trials=FIELD_DETECT_DEFAULT_TRIALS)["domain"]
+        if not st.session_state.get("domain_user_override"):
+            st.session_state.domain = domain
+    st.session_state.domain = st.session_state.get("domain") or domain
     runnable = set(list_runnable_models())
     hidden = [m for m in FORGE_MODEL_CATALOG if m not in runnable]
     if hidden:
@@ -4315,8 +4600,8 @@ def page_dashboard() -> None:
     if df0 is None:
         return
     src, src_label = dashboard_source_frame(df0)
-    if not st.session_state.get("domain"):
-        st.session_state.domain = detect_field(src, use_gemini=False, optuna_trials=8)["domain"]
+    if not st.session_state.get("domain") and not st.session_state.get("domain_user_override"):
+        apply_detected_domain(detect_field(src, use_gemini=False, optuna_trials=FIELD_DETECT_DEFAULT_TRIALS))
 
     filtered = render_filter_bar(src, key_prefix="dash")
     if filtered.empty:
@@ -4539,6 +4824,7 @@ PAGES = [
     "Clean",
     "Data Integration",
     "DWDM & SQL",
+    "DWDM labs",
     "Field",
     "Auto KPIs",
     "Charts",
@@ -4587,6 +4873,7 @@ def render_sidebar() -> str:
             if up is not None:
                 try:
                     st.session_state.manual_df = load_uploaded_file(up)
+                    reset_domain_pick_for_new_frame(st.session_state.manual_df)
                     st.session_state.manual_name = up.name
                     st.session_state.clean_df = None
                     st.success(f"Loaded {up.name}")
@@ -4662,6 +4949,7 @@ def main() -> None:
         "Clean": page_clean,
         "Data Integration": page_data_integration,
         "DWDM & SQL": page_dwdm_sql,
+        "DWDM labs": page_dwdm_labs,
         "Field": page_field,
         "Auto KPIs": page_kpis,
         "Charts": page_charts,

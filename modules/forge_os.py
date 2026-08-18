@@ -7,7 +7,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -18,8 +20,10 @@ from typing import Any, Iterator, Optional
 import pandas as pd
 
 from modules.domain_detect import (
+    APP_TO_OS_DOMAIN,
     BASE_ROLES,
     COLUMN_ROLES,
+    DOMAIN_OVERRIDE_LOW_CONF,
     DOMAIN_ROLE_PACKS,
     FORGE_DOMAIN_LABELS,
     FORGE_DOMAINS,
@@ -52,6 +56,7 @@ PHASE3_CAPTION = "SaaS login + Monday scheduled email = next phase."
 RENDER_KEY_WARNING = "On Render, set GEMINI_API_KEY in Environment. Session key is temporary."
 
 FRAME_KEYS = ("clean_df", "manual_df")
+SESSION_DBLCLICK_S = 0.5
 
 
 # -----------------------------------------------------------------------------
@@ -411,6 +416,19 @@ def session_exists(session_id: str) -> bool:
     return row is not None
 
 
+def delete_session(session_id: str) -> bool:
+    sid = str(session_id or "").strip()
+    if not sid or "/" in sid or "\\" in sid or sid in {".", ".."}:
+        return False
+    with connect() as conn:
+        conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
+        conn.commit()
+    sess_dir = STORE_DIR / sid
+    if sess_dir.is_dir() and STORE_DIR in sess_dir.resolve().parents:
+        shutil.rmtree(sess_dir, ignore_errors=True)
+    return True
+
+
 def _session_dir(session_id: str) -> Path:
     path = STORE_DIR / session_id
     path.mkdir(parents=True, exist_ok=True)
@@ -553,6 +571,7 @@ def collect_streamlit_meta() -> dict[str, Any]:
         "clean_engine": st.session_state.get("clean_engine"),
         "prefer_clean_df": bool(st.session_state.get("prefer_clean_df", True)),
         "mode": st.session_state.get("mode"),
+        "domain_user_override": bool(st.session_state.get("domain_user_override")),
     }
 
 
@@ -619,6 +638,7 @@ def restore_session_to_streamlit(session_id: str) -> bool:
     st.session_state.column_roles = dict(meta.get("column_roles") or {})
     st.session_state.forge_session_id = session_id
     st.session_state.forge_session_title = meta.get("_title") or session_id
+    st.session_state.domain_user_override = bool(meta.get("domain_user_override"))
     if meta.get("clean_engine"):
         st.session_state.clean_engine = meta["clean_engine"]
     return True
@@ -628,10 +648,7 @@ def render_session_sidebar() -> None:
     import streamlit as st
 
     st.subheader("Recent sessions")
-    st.caption(
-        "SQLite under `.forge_sessions/` — survives Streamlit reruns. "
-        "On Render this disk is wiped on deploy; that is expected."
-    )
+    st.caption("Restore, or click the session name twice quickly to delete.")
     try:
         rows = list_sessions(8)
     except OSError:
@@ -640,18 +657,56 @@ def render_session_sidebar() -> None:
     if not rows:
         st.caption("No saved sessions yet — run Clean or Field to snapshot.")
         return
+
+    pending = str(st.session_state.get("_forge_sess_pending_delete") or "")
+    pending_title = str(st.session_state.get("_forge_sess_pending_title") or pending)
+
+    def _confirm_delete_body(sid: str, title: str) -> None:
+        st.write(f"Delete **{title}** from `.forge_sessions`?")
+        b1, b2 = st.columns(2)
+        if b1.button("Confirm delete", type="primary", key="forge_del_yes"):
+            delete_session(sid)
+            st.session_state.pop("_forge_sess_pending_delete", None)
+            st.session_state.pop("_forge_sess_pending_title", None)
+            st.rerun()
+        if b2.button("Cancel", key="forge_del_no"):
+            st.session_state.pop("_forge_sess_pending_delete", None)
+            st.session_state.pop("_forge_sess_pending_title", None)
+            st.rerun()
+
+    if pending:
+        dlg = getattr(st, "dialog", None)
+        if callable(dlg):
+            @dlg("Delete session?")
+            def _dlg() -> None:
+                _confirm_delete_body(pending, pending_title)
+
+            _dlg()
+        else:
+            st.warning(f"Delete **{pending_title}** from `.forge_sessions`?")
+            _confirm_delete_body(pending, pending_title)
+
     for rec in rows:
         sid = rec["id"]
         label = rec.get("title") or sid
         stamp = str(rec.get("updated_at") or "")[:16]
         c1, c2 = st.columns([3, 1])
-        c1.caption(f"{label} · {stamp}")
-        if c2.button("Restore", key=f"forge_restore_{sid}"):
-            if restore_session_to_streamlit(sid):
-                st.success(f"Restored {label}")
+        with c1:
+            if st.button(f"{label}", key=f"forge_sess_name_{sid}", help=f"{stamp} — click twice quickly to delete"):
+                now = time.monotonic()
+                prev = st.session_state.get("_forge_sess_click") or {}
+                if str(prev.get("sid")) == sid and (now - float(prev.get("t") or 0)) <= SESSION_DBLCLICK_S:
+                    st.session_state._forge_sess_pending_delete = sid
+                    st.session_state._forge_sess_pending_title = label
+                st.session_state._forge_sess_click = {"sid": sid, "t": now}
                 st.rerun()
-            else:
-                st.error("Could not restore that session.")
+        with c2:
+            if st.button("Restore", key=f"forge_restore_{sid}"):
+                if restore_session_to_streamlit(sid):
+                    st.success(f"Restored {label}")
+                    st.rerun()
+                else:
+                    st.error("Could not restore that session.")
 
 
 # -----------------------------------------------------------------------------
@@ -862,6 +917,18 @@ def run_forge_detect(
 
     st.session_state.column_types = ctypes
     st.session_state.forge_detect = result
+    if st.session_state.get("domain_user_override"):
+        locked = str(st.session_state.get("forge_domain") or "generic")
+        if locked not in FORGE_DOMAINS:
+            locked = "generic"
+        result = dict(result)
+        result["detected_domain"] = result.get("domain")
+        result["domain"] = locked
+        result["label"] = FORGE_DOMAIN_LABELS.get(locked, locked)
+        result["app_domain"] = OS_TO_APP_DOMAIN.get(locked, "generic")
+        result["overridden"] = True
+        st.session_state.forge_detect = result
+        return result
     st.session_state.forge_domain = result["domain"]
     st.session_state.domain = result.get("app_domain") or OS_TO_APP_DOMAIN.get(result["domain"], "generic")
     return result
@@ -896,6 +963,8 @@ def render_detection_ui(df: pd.DataFrame, context: str = "upload") -> dict[str, 
         f"**Detected domain:** {detect.get('label', 'Generic')} "
         f"(`{detect.get('domain', 'generic')}`) — confidence **{conf * 100:.0f}%**"
     )
+    if conf < DOMAIN_OVERRIDE_LOW_CONF:
+        st.caption("guess — override if wrong.")
     reasons = detect.get("reasons") or []
     if reasons:
         st.caption("Why: " + " · ".join(str(r) for r in reasons[:8]))
@@ -905,29 +974,67 @@ def render_detection_ui(df: pd.DataFrame, context: str = "upload") -> dict[str, 
 
 
 def render_domain_selector(context: str = "upload") -> str:
-    """Step 2 — override detected domain."""
+    """Always-visible domain pack. User pick always wins; Field must not overwrite it."""
     import streamlit as st
 
-    st.subheader("Step 2 — Domain")
+    st.subheader("Domain")
     detect = st.session_state.get("forge_detect") or {}
-    detected = str(detect.get("domain") or st.session_state.get("forge_domain") or "generic")
-    labels = [FORGE_DOMAIN_LABELS.get(d, d) for d in FORGE_DOMAINS]
-    idx = FORGE_DOMAINS.index(detected) if detected in FORGE_DOMAINS else 0
+    detected = str(detect.get("detected_domain") or detect.get("domain") or st.session_state.get("forge_domain") or "generic")
+    if detected not in FORGE_DOMAINS:
+        detected = APP_TO_OS_DOMAIN.get(detected, "generic")
+        if detected not in FORGE_DOMAINS:
+            detected = "generic"
+    conf = float(detect.get("confidence") or 0)
+    if st.session_state.get("domain_user_override"):
+        st.caption("Your override — Field will not replace this.")
+    elif conf < DOMAIN_OVERRIDE_LOW_CONF:
+        st.caption("guess — override if wrong.")
+
+    widget_key = "forge_domain_override_pick"
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = detected
+
+    def _mark_override() -> None:
+        st.session_state.domain_user_override = True
+
     picked = st.selectbox(
         "Domain pack (override if wrong)",
         FORGE_DOMAINS,
-        index=idx,
         format_func=lambda d: FORGE_DOMAIN_LABELS.get(d, d),
-        key=f"forge_domain_pick_{context}",
+        key=widget_key,
+        on_change=_mark_override,
     )
-    if picked != detected:
-        st.caption(f"Overriding `{detected}` → `{picked}`. Role dropdowns update below.")
+    if picked not in FORGE_DOMAINS:
+        picked = "generic"
     st.session_state.forge_domain = picked
     st.session_state.domain = OS_TO_APP_DOMAIN.get(picked, "generic")
+    if picked != detected:
+        st.session_state.domain_user_override = True
+        st.caption(f"Overriding `{detected}` → `{picked}`.")
     pack_roles = DOMAIN_ROLE_PACKS.get(picked, ())
     if pack_roles:
         st.caption(f"Extra roles for this pack: {', '.join(pack_roles)}")
     return picked
+
+
+def reset_domain_pick_for_new_frame(df: pd.DataFrame) -> None:
+    """New upload fingerprint clears the domain widget so detection can re-seed."""
+    try:
+        import streamlit as st
+    except Exception:
+        return
+    if df is None or not isinstance(df, pd.DataFrame):
+        return
+    fp = f"{len(df)}:{df.shape[1]}:{','.join(str(c) for c in df.columns[:12])}"
+    if st.session_state.get("_domain_pick_fp") == fp:
+        return
+    st.session_state._domain_pick_fp = fp
+    st.session_state.domain_user_override = False
+    st.session_state.pop("forge_domain_override_pick", None)
+    st.session_state.pop("_field_detect_cache", None)
+    st.session_state.field_result = None
+    st.session_state.forge_detect = None
+    st.session_state.domain_meta = None
 
 
 def render_domain_hints(domain: Optional[str] = None) -> None:
