@@ -5,7 +5,9 @@ Falls back to stub auth if SUPABASE_URL/SUPABASE_KEY not set.
 from __future__ import annotations
 
 import base64
+import logging
 import os
+import warnings
 from importlib import import_module
 from typing import Optional
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
@@ -15,6 +17,7 @@ import streamlit as st
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip()
+_INVALID_URL_SEGMENTS = ("/rest/v1", "/auth/v1")
 
 _client = None
 _client_error = ""
@@ -22,6 +25,42 @@ _client_error = ""
 
 def _supabase_available() -> bool:
     return bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+def normalize_supabase_url(raw_url: str) -> str:
+    """
+    Normalize Supabase base URL from env input.
+
+    Accepts values that may accidentally include /rest/v1 or /auth/v1 and
+    always returns the host base URL without trailing slash.
+    """
+    candidate = (raw_url or "").strip()
+    if not candidate:
+        return ""
+
+    parsed = urlparse(candidate)
+    if not parsed.scheme or not parsed.netloc:
+        return candidate.rstrip("/")
+
+    path = parsed.path.rstrip("/")
+    lowered = path.lower()
+    # Users sometimes set SUPABASE_URL with API paths; peel those off.
+    while any(lowered.endswith(suffix) for suffix in _INVALID_URL_SEGMENTS):
+        for suffix in _INVALID_URL_SEGMENTS:
+            if lowered.endswith(suffix):
+                path = path[: -len(suffix)]
+                lowered = path.lower()
+                break
+
+    path = path.rstrip("/")
+    normalized = parsed._replace(path=path, params="", query="", fragment="")
+    return urlunparse(normalized).rstrip("/")
+
+
+def _looks_like_invalid_supabase_path(raw_url: str) -> bool:
+    parsed = urlparse((raw_url or "").strip())
+    path = parsed.path.lower().rstrip("/")
+    return any(path.endswith(seg) for seg in _INVALID_URL_SEGMENTS)
 
 
 def _is_likely_service_role_key(key: str) -> bool:
@@ -70,12 +109,33 @@ def init_supabase_client():
         _client_error = err or "Supabase import failed."
         return None
 
+    normalized_url = normalize_supabase_url(SUPABASE_URL)
+    if not normalized_url:
+        _client_error = "Supabase URL is empty after normalization."
+        return None
+
+    if _looks_like_invalid_supabase_path(SUPABASE_URL):
+        warning_msg = (
+            "SUPABASE_URL contains API path suffix. "
+            f"Using normalized base URL: {normalized_url}"
+        )
+        logging.warning(warning_msg)
+        warnings.warn(warning_msg, RuntimeWarning, stacklevel=2)
+
     try:
-        _client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        _client = create_client(normalized_url, SUPABASE_KEY)
         _client_error = ""
     except Exception as exc:
         _client = None
-        _client_error = f"Supabase client init failed: {exc}"
+        message = str(exc)
+        if "pgrst125" in message.lower() or "invalid path specified" in message.lower():
+            _client_error = (
+                "Supabase URL path appears invalid. "
+                f"Resolved base URL: {normalized_url}. "
+                f"Original error: {message}"
+            )
+        else:
+            _client_error = f"Supabase client init failed: {message}"
     return _client
 
 
@@ -149,7 +209,7 @@ def get_user_id() -> Optional[str]:
 
 
 def _build_google_authorize_fallback_url() -> str:
-    base = SUPABASE_URL.rstrip("/")
+    base = normalize_supabase_url(SUPABASE_URL)
     url = f"{base}/auth/v1/authorize?provider=google&apikey={quote(SUPABASE_KEY, safe='')}"
     if APP_BASE_URL:
         redirect_to = APP_BASE_URL.rstrip("/")

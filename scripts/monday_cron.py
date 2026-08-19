@@ -17,14 +17,30 @@ EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
 def _init_client():
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         return None, "Missing SUPABASE_URL or SUPABASE_SERVICE_KEY"
+    from modules.supabase_auth import normalize_supabase_url
+
+    normalized_url = normalize_supabase_url(SUPABASE_URL)
+    if normalized_url != SUPABASE_URL.strip().rstrip("/"):
+        print(
+            "[WARN] SUPABASE_URL includes API path suffix; "
+            f"using normalized base URL: {normalized_url}"
+        )
+
     try:
         from supabase import create_client
     except Exception as exc:
         return None, f"Supabase import failed: {exc}"
     try:
-        return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY), ""
+        return create_client(normalized_url, SUPABASE_SERVICE_KEY), ""
     except Exception as exc:
-        return None, f"Supabase client init failed: {exc}"
+        message = str(exc)
+        if "pgrst125" in message.lower() or "invalid path specified" in message.lower():
+            return (
+                None,
+                "Invalid Supabase URL path detected. "
+                f"Resolved base URL: {normalized_url}. Error: {message}",
+            )
+        return None, f"Supabase client init failed: {message}"
 
 
 def get_enabled_jobs(client):
