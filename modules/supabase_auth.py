@@ -4,14 +4,17 @@ Falls back to stub auth if SUPABASE_URL/SUPABASE_KEY not set.
 """
 from __future__ import annotations
 
+import base64
 import os
 from importlib import import_module
 from typing import Optional
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 import streamlit as st
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip()
 
 _client = None
 _client_error = ""
@@ -19,6 +22,20 @@ _client_error = ""
 
 def _supabase_available() -> bool:
     return bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+def _is_likely_service_role_key(key: str) -> bool:
+    """Best-effort guard to prevent using service_role key in end-user auth flow."""
+    try:
+        parts = key.split(".")
+        if len(parts) != 3:
+            return False
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload.encode("utf-8")).decode("utf-8")
+        return '"role":"service_role"' in decoded or '"role": "service_role"' in decoded
+    except Exception:
+        return False
 
 
 def _load_create_client():
@@ -64,6 +81,8 @@ def init_supabase_client():
 
 def supabase_status_message() -> str:
     if _supabase_available():
+        if _is_likely_service_role_key(SUPABASE_KEY):
+            return "SUPABASE_KEY must be anon/publishable key, not service_role key."
         if init_supabase_client() is None:
             return _client_error or "Supabase is unavailable."
         return ""
@@ -129,15 +148,49 @@ def get_user_id() -> Optional[str]:
     return user["id"] if user else None
 
 
-def get_google_oauth_url() -> Optional[str]:
+def _build_google_authorize_fallback_url() -> str:
+    base = SUPABASE_URL.rstrip("/")
+    url = f"{base}/auth/v1/authorize?provider=google&apikey={quote(SUPABASE_KEY, safe='')}"
+    if APP_BASE_URL:
+        redirect_to = APP_BASE_URL.rstrip("/")
+        url += f"&redirect_to={quote(redirect_to, safe='')}"
+    return url
+
+
+def _ensure_authorize_url_params(url: str) -> str:
+    """Ensure browser authorize URL includes required apikey and optional redirect."""
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.setdefault("provider", "google")
+    query.setdefault("apikey", SUPABASE_KEY)
+    if APP_BASE_URL:
+        query.setdefault("redirect_to", APP_BASE_URL.rstrip("/"))
+    encoded_query = urlencode(query, doseq=True, safe=":/")
+    return urlunparse(parsed._replace(query=encoded_query))
+
+
+def get_google_oauth_url() -> tuple[Optional[str], Optional[str]]:
     client = init_supabase_client()
     if not client:
-        return None
+        return None, _client_error or "Supabase auth client is unavailable."
     try:
-        res = client.auth.sign_in_with_oauth({"provider": "google"})
-        return res.url if res else None
-    except Exception:
-        return None
+        payload = {"provider": "google"}
+        if APP_BASE_URL:
+            payload["options"] = {"redirect_to": APP_BASE_URL.rstrip("/")}
+        res = client.auth.sign_in_with_oauth(payload)
+        oauth_url = getattr(res, "url", None) if res else None
+        if oauth_url:
+            return _ensure_authorize_url_params(oauth_url), None
+    except Exception as exc:
+        message = str(exc)
+        if "provider is not enabled" in message.lower() or "unsupported provider" in message.lower():
+            return None, (
+                "Google provider is not enabled in Supabase Auth. "
+                "Enable Google provider and configure redirect URL in Supabase dashboard."
+            )
+
+    # Fallback for environments where library response does not include URL.
+    return _build_google_authorize_fallback_url(), None
 
 
 def render_auth_page() -> bool:
@@ -188,8 +241,10 @@ def render_auth_page() -> bool:
                     st.success("Account created! Check email for confirmation.")
                     st.rerun()
 
-    oauth_url = get_google_oauth_url()
+    oauth_url, oauth_error = get_google_oauth_url()
     if oauth_url:
         st.markdown(f"[Sign in with Google]({oauth_url})")
+    elif oauth_error:
+        st.info(oauth_error)
 
     return False

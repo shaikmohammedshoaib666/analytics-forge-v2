@@ -110,4 +110,13 @@ GEMINI_API_KEY=...
 GEMINI_MODEL=gemini-3.6-flash
 EMAIL_USER=
 EMAIL_PASSWORD=
+SUPABASE_URL=https://<project-ref>.supabase.co
+SUPABASE_KEY=<anon-or-publishable-key>
+# Optional but recommended for OAuth callbacks:
+APP_BASE_URL=https://<your-render-service>.onrender.com
 ```
+
+Google OAuth notes:
+- Use `SUPABASE_KEY` as anon/publishable key only (never service role key in app auth flow).
+- In Supabase Dashboard → Authentication → Providers → Google: enable provider and set Google client ID/secret.
+- In Supabase Dashboard → Authentication → URL Configuration: add `https://<your-render-service>.onrender.com` to Redirect URLs / Additional Redirect URLs.
