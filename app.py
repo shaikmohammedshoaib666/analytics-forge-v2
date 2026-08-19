@@ -55,6 +55,9 @@ from modules.dwdm_labs import (
     numeric_columns as lab_numeric_columns,
 )
 from modules.domain_detect import APP_TO_OS_DOMAIN, OS_TO_APP_DOMAIN
+from modules.supabase_auth import render_auth_page, sign_out as supabase_sign_out, get_user, get_user_id, _supabase_available
+from modules.sap_connector import render_sap_page
+from modules.cron_manager import render_cron_settings
 from modules.forge_os import (
     autosave_after_pipeline,
     gemini_issue_from_raw,
@@ -4833,14 +4836,20 @@ PAGES = [
     "Ask / AI",
     "Dashboard",
     "Email",
+    "SAP Connect",
+    "Settings",
 ]
 
 
 def render_sidebar() -> str:
     with st.sidebar:
-        st.write(f"📧 {OPERATOR_EMAIL}")
+        user = get_user()
+        if user:
+            st.write(f"👤 {user.get('email', OPERATOR_EMAIL)}")
+        else:
+            st.write(f"📧 {OPERATOR_EMAIL}")
         if st.button("Sign out"):
-            st.session_state.signed_in = False
+            supabase_sign_out()
             st.rerun()
 
         st.title("Analytics Forge v2")
@@ -4916,13 +4925,20 @@ def render_sidebar() -> str:
         return page
 
 
+def page_sap():
+    user_id = get_user_id() or "local"
+    render_sap_page(user_id)
+
+
+def page_settings():
+    st.header("⚙️ Settings")
+    user_id = get_user_id() or "local"
+    render_cron_settings(user_id)
+
+
 def main() -> None:
     init_state()
-    if not st.session_state.signed_in:
-        st.warning("Signed out.")
-        if st.button("Sign in again"):
-            st.session_state.signed_in = True
-            st.rerun()
+    if not render_auth_page():
         return
 
     page = render_sidebar()
@@ -4958,6 +4974,8 @@ def main() -> None:
         "Ask / AI": page_ask,
         "Dashboard": page_dashboard,
         "Email": page_email,
+        "SAP Connect": page_sap,
+        "Settings": page_settings,
     }
     try:
         handlers = routers.get(page)
