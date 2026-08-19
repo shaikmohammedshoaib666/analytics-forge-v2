@@ -155,13 +155,7 @@ def sign_up(email: str, password: str) -> dict:
         return {"error": "Supabase not configured"}
     try:
         res = client.auth.sign_up({"email": email, "password": password})
-        if res.user:
-            st.session_state["supabase_user"] = {
-                "id": res.user.id,
-                "email": res.user.email,
-            }
-            st.session_state["supabase_session"] = res.session
-            st.session_state["signed_in"] = True
+        if _set_signed_in_user(getattr(res, "user", None), getattr(res, "session", None)):
             return {"user": res.user}
         return {"error": "Sign-up failed"}
     except Exception as e:
@@ -174,13 +168,7 @@ def sign_in(email: str, password: str) -> dict:
         return {"error": "Supabase not configured"}
     try:
         res = client.auth.sign_in_with_password({"email": email, "password": password})
-        if res.user:
-            st.session_state["supabase_user"] = {
-                "id": res.user.id,
-                "email": res.user.email,
-            }
-            st.session_state["supabase_session"] = res.session
-            st.session_state["signed_in"] = True
+        if _set_signed_in_user(getattr(res, "user", None), getattr(res, "session", None)):
             return {"user": res.user}
         return {"error": "Sign-in failed"}
     except Exception as e:
@@ -196,7 +184,12 @@ def sign_out():
             pass
     st.session_state["supabase_user"] = None
     st.session_state["supabase_session"] = None
+    st.session_state["supabase_access_token"] = None
+    st.session_state["supabase_refresh_token"] = None
     st.session_state["signed_in"] = False
+    st.session_state["_last_oauth_code"] = None
+    st.session_state["_oauth_failed_code"] = None
+    st.session_state["_oauth_failed_error"] = None
 
 
 def get_user() -> Optional[dict]:
@@ -214,6 +207,7 @@ def _build_google_authorize_fallback_url() -> str:
     if APP_BASE_URL:
         redirect_to = APP_BASE_URL.rstrip("/")
         url += f"&redirect_to={quote(redirect_to, safe='')}"
+    url += "&prompt=select_account"
     return url
 
 
@@ -224,7 +218,8 @@ def _ensure_authorize_url_params(url: str) -> str:
     query.setdefault("provider", "google")
     query.setdefault("apikey", SUPABASE_KEY)
     if APP_BASE_URL:
-        query.setdefault("redirect_to", APP_BASE_URL.rstrip("/"))
+        query["redirect_to"] = APP_BASE_URL.rstrip("/")
+    query["prompt"] = "select_account"
     encoded_query = urlencode(query, doseq=True, safe=":/")
     return urlunparse(parsed._replace(query=encoded_query))
 
@@ -236,7 +231,12 @@ def get_google_oauth_url() -> tuple[Optional[str], Optional[str]]:
     try:
         payload = {"provider": "google"}
         if APP_BASE_URL:
-            payload["options"] = {"redirect_to": APP_BASE_URL.rstrip("/")}
+            payload["options"] = {
+                "redirect_to": APP_BASE_URL.rstrip("/"),
+                "query_params": {"prompt": "select_account"},
+            }
+        else:
+            payload["options"] = {"query_params": {"prompt": "select_account"}}
         res = client.auth.sign_in_with_oauth(payload)
         oauth_url = getattr(res, "url", None) if res else None
         if oauth_url:
@@ -258,8 +258,39 @@ def _set_signed_in_user(user, session) -> bool:
         return False
     st.session_state["supabase_user"] = {"id": user.id, "email": user.email}
     st.session_state["supabase_session"] = session
+    st.session_state["supabase_access_token"] = getattr(session, "access_token", None) if session else None
+    st.session_state["supabase_refresh_token"] = getattr(session, "refresh_token", None) if session else None
     st.session_state["signed_in"] = True
     return True
+
+
+def _restore_signed_in_user(client) -> bool:
+    """Restore an authenticated user from saved session tokens or client session."""
+    if st.session_state.get("signed_in") and get_user():
+        return True
+
+    access_token = (st.session_state.get("supabase_access_token") or "").strip()
+    refresh_token = (st.session_state.get("supabase_refresh_token") or "").strip()
+    if access_token and refresh_token:
+        try:
+            res = client.auth.set_session(access_token, refresh_token)
+            user = getattr(res, "user", None) if res else None
+            session = getattr(res, "session", None) if res else None
+            if _set_signed_in_user(user, session):
+                return True
+        except Exception:
+            pass
+
+    try:
+        session_res = client.auth.get_session()
+        session = getattr(session_res, "session", None) if session_res else None
+        user_res = client.auth.get_user()
+        user = getattr(user_res, "user", None) if user_res else None
+        if _set_signed_in_user(user, session):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _query_params_dict() -> dict[str, str]:
@@ -327,11 +358,13 @@ def _handle_oauth_callback(client) -> tuple[bool, Optional[str]]:
 
     if params.get("error"):
         description = params.get("error_description") or "OAuth sign-in was cancelled or denied."
-        _clear_auth_query_params()
         return False, description
 
     code = (params.get("code") or "").strip()
     if code:
+        if st.session_state.get("_oauth_failed_code") == code:
+            cached_error = st.session_state.get("_oauth_failed_error") or "Google sign-in failed."
+            return False, f"{cached_error} Remove the stale callback URL params and try Google sign-in again."
         if st.session_state.get("_last_oauth_code") == code and st.session_state.get("signed_in") and get_user():
             return True, None
         try:
@@ -340,12 +373,19 @@ def _handle_oauth_callback(client) -> tuple[bool, Optional[str]]:
             session = getattr(res, "session", None) if res else None
             if _set_signed_in_user(user, session):
                 st.session_state["_last_oauth_code"] = code
+                st.session_state["_oauth_failed_code"] = None
+                st.session_state["_oauth_failed_error"] = None
                 _clear_auth_query_params()
                 return True, None
-            return False, "Google sign-in callback was received, but no user session was returned."
+            error_message = "Google sign-in callback was received, but no user session was returned."
+            st.session_state["_oauth_failed_code"] = code
+            st.session_state["_oauth_failed_error"] = error_message
+            return False, error_message
         except Exception as exc:
-            _clear_auth_query_params()
-            return False, f"Google sign-in failed. The callback may be expired. ({exc})"
+            error_message = f"Google sign-in failed. The callback may be expired. ({exc})"
+            st.session_state["_oauth_failed_code"] = code
+            st.session_state["_oauth_failed_error"] = error_message
+            return False, error_message
 
     access_token = (params.get("access_token") or "").strip()
     refresh_token = (params.get("refresh_token") or "").strip()
@@ -379,6 +419,8 @@ def render_auth_page() -> bool:
 
     client = init_supabase_client()
     if client:
+        if _restore_signed_in_user(client):
+            return True
         callback_authenticated, callback_error = _handle_oauth_callback(client)
         if callback_authenticated:
             st.rerun()
@@ -390,6 +432,7 @@ def render_auth_page() -> bool:
 
     st.title("🔐 Analytics Forge v2")
     st.markdown("Sign in or create an account to continue.")
+    st.caption("Fallback available: use the **Sign In** tab to continue with email and password.")
 
     tab_login, tab_register = st.tabs(["Sign In", "Register"])
 
@@ -427,7 +470,7 @@ def render_auth_page() -> bool:
 
     oauth_url, oauth_error = get_google_oauth_url()
     if oauth_url:
-        st.markdown(f"[Sign in with Google]({oauth_url})")
+        st.markdown(f"[Sign in with Google (Choose account)]({oauth_url})")
     elif oauth_error:
         st.info(oauth_error)
 
