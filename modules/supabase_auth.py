@@ -253,6 +253,122 @@ def get_google_oauth_url() -> tuple[Optional[str], Optional[str]]:
     return _build_google_authorize_fallback_url(), None
 
 
+def _set_signed_in_user(user, session) -> bool:
+    if not user:
+        return False
+    st.session_state["supabase_user"] = {"id": user.id, "email": user.email}
+    st.session_state["supabase_session"] = session
+    st.session_state["signed_in"] = True
+    return True
+
+
+def _query_params_dict() -> dict[str, str]:
+    try:
+        params_obj = getattr(st, "query_params", None)
+        if params_obj is not None:
+            return {k: params_obj.get(k, "") for k in params_obj.keys()}
+    except Exception:
+        pass
+    try:
+        raw = st.experimental_get_query_params()
+        return {k: (v[0] if isinstance(v, list) and v else v) for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def _clear_auth_query_params():
+    auth_keys = {
+        "code",
+        "error",
+        "error_code",
+        "error_description",
+        "access_token",
+        "refresh_token",
+        "token_type",
+        "expires_in",
+        "provider_token",
+        "provider_refresh_token",
+    }
+    try:
+        params_obj = getattr(st, "query_params", None)
+        if params_obj is not None:
+            for key in list(params_obj.keys()):
+                if key in auth_keys:
+                    del params_obj[key]
+            return
+    except Exception:
+        pass
+    # Fallback API: rewrite with non-auth params.
+    try:
+        current = st.experimental_get_query_params()
+        cleaned = {k: v for k, v in current.items() if k not in auth_keys}
+        st.experimental_set_query_params(**cleaned)
+    except Exception:
+        pass
+
+
+def _exchange_auth_code(client, auth_code: str):
+    # supabase-py has used both dict and positional signatures across versions.
+    last_error = None
+    try:
+        return client.auth.exchange_code_for_session({"auth_code": auth_code})
+    except Exception as exc:
+        last_error = exc
+    try:
+        return client.auth.exchange_code_for_session(auth_code)
+    except Exception:
+        raise last_error
+
+
+def _handle_oauth_callback(client) -> tuple[bool, Optional[str]]:
+    params = _query_params_dict()
+    if not params:
+        return False, None
+
+    if params.get("error"):
+        description = params.get("error_description") or "OAuth sign-in was cancelled or denied."
+        _clear_auth_query_params()
+        return False, description
+
+    code = (params.get("code") or "").strip()
+    if code:
+        if st.session_state.get("_last_oauth_code") == code and st.session_state.get("signed_in") and get_user():
+            return True, None
+        try:
+            res = _exchange_auth_code(client, code)
+            user = getattr(res, "user", None) if res else None
+            session = getattr(res, "session", None) if res else None
+            if _set_signed_in_user(user, session):
+                st.session_state["_last_oauth_code"] = code
+                _clear_auth_query_params()
+                return True, None
+            return False, "Google sign-in callback was received, but no user session was returned."
+        except Exception as exc:
+            _clear_auth_query_params()
+            return False, f"Google sign-in failed. The callback may be expired. ({exc})"
+
+    access_token = (params.get("access_token") or "").strip()
+    refresh_token = (params.get("refresh_token") or "").strip()
+    if access_token and refresh_token:
+        try:
+            res = client.auth.set_session(access_token, refresh_token)
+            user = getattr(res, "user", None) if res else None
+            session = getattr(res, "session", None) if res else None
+            if _set_signed_in_user(user, session):
+                _clear_auth_query_params()
+                return True, None
+        except Exception:
+            pass
+
+    if any(k in params for k in ("provider_token", "provider_refresh_token", "access_token")):
+        # Hash fragments are not available to Streamlit server callbacks.
+        return (
+            False,
+            "Google callback tokens were not readable server-side. Please retry Google sign-in to complete code exchange.",
+        )
+    return False, None
+
+
 def render_auth_page() -> bool:
     """Render login/register UI. Returns True if authenticated."""
     status = supabase_status_message()
@@ -260,6 +376,14 @@ def render_auth_page() -> bool:
         st.warning(f"Auth fallback mode: {status}")
         st.session_state["signed_in"] = True
         return True
+
+    client = init_supabase_client()
+    if client:
+        callback_authenticated, callback_error = _handle_oauth_callback(client)
+        if callback_authenticated:
+            st.rerun()
+        if callback_error:
+            st.error(callback_error)
 
     if st.session_state.get("signed_in") and get_user():
         return True
