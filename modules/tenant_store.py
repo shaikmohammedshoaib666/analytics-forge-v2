@@ -17,7 +17,7 @@ _LOCAL_DB = Path(__file__).resolve().parent.parent / ".forge_sessions" / "tenant
 
 
 def _use_supabase() -> bool:
-    return bool(SUPABASE_URL and SUPABASE_KEY)
+    return bool(SUPABASE_URL and SUPABASE_KEY and _get_client() is not None)
 
 
 def _get_client():

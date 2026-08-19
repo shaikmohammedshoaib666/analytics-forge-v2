@@ -14,7 +14,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 
 def _use_supabase() -> bool:
-    return bool(SUPABASE_URL and SUPABASE_KEY)
+    return bool(SUPABASE_URL and SUPABASE_KEY and _get_client() is not None)
 
 
 def _get_client():

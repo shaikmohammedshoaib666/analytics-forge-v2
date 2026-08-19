@@ -8,22 +8,31 @@ import ssl
 from datetime import datetime
 from email.message import EmailMessage
 
-from supabase import create_client
-
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 EMAIL_USER = os.environ.get("EMAIL_USER", "")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
 
-client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+def _init_client():
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return None, "Missing SUPABASE_URL or SUPABASE_SERVICE_KEY"
+    try:
+        from supabase import create_client
+    except Exception as exc:
+        return None, f"Supabase import failed: {exc}"
+    try:
+        return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY), ""
+    except Exception as exc:
+        return None, f"Supabase client init failed: {exc}"
 
 
-def get_enabled_jobs():
+def get_enabled_jobs(client):
     res = client.table("cron_jobs").select("*").eq("enabled", True).eq("job_type", "monday_report").execute()
     return res.data or []
 
 
-def get_user_latest_session(user_id: str):
+def get_user_latest_session(client, user_id: str):
     res = client.table("user_sessions").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(1).execute()
     return res.data[0] if res.data else None
 
@@ -70,7 +79,12 @@ def send_email(to_email: str, body: str):
 
 
 def main():
-    jobs = get_enabled_jobs()
+    client, err = _init_client()
+    if client is None:
+        print(f"[SKIP] Monday cron disabled: {err}")
+        return
+
+    jobs = get_enabled_jobs(client)
     print(f"Monday cron: {len(jobs)} enabled job(s)")
     for job in jobs:
         user_id = job["user_id"]
@@ -80,7 +94,7 @@ def main():
             print(f"  [SKIP] user {user_id}: no email configured")
             continue
 
-        session = get_user_latest_session(user_id)
+        session = get_user_latest_session(client, user_id)
         brief = compose_brief(session)
         send_email(email, brief)
 

@@ -24,6 +24,7 @@ polars>=0.20
 prophet>=1.1.5
 cleanlab>=2.5
 duckdb>=0.9
+supabase>=2.0
 
 # Skip on free Cloud (install locally / Docker full image instead):
 # pyspark, great-expectations, ydata-profiling, lightgbm, fastapi, uvicorn

@@ -5,6 +5,7 @@ Falls back to stub auth if SUPABASE_URL/SUPABASE_KEY not set.
 from __future__ import annotations
 
 import os
+from importlib import import_module
 from typing import Optional
 
 import streamlit as st
@@ -13,21 +14,60 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 _client = None
+_client_error = ""
 
 
 def _supabase_available() -> bool:
     return bool(SUPABASE_URL and SUPABASE_KEY)
 
 
+def _load_create_client():
+    """Load supabase create_client safely and return (callable, error)."""
+    try:
+        module = import_module("supabase")
+    except Exception as exc:
+        return None, f"Supabase package import failed: {exc}"
+
+    create_client = getattr(module, "create_client", None)
+    if create_client is None:
+        module_file = getattr(module, "__file__", None)
+        if not module_file:
+            return None, (
+                "Supabase package is missing create_client. "
+                "A local folder named 'supabase' may be shadowing the pip package."
+            )
+        return None, "Supabase package is incompatible (missing create_client)."
+    return create_client, ""
+
+
 def init_supabase_client():
-    global _client
+    global _client, _client_error
     if _client is not None:
         return _client
     if not _supabase_available():
+        _client_error = "Supabase env vars are not configured."
         return None
-    from supabase import create_client
-    _client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    create_client, err = _load_create_client()
+    if not create_client:
+        _client_error = err or "Supabase import failed."
+        return None
+
+    try:
+        _client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        _client_error = ""
+    except Exception as exc:
+        _client = None
+        _client_error = f"Supabase client init failed: {exc}"
     return _client
+
+
+def supabase_status_message() -> str:
+    if _supabase_available():
+        if init_supabase_client() is None:
+            return _client_error or "Supabase is unavailable."
+        return ""
+    return "Set SUPABASE_URL + SUPABASE_KEY env vars for real auth."
 
 
 def sign_up(email: str, password: str) -> dict:
@@ -102,8 +142,9 @@ def get_google_oauth_url() -> Optional[str]:
 
 def render_auth_page() -> bool:
     """Render login/register UI. Returns True if authenticated."""
-    if not _supabase_available():
-        st.caption("⚠️ Set SUPABASE_URL + SUPABASE_KEY env vars for real auth")
+    status = supabase_status_message()
+    if status:
+        st.warning(f"Auth fallback mode: {status}")
         st.session_state["signed_in"] = True
         return True
 
