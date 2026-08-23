@@ -43,6 +43,13 @@ def _local_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT, filename TEXT, upload_meta TEXT, created_at TEXT
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS custom_kpis (
+        id TEXT PRIMARY KEY,
+        user_id TEXT,
+        name TEXT,
+        spec_json TEXT,
+        updated_at TEXT
+    )""")
     conn.commit()
     return conn
 
@@ -156,6 +163,78 @@ def save_upload_meta(user_id: str, filename: str, meta: dict) -> bool:
         "INSERT INTO uploads (user_id, filename, upload_meta, created_at) VALUES (?,?,?,?)",
         (user_id, filename, json.dumps(meta), datetime.utcnow().isoformat()),
     )
+    conn.commit()
+    conn.close()
+    return True
+
+
+# --- Custom KPIs (KPI Studio) ---
+
+def save_custom_kpi(user_id: str, spec: dict) -> bool:
+    """Persist one custom KPI spec (id required). Supabase or local SQLite."""
+    kpi_id = str(spec.get("id") or "")
+    if not kpi_id:
+        return False
+    name = str(spec.get("name") or "Custom")
+    updated = datetime.utcnow().isoformat()
+    if _use_supabase():
+        client = _get_client()
+        client.table("user_custom_kpis").upsert({
+            "id": kpi_id,
+            "user_id": user_id,
+            "name": name,
+            "spec_json": spec,
+            "updated_at": updated,
+        }, on_conflict="id").execute()
+        return True
+    conn = _local_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO custom_kpis (id, user_id, name, spec_json, updated_at) VALUES (?,?,?,?,?)",
+        (kpi_id, user_id, name, json.dumps(spec), updated),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def list_custom_kpis(user_id: str) -> list[dict]:
+    if _use_supabase():
+        client = _get_client()
+        res = client.table("user_custom_kpis").select("*").eq("user_id", user_id).execute()
+        rows = res.data or []
+        out = []
+        for r in rows:
+            spec = r.get("spec_json")
+            if isinstance(spec, str):
+                try:
+                    spec = json.loads(spec)
+                except json.JSONDecodeError:
+                    spec = {}
+            if isinstance(spec, dict):
+                out.append(spec)
+        return out
+    conn = _local_db()
+    rows = conn.execute(
+        "SELECT spec_json FROM custom_kpis WHERE user_id=? ORDER BY updated_at DESC",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        try:
+            out.append(json.loads(r[0]))
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return out
+
+
+def delete_custom_kpi(user_id: str, kpi_id) -> bool:
+    if _use_supabase():
+        client = _get_client()
+        client.table("user_custom_kpis").delete().eq("user_id", user_id).eq("id", kpi_id).execute()
+        return True
+    conn = _local_db()
+    conn.execute("DELETE FROM custom_kpis WHERE user_id=? AND id=?", (user_id, str(kpi_id)))
     conn.commit()
     conn.close()
     return True

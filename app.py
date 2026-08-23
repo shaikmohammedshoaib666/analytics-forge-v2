@@ -44,6 +44,13 @@ from modules.dashboard_charts import (
     render_export_controls,
     render_extended_charts,
 )
+from modules.kpi_studio import (
+    ensure_custom_kpis_loaded,
+    evaluate_all as evaluate_custom_kpis,
+    merge_kpi_dicts,
+    render_kpi_studio,
+)
+from modules.report_builder import render_report_builder_page
 from modules.dwdm_labs import (
     apriori_need_txn_hint,
     assign_kmeans,
@@ -4277,7 +4284,18 @@ def page_kpis() -> None:
 
     filtered = render_filter_bar(df, key_prefix="kpi")
     kpis = get_kpis(filtered)
-    render_kpi_boxes(kpis, per_row=4)
+    uid = get_user_id()
+    custom_specs = ensure_custom_kpis_loaded(uid)
+    custom_vals = evaluate_custom_kpis(filtered, custom_specs)
+    display_kpis = merge_kpi_dicts(kpis, custom_vals)
+    render_kpi_boxes(display_kpis, per_row=4)
+
+    st.divider()
+    render_kpi_studio(filtered, user_id=uid, key_prefix="kpi_studio")
+    # Re-read after studio mutations for export
+    custom_specs = ensure_custom_kpis_loaded(uid)
+    custom_vals = evaluate_custom_kpis(filtered, custom_specs)
+    kpis = merge_kpi_dicts(get_kpis(filtered), custom_vals)
 
     impact = render_dollar_impact(filtered, key_prefix="kpi")
     field_actions = []
@@ -4621,6 +4639,9 @@ def page_dashboard() -> None:
     )
 
     kpis_all = get_kpis(filtered)
+    uid = get_user_id()
+    custom_vals = evaluate_custom_kpis(filtered, ensure_custom_kpis_loaded(uid))
+    kpis_all = merge_kpi_dicts(kpis_all, custom_vals)
     kpi_keys = [k for k in kpis_all.keys() if k != "Domain"]
     pick = st.multiselect("KPIs to show", kpi_keys, default=kpi_keys[:8], key="dash_kpi_pick")
     render_kpi_boxes({k: kpis_all[k] for k in pick} | {"Domain": kpis_all.get("Domain")}, per_row=4)
@@ -4715,6 +4736,56 @@ def page_dashboard() -> None:
     if st.button("Clear pinned dashboard charts"):
         st.session_state.dashboard_charts = []
         st.rerun()
+
+
+def page_report_builder() -> None:
+    df = require_data()
+    if df is None:
+        return
+    filtered = render_filter_bar(df, key_prefix="rb")
+    if filtered.empty:
+        st.warning("Filters removed all rows.")
+        return
+    uid = get_user_id()
+    auto_kpis = get_kpis(filtered)
+    custom_specs = ensure_custom_kpis_loaded(uid)
+    custom_vals = evaluate_custom_kpis(filtered, custom_specs)
+    domain_label = DOMAIN_CATALOG.get(st.session_state.get("domain") or "generic", {}).get(
+        "label", st.session_state.get("domain") or "generic"
+    )
+    forge_domain = str(st.session_state.get("forge_domain") or st.session_state.get("domain") or "generic")
+    cached_brief = st.session_state.get("kpi_manager_brief") or st.session_state.get("dash_manager_brief") or {}
+    actions = list(cached_brief.get("actions") or [])
+    briefing = str(cached_brief.get("body") or "")
+    if not actions and st.session_state.get("field_result"):
+        actions = list((st.session_state.field_result.get("model_card") or {}).get("actions") or [])
+
+    def _email_rb(to: str, body: str, html: str, kpi_csv: bytes) -> str:
+        return send_full_dashboard_email(
+            to,
+            subject=f"[Analytics Forge v2] Custom report — {domain_label}",
+            body=body,
+            html_report=html,
+            kpi_csv=kpi_csv,
+            df=filtered,
+        )
+
+    render_report_builder_page(
+        filtered,
+        auto_kpis=auto_kpis,
+        custom_kpis=custom_vals,
+        insights=st.session_state.get("dashboard_insights") or [],
+        actions=actions,
+        briefing=briefing,
+        domain_label=domain_label,
+        chart_domain=forge_domain,
+        source_name=str(st.session_state.get("manual_name") or "forge.csv"),
+        roles=dict(st.session_state.get("column_roles") or {}),
+        smtp_ok=bool(EMAIL_USER and EMAIL_PASSWORD),
+        default_to=OPERATOR_EMAIL,
+        send_fn=_email_rb,
+        key_prefix="rb",
+    )
 
 
 def page_email() -> None:
@@ -4835,6 +4906,7 @@ PAGES = [
     "ML Studio",
     "Ask / AI",
     "Dashboard",
+    "Report Builder",
     "Email",
     "SAP Connect",
     "Settings",
@@ -4973,6 +5045,7 @@ def main() -> None:
         "ML Studio": page_ml,
         "Ask / AI": page_ask,
         "Dashboard": page_dashboard,
+        "Report Builder": page_report_builder,
         "Email": page_email,
         "SAP Connect": page_sap,
         "Settings": page_settings,

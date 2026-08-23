@@ -964,9 +964,9 @@ def _list_html(items: Optional[list[Any]], empty: str) -> str:
     return "<ol>" + "".join(f"<li>{html_lib.escape(x)}</li>" for x in cleaned) + "</ol>"
 
 
-def chart_specs_to_html(specs: list[dict[str, Any]]) -> str:
+def chart_specs_to_html(specs: list[dict[str, Any]], *, include_plotlyjs: Any = "cdn") -> str:
     chunks: list[str] = []
-    js_mode: Any = "cdn"
+    js_mode: Any = include_plotlyjs
     for spec in specs:
         title = html_lib.escape(str(spec.get("title") or spec.get("id") or "Chart"))
         fig = spec.get("fig")

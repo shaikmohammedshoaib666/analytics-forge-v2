@@ -81,6 +81,8 @@ def main() -> int:
             forge_session_title="",
             last_gemini_error="",
             domain_user_override=False,
+            custom_kpis=[],
+            _custom_kpis_hydrated=False,
         )
 
     rng = np.random.default_rng(0)
@@ -495,6 +497,70 @@ def main() -> int:
         assert "cleaned" in label or "joined" in label
 
     check("dashboard_charts helpers", dashboard_charts_helpers)
+
+    def kpi_studio_helpers():
+        from modules import kpi_studio as KS
+
+        assert KS.evaluate_kpi(sales, {"name": "AvgRev", "agg": "mean", "column": "revenue"}) > 0
+        assert KS.evaluate_kpi(sales, {"name": "SumUnits", "agg": "sum", "column": "units"}) > 0
+        filtered_kpi = KS.evaluate_kpi(
+            sales,
+            {
+                "name": "EastRev",
+                "agg": "sum",
+                "column": "revenue",
+                "filter": {"column": "region", "op": "==", "value": "East"},
+            },
+        )
+        assert isinstance(filtered_kpi, (int, float))
+        ratio = KS.evaluate_kpi(
+            sales,
+            {
+                "name": "RevPerUnit",
+                "agg": "sum",
+                "column": "revenue",
+                "ratio": {"agg": "sum", "column": "units"},
+            },
+        )
+        assert isinstance(ratio, (int, float)) and ratio > 0
+        # Reject raw-eval style: only allowlisted ops
+        try:
+            KS.apply_simple_filter(sales, {"column": "region", "op": "eval", "value": "1"})
+            raise AssertionError("bad op should fail")
+        except ValueError:
+            pass
+        merged = KS.merge_kpi_dicts({"Rows": 1}, {"Rows": 2, "CustomA": 9})
+        assert merged["Rows"] == 1 and merged["Custom_Rows"] == 2
+
+    check("kpi_studio helpers", kpi_studio_helpers)
+
+    def report_builder_helpers():
+        from modules import report_builder as RB
+
+        pack = RB.assemble_custom_report(
+            sales,
+            selected_tiles=[RB.TILE_AUTO_KPIS, RB.TILE_CORE, RB.TILE_INSIGHTS],
+            tile_order=[RB.TILE_INSIGHTS, RB.TILE_AUTO_KPIS, RB.TILE_CORE],
+            columns=2,
+            auto_kpis={"Rows": len(sales), "Total_Revenue": float(sales["revenue"].sum())},
+            custom_kpis={"AvgRev": float(sales["revenue"].mean())},
+            insights=["East leads"],
+            actions=["Review West"],
+            briefing="Smoke report",
+            domain="Sales",
+            chart_domain="sales",
+            source_name="sales.csv",
+            roles={"date": "date", "revenue": "revenue", "region": "region"},
+        )
+        html_b = pack["html"].encode("utf-8")
+        assert b"<!DOCTYPE html>" in html_b
+        assert b"kpi-card" in html_b
+        assert b"plotly" in html_b.lower()
+        assert pack["tile_order"][0] == RB.TILE_INSIGHTS
+        order = RB.move_tile([RB.TILE_AUTO_KPIS, RB.TILE_CORE], RB.TILE_CORE, "up")
+        assert order[0] == RB.TILE_CORE
+
+    check("report_builder helpers", report_builder_helpers)
 
     if errors:
         print(f"\n{len(errors)} FAILURE(S)")

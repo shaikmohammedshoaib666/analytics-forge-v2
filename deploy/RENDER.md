@@ -36,6 +36,9 @@ Paste-in-UI keys are session-only on Render — they do not persist. Use **Envir
 - Demos: mode **MANUAL UPLOAD** (joins, Clean, Field, Optuna, LlamaIndex)
 - LIVE without PLC → connection **`buffer_only`**
 - Free tier sleeps after ~15 min idle; first open after sleep can take ~30–60s
+- **KPI Studio** lives under **Auto KPIs** (custom calculated fields → session + optional Supabase)
+- **Report Builder** nav page → colored HTML download (Plotly CDN); optional email if `EMAIL_*` env is set
+- After pushing `main`, use **Manual Deploy → Deploy latest commit** if auto-deploy did not start
 
 ## Start command
 
