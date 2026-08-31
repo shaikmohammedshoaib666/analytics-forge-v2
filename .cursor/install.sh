@@ -8,7 +8,22 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+_ensure_venv_module() {
+  if python3 -c "import venv" 2>/dev/null; then
+    return 0
+  fi
+  echo "python3-venv missing — installing system package…"
+  if command -v sudo >/dev/null 2>&1; then
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-venv python3-pip
+  else
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-venv python3-pip
+  fi
+}
+
 if [ ! -d .venv ]; then
+  _ensure_venv_module
   python3 -m venv .venv
 fi
 
