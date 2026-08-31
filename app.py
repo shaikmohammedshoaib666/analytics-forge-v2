@@ -65,7 +65,13 @@ from modules.domain_detect import APP_TO_OS_DOMAIN, OS_TO_APP_DOMAIN
 from modules.supabase_auth import render_auth_page, sign_out as supabase_sign_out, get_user, get_user_id, _supabase_available
 from modules.sap_connector import render_sap_page
 from modules.cron_manager import render_cron_settings
-from modules.url_ingest import default_ingest_sql, friendly_source_label, load_from_url
+from modules.url_ingest import (
+    build_preset_sql,
+    default_ingest_sql,
+    friendly_source_label,
+    list_ingest_presets,
+    load_from_url,
+)
 from modules.forge_os import (
     autosave_after_pipeline,
     gemini_issue_from_raw,
@@ -205,6 +211,9 @@ def init_state() -> None:
         "url_ingest_meta": None,
         "url_ingest_mode": "limit",
         "url_ingest_sql": default_ingest_sql(),
+        "url_ingest_preset": "last_n_rows",
+        "url_ingest_preset_params": {},
+        "maintenance_table_attached": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1116,6 +1125,21 @@ def _run_great_expectations(df: pd.DataFrame) -> dict[str, Any]:
     return {"engine": "great_expectations", "available": ge_available, "passed": passed, "total": len(results), "results": results[:40], "ok": True}
 
 
+def _ydata_description_parts(desc: Any) -> tuple[dict[str, Any], list[Any]]:
+    """Support ydata-profiling dict or BaseDescription dataclass (v4+)."""
+    if desc is None:
+        return {}, []
+    if isinstance(desc, dict):
+        return desc.get("variables") or {}, desc.get("alerts") or []
+    variables = getattr(desc, "variables", None) or {}
+    alerts = getattr(desc, "alerts", None) or []
+    if not isinstance(variables, dict):
+        variables = dict(variables) if variables else {}
+    if not isinstance(alerts, list):
+        alerts = list(alerts) if alerts else []
+    return variables, alerts
+
+
 def _run_ydata(df: pd.DataFrame) -> dict[str, Any]:
     high_card = []
     for c in df.columns:
@@ -1126,28 +1150,59 @@ def _run_ydata(df: pd.DataFrame) -> dict[str, Any]:
         from ydata_profiling import ProfileReport
         profile = ProfileReport(df.head(min(400, len(df))), minimal=True, progress_bar=False)
         desc = profile.get_description()
-        return {"engine": "ydata-profiling", "ok": True, "variables": len(desc.get("variables", {})), "alerts": len(desc.get("alerts", [])), "high_cardinality": high_card[:8]}
+        variables, alerts = _ydata_description_parts(desc)
+        return {
+            "engine": "ydata-profiling",
+            "ok": True,
+            "variables": len(variables),
+            "alerts": len(alerts),
+            "high_cardinality": high_card[:8],
+        }
     except Exception as exc:
         return {"engine": "ydata-profiling", "ok": False, "error": str(exc), "high_cardinality": high_card[:8]}
+
+
+def _cleanlab_datalab_available() -> tuple[bool, str]:
+    try:
+        from cleanlab import Datalab  # noqa: F401
+        return True, ""
+    except ImportError as exc:
+        msg = str(exc)
+        if "datalab" in msg.lower():
+            return False, (
+                "Cleanlab Datalab is not installed. Add `cleanlab[datalab]` to requirements "
+                "(Render: requirements-cloud.txt) or install locally."
+            )
+        return False, f"Cleanlab unavailable: {msg}"
+    except Exception as exc:
+        return False, f"Cleanlab unavailable: {exc}"
 
 
 def _run_cleanlab(df: pd.DataFrame) -> dict[str, Any]:
     fcol = _col(df, "failure", "fault", "label", "churn", "default")
     num = df.select_dtypes(include=[np.number])
     out: dict[str, Any] = {"engine": "cleanlab"}
-    try:
-        from cleanlab import Datalab
-        work = num.dropna()
-        if work.shape[1] >= 2 and len(work) >= 15:
-            lab = Datalab(data=work.reset_index(drop=True))
-            lab.find_issues(features=work.values)
-            issues = lab.get_issues()
-            n_out = int(issues["is_outlier_issue"].sum()) if "is_outlier_issue" in issues.columns else 0
-            out.update({"ok": True, "outlier_issues": n_out})
-        else:
-            out.update({"ok": True, "skipped": "numeric too small"})
-    except Exception as exc:
-        out.update({"ok": False, "error": str(exc)})
+    available, avail_msg = _cleanlab_datalab_available()
+    if not available:
+        out.update({"ok": False, "skipped": "datalab_not_installed", "error": avail_msg})
+    else:
+        try:
+            from cleanlab import Datalab
+            work = num.dropna()
+            if work.shape[1] >= 2 and len(work) >= 15:
+                lab = Datalab(data=work.reset_index(drop=True))
+                lab.find_issues(features=work.values)
+                issues = lab.get_issues()
+                n_out = int(issues["is_outlier_issue"].sum()) if "is_outlier_issue" in issues.columns else 0
+                out.update({"ok": True, "outlier_issues": n_out})
+            else:
+                out.update({"ok": True, "skipped": "numeric too small"})
+        except Exception as exc:
+            err = str(exc)
+            hint = ""
+            if "datalab" in err.lower() or "Datalab" in err:
+                hint = " Install `cleanlab[datalab]` for full Datalab support."
+            out.update({"ok": False, "error": f"{err}{hint}"})
     dirty = []
     if fcol and _col(df, "vibration", "vib"):
         v = pd.to_numeric(df[_col(df, "vibration", "vib")], errors="coerce")
@@ -3705,6 +3760,17 @@ def page_upload() -> None:
         page_live_console()
         return
 
+    _pdm_domain = st.session_state.get("domain") or st.session_state.get("forge_domain")
+    if _pdm_domain in ("predictive_maintenance", "pdm", None, "generic"):
+        sample_path = Path(__file__).resolve().parent / "data" / "samples" / "sample_predictive_maintenance.csv"
+        st.info(
+            "**Predictive maintenance quick-start:** Try the bundled sample "
+            f"`data/samples/sample_predictive_maintenance.csv` ({sample_path.name}) via **File upload**, "
+            "or use **URL / cloud link → SQL slice** with plant presets (last N days, machine_id filter, "
+            "random sample %) before running Clean → Field → ML. For work-order history, attach a "
+            "**maintenance table** below and join on **Data Integration**."
+        )
+
     gemini_key_ui("upload")
     st.divider()
 
@@ -3769,15 +3835,68 @@ def page_upload() -> None:
                 key="upload_url_row_limit",
             )
         else:
+            app_domain = st.session_state.get("domain") or "generic"
+            presets = list_ingest_presets(domain=app_domain if app_domain != "generic" else None)
+            preset_ids = [p["id"] for p in presets]
+            preset_labels = {p["id"]: p["label"] for p in presets}
+            cur_preset = st.session_state.get("url_ingest_preset") or preset_ids[0]
+            if cur_preset not in preset_ids:
+                cur_preset = preset_ids[0]
+            preset_pick = st.selectbox(
+                "SQL preset (plant / PdM templates)",
+                preset_ids,
+                index=preset_ids.index(cur_preset),
+                format_func=lambda pid: preset_labels.get(pid, pid),
+                key="upload_url_sql_preset",
+            )
+            picked = next(p for p in presets if p["id"] == preset_pick)
+            st.caption(picked.get("description") or "")
+            preset_params: dict[str, Any] = dict(st.session_state.get("url_ingest_preset_params") or {})
+            param_cols = st.columns(min(3, max(1, len(picked.get("params") or []))) or 1)
+            for idx, (pname, plabel, pdefault, pkind) in enumerate(picked.get("params") or []):
+                with param_cols[idx % len(param_cols)]:
+                    if pkind == "int":
+                        preset_params[pname] = st.number_input(
+                            plabel,
+                            min_value=0,
+                            value=int(preset_params.get(pname, pdefault) or pdefault),
+                            step=max(1, int(pdefault) // 10) if int(pdefault) > 10 else 1,
+                            key=f"upload_preset_{preset_pick}_{pname}",
+                        )
+                    elif pkind == "float":
+                        preset_params[pname] = st.number_input(
+                            plabel,
+                            min_value=0.1,
+                            max_value=100.0,
+                            value=float(preset_params.get(pname, pdefault) or pdefault),
+                            step=0.5,
+                            key=f"upload_preset_{preset_pick}_{pname}",
+                        )
+                    else:
+                        preset_params[pname] = st.text_input(
+                            plabel,
+                            value=str(preset_params.get(pname, pdefault) or pdefault),
+                            key=f"upload_preset_{preset_pick}_{pname}",
+                        )
+            c_preset, _ = st.columns([1, 3])
+            if c_preset.button("Apply preset to SQL", key="upload_apply_sql_preset"):
+                try:
+                    st.session_state.url_ingest_sql = build_preset_sql(preset_pick, preset_params)
+                    st.session_state.url_ingest_preset = preset_pick
+                    st.session_state.url_ingest_preset_params = preset_params
+                    st.success(f"Applied **{preset_labels[preset_pick]}** template.")
+                except Exception as exc:
+                    st.error(str(exc))
             sql_query = st.text_area(
                 "DuckDB SQL (use `{source}` for the resolved file path/URL)",
-                value=st.session_state.get("url_ingest_sql") or default_ingest_sql(),
+                value=st.session_state.get("url_ingest_sql")
+                or default_ingest_sql(app_domain if app_domain != "generic" else None),
                 height=160,
                 key="upload_url_sql",
             )
             st.caption(
                 "Example: `SELECT machine_id, temperature, vibration FROM read_csv_auto('{source}', header=true) "
-                "WHERE machine_id = 'M1' AND timestamp >= '2024-06-01' LIMIT 50000`"
+                "WHERE machine_id = 'M-001' AND try_cast(timestamp AS TIMESTAMP) >= TIMESTAMP '2024-06-01' LIMIT 50000`"
             )
         force_cache = st.checkbox(
             "Always download to disk first (recommended for Google Drive / files > 100 MB)",
@@ -3832,6 +3951,29 @@ def page_upload() -> None:
                 f"Current URL source: **{st.session_state.get('manual_name', 'url')}** — "
                 f"{len(df):,} × {df.shape[1]} · kind `{meta.get('kind')}`"
             )
+
+    with st.expander("Attach maintenance table (optional — join on Data Integration)"):
+        st.caption(
+            "Upload a work-order / PM schedule CSV (columns like `machine_id`, `maintenance_date`, `work_order`). "
+            "It registers as `maintenance` for INNER/LEFT joins with sensor data."
+        )
+        maint_file = st.file_uploader(
+            "Maintenance / work-order CSV",
+            type=["csv", "tsv", "xlsx", "xls"],
+            key="upload_maintenance_table",
+        )
+        if maint_file is not None:
+            try:
+                maint_df = load_uploaded_file(maint_file)
+                tables = dict(st.session_state.get("uploaded_tables") or {})
+                tables["maintenance"] = maint_df
+                st.session_state.uploaded_tables = tables
+                st.session_state.maintenance_table_attached = maint_file.name
+                st.success(f"Registered **maintenance** — {len(maint_df):,} rows × {maint_df.shape[1]} cols")
+            except Exception as exc:
+                st.error(str(exc))
+        elif st.session_state.get("maintenance_table_attached"):
+            st.write(f"Attached: **{st.session_state.maintenance_table_attached}** (see Data Integration to join)")
 
     if df is None and st.session_state.manual_df is not None:
         df = st.session_state.manual_df
@@ -3889,6 +4031,15 @@ def page_data_integration() -> None:
         "The join result becomes the MANUAL working dataframe (`clean_df` → `get_data()`). "
         "LIVE CONNECT still reads the SCADA buffer."
     )
+    dom = st.session_state.get("domain") or st.session_state.get("forge_domain")
+    if dom in ("predictive_maintenance", "pdm"):
+        st.info(
+            "**Predictive maintenance join pattern:** Load sensor telemetry as your primary table "
+            "(`manual_df` / `clean_df`) and join a **maintenance** or work-order table on "
+            "`machine_id` or `asset_id`. Use LEFT join to keep all sensor rows and attach PM history; "
+            "use INNER join when training only on assets with logged maintenance events. "
+            "Attach maintenance CSV from **Upload → Attach maintenance table** or upload extra tables below."
+        )
     if st.session_state.get("mode") == "LIVE CONNECT":
         st.info(
             "You are in **LIVE CONNECT**. Joins can use `live_buffer` as a table, but applying a join "
@@ -4183,6 +4334,67 @@ def page_dwdm_labs() -> None:
                         st.success("MICE values written to working dataframe.")
 
 
+def _render_quality_subreports(report: dict[str, Any]) -> None:
+    """Human-readable ydata / Cleanlab / PCA / association detail (not raw JSON dumps on error)."""
+    yd = report.get("ydata") or {}
+    cl = report.get("cleanlab") or {}
+    pca = report.get("pca") or {}
+    assoc = report.get("association") or {}
+    flags = report.get("domain_flags")
+
+    st.markdown("**ydata-profiling**")
+    if yd.get("ok"):
+        st.success(
+            f"Profile OK — {yd.get('variables', 0)} variables, {yd.get('alerts', 0)} alerts."
+        )
+        if yd.get("high_cardinality"):
+            st.caption(f"High-cardinality columns: {', '.join(yd['high_cardinality'])}")
+    else:
+        st.warning(yd.get("error") or "ydata-profiling did not complete.")
+        if yd.get("high_cardinality"):
+            st.caption(f"High-cardinality (from fallback scan): {', '.join(yd['high_cardinality'])}")
+
+    st.markdown("**Cleanlab Datalab**")
+    if cl.get("ok"):
+        if cl.get("skipped"):
+            st.info(f"Skipped: {cl['skipped']}")
+        else:
+            st.success(f"Outlier issues flagged: {cl.get('outlier_issues', 0)}")
+        if cl.get("dirty_label_flags"):
+            for line in cl["dirty_label_flags"]:
+                st.warning(line)
+    elif cl.get("skipped") == "datalab_not_installed":
+        st.info(cl.get("error") or "Install cleanlab[datalab] for Datalab outlier detection.")
+    else:
+        st.warning(cl.get("error") or "Cleanlab check failed.")
+
+    st.markdown("**PCA drift**")
+    if pca.get("ok"):
+        drift = "yes" if pca.get("concept_drift") else "no"
+        st.write(
+            f"Early var={pca.get('pca_var_early')} · Late var={pca.get('pca_var_late')} · "
+            f"drift={pca.get('drift_score')} · concept drift={drift}"
+        )
+    else:
+        st.caption("PCA drift skipped (need ≥30 rows and 2 numeric columns).")
+
+    st.markdown("**Association rules**")
+    if assoc.get("ok"):
+        if assoc.get("suspicious_rules"):
+            st.warning(f"Suspicious co-occurrences: {len(assoc['suspicious_rules'])}")
+            for rule in assoc["suspicious_rules"][:5]:
+                st.write(f"- {rule.get('rule')} (conf={rule.get('confidence')})")
+        else:
+            st.success(f"Mined {assoc.get('rules_found', 0)} rules — none flagged suspicious.")
+    else:
+        st.caption(assoc.get("error") or assoc.get("skipped") or "Association mining skipped.")
+
+    if flags:
+        st.markdown("**Domain OPC / physics flags**")
+        for flag in flags:
+            st.error(flag)
+
+
 def page_clean() -> None:
     st.header("Clean")
     st.caption(
@@ -4238,15 +4450,17 @@ def page_clean() -> None:
         with st.expander("Great Expectations detail"):
             st.json(report.get("ge") or {})
         with st.expander("ydata / Cleanlab / PCA / Association"):
-            st.json(
-                {
-                    "ydata": report.get("ydata"),
-                    "cleanlab": report.get("cleanlab"),
-                    "pca": report.get("pca"),
-                    "association": report.get("association"),
-                    "domain_flags": report.get("domain_flags"),
-                }
-            )
+            _render_quality_subreports(report)
+            with st.expander("Raw JSON (debug)", expanded=False):
+                st.json(
+                    {
+                        "ydata": report.get("ydata"),
+                        "cleanlab": report.get("cleanlab"),
+                        "pca": report.get("pca"),
+                        "association": report.get("association"),
+                        "domain_flags": report.get("domain_flags"),
+                    }
+                )
 
     c1, c2 = st.columns(2)
     with c1:

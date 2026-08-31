@@ -23,7 +23,7 @@ llama-index-core>=0.10
 # Mid-weight (usually OK on Cloud Community / Render free)
 polars>=0.20
 prophet>=1.1.5
-cleanlab>=2.5
+cleanlab[datalab]>=2.5
 duckdb>=0.9
 supabase>=2.0
 lightgbm>=4.0
