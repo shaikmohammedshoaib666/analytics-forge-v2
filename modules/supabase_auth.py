@@ -7,11 +7,13 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import socket
 import warnings
 from importlib import import_module
 from typing import Any, Optional
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
+import requests
 import streamlit as st
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -21,6 +23,7 @@ _INVALID_URL_SEGMENTS = ("/rest/v1", "/auth/v1")
 
 _client = None
 _client_error = ""
+_connectivity_cache: dict[str, Any] = {"host": "", "checked": False, "reachable": True, "error": ""}
 
 
 def _supabase_available() -> bool:
@@ -61,6 +64,113 @@ def _looks_like_invalid_supabase_path(raw_url: str) -> bool:
     parsed = urlparse((raw_url or "").strip())
     path = parsed.path.lower().rstrip("/")
     return any(path.endswith(seg) for seg in _INVALID_URL_SEGMENTS)
+
+
+def _supabase_host() -> str:
+    normalized = normalize_supabase_url(SUPABASE_URL)
+    return urlparse(normalized).netloc if normalized else ""
+
+
+def _unreachable_supabase_message(host: str) -> str:
+    display_host = host or "unknown host"
+    return (
+        f"Cannot reach Supabase at {display_host}. "
+        "Check Render SUPABASE_URL — project may be paused or deleted. "
+        "Open Supabase dashboard and update env vars."
+    )
+
+
+def _looks_like_connectivity_error(message: str) -> bool:
+    lowered = (message or "").lower()
+    markers = (
+        "nxdomain",
+        "name or service not known",
+        "failed to resolve",
+        "nodename nor servname provided",
+        "getaddrinfo failed",
+        "connection refused",
+        "connection error",
+        "connection aborted",
+        "network is unreachable",
+        "temporary failure in name resolution",
+        "max retries exceeded",
+        "name resolution",
+        "errno -2",
+        "errno -3",
+        "errno 110",
+        "errno 111",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def check_supabase_connectivity(*, force: bool = False) -> tuple[bool, str]:
+    """
+    Lightweight DNS + HTTP check against Supabase Auth health endpoint.
+    Returns (reachable, error_message).
+    """
+    global _connectivity_cache
+
+    if not _supabase_available():
+        return False, "Supabase env vars are not configured."
+
+    host = _supabase_host()
+    if not host:
+        return False, "Supabase URL is empty after normalization."
+
+    if (
+        not force
+        and _connectivity_cache["checked"]
+        and _connectivity_cache["host"] == host
+    ):
+        if _connectivity_cache["reachable"]:
+            return True, ""
+        return False, str(_connectivity_cache["error"])
+
+    normalized = normalize_supabase_url(SUPABASE_URL)
+    health_url = f"{normalized}/auth/v1/health"
+    error = ""
+
+    try:
+        socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        error = _unreachable_supabase_message(host)
+        _connectivity_cache = {
+            "host": host,
+            "checked": True,
+            "reachable": False,
+            "error": error,
+        }
+        return False, error
+
+    try:
+        resp = requests.head(health_url, timeout=5, allow_redirects=True)
+        # Any HTTP response means the host exists; auth may still fail for other reasons.
+        if resp.status_code >= 500:
+            logging.warning(
+                "Supabase health check returned %s for %s", resp.status_code, health_url
+            )
+        _connectivity_cache = {"host": host, "checked": True, "reachable": True, "error": ""}
+        return True, ""
+    except requests.exceptions.Timeout:
+        error = _unreachable_supabase_message(host)
+    except requests.exceptions.RequestException as exc:
+        if _looks_like_connectivity_error(str(exc)):
+            error = _unreachable_supabase_message(host)
+        else:
+            error = _unreachable_supabase_message(host)
+            logging.warning("Supabase connectivity check failed for %s: %s", health_url, exc)
+
+    _connectivity_cache = {"host": host, "checked": True, "reachable": False, "error": error}
+    return False, error
+
+
+def _ensure_supabase_reachable() -> Optional[str]:
+    """Return a user-facing error when Supabase host is unreachable."""
+    reachable, error = check_supabase_connectivity()
+    if reachable:
+        return None
+    st.session_state["_last_auth_error"] = error
+    return error
 
 
 def _is_likely_service_role_key(key: str) -> bool:
@@ -242,6 +352,8 @@ def _format_auth_error(exc: Exception) -> str:
         )
     if "invalid api key" in lowered or "invalid jwt" in lowered:
         return "Supabase API key appears invalid. Use the anon/publishable key from Project Settings → API."
+    if _looks_like_connectivity_error(message):
+        return _unreachable_supabase_message(_supabase_host())
     if message:
         return message
     return "Authentication failed. Please try again."
@@ -280,11 +392,16 @@ def auth_health_diagnostic() -> dict:
         else:
             key_hint = "anon_or_publishable"
     client_ready = init_supabase_client() is not None
+    reachable, connectivity_error = (
+        check_supabase_connectivity() if _supabase_available() else (False, None)
+    )
     return {
         "supabase_env_configured": _supabase_available(),
         "client_ready": client_ready,
         "client_error": _client_error or None,
         "supabase_host": host or None,
+        "supabase_reachable": reachable if _supabase_available() else None,
+        "supabase_connectivity_error": connectivity_error or None,
         "url_had_api_path_suffix": _looks_like_invalid_supabase_path(SUPABASE_URL),
         "app_base_url_set": bool(APP_BASE_URL),
         "app_base_url_host": urlparse(APP_BASE_URL).netloc if APP_BASE_URL else None,
@@ -295,6 +412,9 @@ def auth_health_diagnostic() -> dict:
 
 
 def sign_up(email: str, password: str) -> dict:
+    connectivity_error = _ensure_supabase_reachable()
+    if connectivity_error:
+        return {"error": connectivity_error}
     client = init_supabase_client()
     if not client:
         err = _client_error or "Supabase auth client failed to initialize."
@@ -327,6 +447,9 @@ def sign_up(email: str, password: str) -> dict:
 
 
 def sign_in(email: str, password: str) -> dict:
+    connectivity_error = _ensure_supabase_reachable()
+    if connectivity_error:
+        return {"error": connectivity_error}
     client = init_supabase_client()
     if not client:
         err = _client_error or "Supabase auth client failed to initialize."
@@ -397,6 +520,9 @@ def _ensure_authorize_url_params(url: str) -> str:
 
 
 def get_google_oauth_url() -> tuple[Optional[str], Optional[str]]:
+    connectivity_error = _ensure_supabase_reachable()
+    if connectivity_error:
+        return None, connectivity_error
     client = init_supabase_client()
     if not client:
         return None, _client_error or "Supabase auth client is unavailable."
@@ -597,6 +723,9 @@ def render_auth_page() -> bool:
         return True
 
     client = init_supabase_client()
+    connectivity_error = None
+    if _supabase_available():
+        _, connectivity_error = check_supabase_connectivity()
     if client:
         if _restore_signed_in_user(client):
             return True
@@ -612,6 +741,10 @@ def render_auth_page() -> bool:
 
     st.title("🔐 Analytics Forge v2")
     st.markdown("Sign in or create an account to continue.")
+
+    if connectivity_error:
+        st.error(connectivity_error)
+        _render_auth_diagnostic()
 
     tab_login, tab_register = st.tabs(["Sign In", "Register"])
     auth_error_shown = False
