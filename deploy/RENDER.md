@@ -18,7 +18,7 @@ To follow `main` going forward:
 4. **Branch** → change `cursor/forge-v2-foundation-f3f9` → **`main`** → Save
 5. If it does not start a deploy: **Manual Deploy** → **Deploy latest commit**
 
-Optional: **Environment** → confirm `GEMINI_API_KEY` (and `GEMINI_MODEL=gemini-2.0-flash`).
+Optional: **Environment** → confirm `GEMINI_API_KEY` (and `GEMINI_MODEL=gemini-3.6-flash`). Old values such as `gemini-2.0-flash` are remapped in code.
 Paste-in-UI keys are session-only on Render — they do not persist. Use **Environment** + Manual Deploy.
 
 ## New Blueprint (only if the service does not exist)
@@ -36,6 +36,20 @@ Paste-in-UI keys are session-only on Render — they do not persist. Use **Envir
 - Demos: mode **MANUAL UPLOAD** (joins, Clean, Field, Optuna, LlamaIndex)
 - LIVE without PLC → connection **`buffer_only`**
 - Free tier sleeps after ~15 min idle; first open after sleep can take ~30–60s
+- **KPI Studio** lives under **Auto KPIs** (custom calculated fields → session + optional Supabase)
+- **Report Builder** nav page → colored HTML download (Plotly CDN); optional email if `EMAIL_*` env is set
+- After pushing `main`, use **Manual Deploy → Deploy latest commit** if auto-deploy did not start
+
+## Start command
+
+Render scans `$PORT` (default **10000**). Do **not** put `$PORT` in `render.yaml` — YAML does not expand it, so Streamlit binds the default **8501** and the deploy fails with *Port scan timeout / no open ports*.
+
+`start.sh` binds `${PORT:-10000}` on `0.0.0.0`. Blueprint `startCommand` is `bash start.sh`.
+
+If the service already exists, set it in the dashboard too (Blueprint updates are not always applied):
+
+1. Service → **Settings** → **Build & Deploy** → **Start Command** → `bash start.sh` → Save
+2. **Manual Deploy** → **Deploy latest commit** (the SHA that added `start.sh`)
 
 ## If build fails
 

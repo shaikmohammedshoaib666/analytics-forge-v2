@@ -32,7 +32,7 @@ pip install -r requirements.txt
 
 # .env (gitignored)
 # GEMINI_API_KEY=...
-# GEMINI_MODEL=gemini-2.0-flash
+# GEMINI_MODEL=gemini-3.6-flash
 
 streamlit run app.py
 # http://127.0.0.1:8501
@@ -71,7 +71,7 @@ If an existing Render service is still pinned to `cursor/forge-v2-foundation-f3f
 2. Repo: `shaikmohammedshoaib666/analytics-forge-v2`
 3. Branch: `main` · Main file: `app.py`
 4. Requirements file: **`requirements-cloud.txt`**
-5. Secrets: `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-2.0-flash`
+5. Secrets: `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-3.6-flash`
 
 Cloud demos: use **MANUAL** or LIVE **`buffer_only`**. Private plant `192.168.x` Modbus will not reach from the internet.
 
@@ -107,7 +107,16 @@ uvicorn gateway:app --host 0.0.0.0 --port 8088
 
 ```
 GEMINI_API_KEY=...
-GEMINI_MODEL=gemini-2.0-flash
+GEMINI_MODEL=gemini-3.6-flash
 EMAIL_USER=
 EMAIL_PASSWORD=
+SUPABASE_URL=https://<project-ref>.supabase.co
+SUPABASE_KEY=<anon-or-publishable-key>
+# Optional but recommended for OAuth callbacks:
+APP_BASE_URL=https://<your-render-service>.onrender.com
 ```
+
+Google OAuth notes:
+- Use `SUPABASE_KEY` as anon/publishable key only (never service role key in app auth flow).
+- In Supabase Dashboard → Authentication → Providers → Google: enable provider and set Google client ID/secret.
+- In Supabase Dashboard → Authentication → URL Configuration: add `https://<your-render-service>.onrender.com` to Redirect URLs / Additional Redirect URLs.

@@ -7,7 +7,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -17,28 +19,36 @@ from typing import Any, Iterator, Optional
 
 import pandas as pd
 
+from modules.domain_detect import (
+    APP_TO_OS_DOMAIN,
+    BASE_ROLES,
+    COLUMN_ROLES,
+    DOMAIN_OVERRIDE_LOW_CONF,
+    DOMAIN_ROLE_PACKS,
+    FORGE_DOMAIN_LABELS,
+    FORGE_DOMAINS,
+    OS_TO_APP_DOMAIN,
+    detect_column_types,
+    detect_domain,
+    domain_pipeline_hint,
+    roles_for_domain,
+    suggest_roles as _suggest_roles_domain,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 STORE_DIR = ROOT / ".forge_sessions"
 DB_PATH = STORE_DIR / "forge_os.db"
 ENV_PATH = ROOT / ".env"
 
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
-BROKEN_GEMINI_ALIASES = frozenset({"gemini-flash-latest", "gemini-flash-latest-latest"})
-
-COLUMN_ROLES = (
-    "id",
-    "date",
-    "metric",
-    "category",
-    "downtime",
-    "loss",
-    "qty",
-    "scrap",
-    "asset",
-    "availability",
-    "performance",
-    "quality",
-    "unused",
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+RETIRED_GEMINI_ALIASES = frozenset(
+    {
+        "gemini-2.0-flash",
+        "gemini-flash-latest",
+        "gemini-flash-latest-latest",
+        "gemini-1.5-flash",
+        "gemini-pro",
+    }
 )
 
 OEE_PULSE_GITHUB = "https://github.com/shaikmohammedshoaib666/oee-pulse"
@@ -46,6 +56,7 @@ PHASE3_CAPTION = "SaaS login + Monday scheduled email = next phase."
 RENDER_KEY_WARNING = "On Render, set GEMINI_API_KEY in Environment. Session key is temporary."
 
 FRAME_KEYS = ("clean_df", "manual_df")
+SESSION_DBLCLICK_S = 0.5
 
 
 # -----------------------------------------------------------------------------
@@ -127,16 +138,17 @@ def get_gemini_api_key() -> str:
 
 
 def get_gemini_model() -> str:
-    """Prefer GEMINI_MODEL env/secrets/.env; remap aliases that often fail."""
+    """Prefer GEMINI_MODEL env/secrets/.env; remap retired aliases to gemini-3.6-flash."""
     raw = (
         str(os.environ.get("GEMINI_MODEL") or "").strip()
         or _from_secrets("GEMINI_MODEL")
         or _dotenv_get("GEMINI_MODEL")
         or DEFAULT_GEMINI_MODEL
     )
-    if not raw or raw.lower() in BROKEN_GEMINI_ALIASES:
+    name = raw[7:] if raw.lower().startswith("models/") else raw
+    if not name or name.lower() in RETIRED_GEMINI_ALIASES:
         return DEFAULT_GEMINI_MODEL
-    return raw
+    return name
 
 
 def persist_gemini_key(key: str, write_dotenv: bool = True) -> dict[str, Any]:
@@ -335,13 +347,22 @@ def ensure_store() -> None:
                 name TEXT PRIMARY KEY,
                 mapping_json TEXT NOT NULL DEFAULT '{}',
                 source_columns_json TEXT NOT NULL DEFAULT '[]',
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                domain TEXT NOT NULL DEFAULT 'generic'
             )
             """
         )
+        _migrate_column_mappings(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate_column_mappings(conn: sqlite3.Connection) -> None:
+    """Add domain column to column_mappings if missing (existing DBs)."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(column_mappings)").fetchall()}
+    if "domain" not in cols:
+        conn.execute("ALTER TABLE column_mappings ADD COLUMN domain TEXT NOT NULL DEFAULT 'generic'")
 
 
 @contextmanager
@@ -393,6 +414,19 @@ def session_exists(session_id: str) -> bool:
     with connect() as conn:
         row = conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone()
     return row is not None
+
+
+def delete_session(session_id: str) -> bool:
+    sid = str(session_id or "").strip()
+    if not sid or "/" in sid or "\\" in sid or sid in {".", ".."}:
+        return False
+    with connect() as conn:
+        conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
+        conn.commit()
+    sess_dir = STORE_DIR / sid
+    if sess_dir.is_dir() and STORE_DIR in sess_dir.resolve().parents:
+        shutil.rmtree(sess_dir, ignore_errors=True)
+    return True
 
 
 def _session_dir(session_id: str) -> Path:
@@ -531,9 +565,13 @@ def collect_streamlit_meta() -> dict[str, Any]:
         "usd_per_hour": st.session_state.get("usd_per_hour") or 0,
         "usd_per_unit": st.session_state.get("usd_per_unit") or 0,
         "column_roles": st.session_state.get("column_roles") or {},
+        "forge_domain": st.session_state.get("forge_domain"),
+        "column_types": st.session_state.get("column_types") or {},
+        "forge_detect": st.session_state.get("forge_detect"),
         "clean_engine": st.session_state.get("clean_engine"),
         "prefer_clean_df": bool(st.session_state.get("prefer_clean_df", True)),
         "mode": st.session_state.get("mode"),
+        "domain_user_override": bool(st.session_state.get("domain_user_override")),
     }
 
 
@@ -586,6 +624,11 @@ def restore_session_to_streamlit(session_id: str) -> bool:
         st.session_state.manual_df = clean
     st.session_state.manual_name = meta.get("manual_name") or meta.get("_source_name") or session_id
     st.session_state.domain = meta.get("domain") or st.session_state.get("domain") or "generic"
+    st.session_state.forge_domain = meta.get("forge_domain") or st.session_state.get("forge_domain") or "generic"
+    if isinstance(meta.get("column_types"), dict):
+        st.session_state.column_types = meta["column_types"]
+    if isinstance(meta.get("forge_detect"), dict):
+        st.session_state.forge_detect = meta["forge_detect"]
     if isinstance(meta.get("domain_meta"), dict):
         st.session_state.domain_meta = meta["domain_meta"]
     st.session_state.dashboard_insights = list(meta.get("dashboard_insights") or [])
@@ -595,6 +638,7 @@ def restore_session_to_streamlit(session_id: str) -> bool:
     st.session_state.column_roles = dict(meta.get("column_roles") or {})
     st.session_state.forge_session_id = session_id
     st.session_state.forge_session_title = meta.get("_title") or session_id
+    st.session_state.domain_user_override = bool(meta.get("domain_user_override"))
     if meta.get("clean_engine"):
         st.session_state.clean_engine = meta["clean_engine"]
     return True
@@ -604,10 +648,7 @@ def render_session_sidebar() -> None:
     import streamlit as st
 
     st.subheader("Recent sessions")
-    st.caption(
-        "SQLite under `.forge_sessions/` — survives Streamlit reruns. "
-        "On Render this disk is wiped on deploy; that is expected."
-    )
+    st.caption("Restore, or click the session name twice quickly to delete.")
     try:
         rows = list_sessions(8)
     except OSError:
@@ -616,18 +657,56 @@ def render_session_sidebar() -> None:
     if not rows:
         st.caption("No saved sessions yet — run Clean or Field to snapshot.")
         return
+
+    pending = str(st.session_state.get("_forge_sess_pending_delete") or "")
+    pending_title = str(st.session_state.get("_forge_sess_pending_title") or pending)
+
+    def _confirm_delete_body(sid: str, title: str) -> None:
+        st.write(f"Delete **{title}** from `.forge_sessions`?")
+        b1, b2 = st.columns(2)
+        if b1.button("Confirm delete", type="primary", key="forge_del_yes"):
+            delete_session(sid)
+            st.session_state.pop("_forge_sess_pending_delete", None)
+            st.session_state.pop("_forge_sess_pending_title", None)
+            st.rerun()
+        if b2.button("Cancel", key="forge_del_no"):
+            st.session_state.pop("_forge_sess_pending_delete", None)
+            st.session_state.pop("_forge_sess_pending_title", None)
+            st.rerun()
+
+    if pending:
+        dlg = getattr(st, "dialog", None)
+        if callable(dlg):
+            @dlg("Delete session?")
+            def _dlg() -> None:
+                _confirm_delete_body(pending, pending_title)
+
+            _dlg()
+        else:
+            st.warning(f"Delete **{pending_title}** from `.forge_sessions`?")
+            _confirm_delete_body(pending, pending_title)
+
     for rec in rows:
         sid = rec["id"]
         label = rec.get("title") or sid
         stamp = str(rec.get("updated_at") or "")[:16]
         c1, c2 = st.columns([3, 1])
-        c1.caption(f"{label} · {stamp}")
-        if c2.button("Restore", key=f"forge_restore_{sid}"):
-            if restore_session_to_streamlit(sid):
-                st.success(f"Restored {label}")
+        with c1:
+            if st.button(f"{label}", key=f"forge_sess_name_{sid}", help=f"{stamp} — click twice quickly to delete"):
+                now = time.monotonic()
+                prev = st.session_state.get("_forge_sess_click") or {}
+                if str(prev.get("sid")) == sid and (now - float(prev.get("t") or 0)) <= SESSION_DBLCLICK_S:
+                    st.session_state._forge_sess_pending_delete = sid
+                    st.session_state._forge_sess_pending_title = label
+                st.session_state._forge_sess_click = {"sid": sid, "t": now}
                 st.rerun()
-            else:
-                st.error("Could not restore that session.")
+        with c2:
+            if st.button("Restore", key=f"forge_restore_{sid}"):
+                if restore_session_to_streamlit(sid):
+                    st.success(f"Restored {label}")
+                    st.rerun()
+                else:
+                    st.error("Could not restore that session.")
 
 
 # -----------------------------------------------------------------------------
@@ -644,22 +723,25 @@ def save_named_mapping(
     name: str,
     mapping: dict[str, str],
     source_columns: Optional[list[str]] = None,
+    domain: str = "generic",
 ) -> None:
     ensure_store()
     label = (name or "").strip() or "default"
+    dom = domain if domain in FORGE_DOMAINS else "generic"
     payload = json.dumps({str(k): str(v) for k, v in (mapping or {}).items() if v}, ensure_ascii=False)
     cols = json.dumps(list(source_columns or []), ensure_ascii=False)
     with connect() as conn:
         conn.execute(
             """
-            INSERT INTO column_mappings(name, mapping_json, source_columns_json, updated_at)
-            VALUES(?, ?, ?, ?)
+            INSERT INTO column_mappings(name, mapping_json, source_columns_json, updated_at, domain)
+            VALUES(?, ?, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
               mapping_json=excluded.mapping_json,
               source_columns_json=excluded.source_columns_json,
-              updated_at=excluded.updated_at
+              updated_at=excluded.updated_at,
+              domain=excluded.domain
             """,
-            (label, payload, cols, _utcnow()),
+            (label, payload, cols, _utcnow(), dom),
         )
         conn.commit()
 
@@ -691,7 +773,7 @@ def list_named_mappings() -> list[dict[str, Any]]:
         return []
     with connect() as conn:
         rows = conn.execute(
-            "SELECT name, mapping_json, source_columns_json, updated_at "
+            "SELECT name, mapping_json, source_columns_json, updated_at, domain "
             "FROM column_mappings ORDER BY updated_at DESC"
         ).fetchall()
     out: list[dict[str, Any]] = []
@@ -710,6 +792,7 @@ def list_named_mappings() -> list[dict[str, Any]]:
                 "mapping": mapping if isinstance(mapping, dict) else {},
                 "source_columns": source_columns if isinstance(source_columns, list) else [],
                 "updated_at": r["updated_at"],
+                "domain": str(r["domain"] if "domain" in r.keys() else "generic"),
             }
         )
     return out
@@ -757,70 +840,258 @@ def apply_roles_to_frame(df: pd.DataFrame, roles: dict[str, str]) -> pd.DataFram
     return out
 
 
-def suggest_roles(columns: list[str]) -> dict[str, str]:
-    hints: dict[str, tuple[str, ...]] = {
-        "date": ("date", "timestamp", "datetime", "day", "shift_date"),
-        "id": ("id", "machine_id", "asset_id", "customer_id", "sku"),
-        "downtime": ("downtime", "down_time", "stop_min", "idle_min"),
-        "loss": ("loss", "lost", "cost", "waste"),
-        "qty": ("qty", "quantity", "units", "count", "produced"),
-        "scrap": ("scrap", "reject", "defect"),
-        "asset": ("asset", "machine", "equipment", "line"),
-        "availability": ("availability", "avail"),
-        "performance": ("performance", "perf", "speed_loss"),
-        "quality": ("quality", "fpy", "yield"),
-        "metric": ("revenue", "sales", "temperature", "vibration", "oee"),
-        "category": ("region", "location", "shift", "category", "type"),
-    }
-    out: dict[str, str] = {}
-    used: set[str] = set()
-    for role, keys in hints.items():
-        for col in columns:
-            if col in used:
-                continue
-            n = _norm_name(col)
-            if any(k in n for k in keys):
-                out[col] = role
-                used.add(col)
-                break
-    return out
+def suggest_roles(
+    columns: list[str],
+    domain: str = "generic",
+    column_types: Optional[dict[str, str]] = None,
+    df: Optional[pd.DataFrame] = None,
+) -> dict[str, str]:
+    return _suggest_roles_domain(columns, domain=domain, column_types=column_types, df=df)
+
+
+def _gemini_forge_domain(df: pd.DataFrame) -> tuple[Optional[str], float]:
+    """Optional Gemini boost for OS domain detection."""
+    if not get_gemini_api_key():
+        return None, 0.0
+    schema = [
+        {
+            "column": str(c),
+            "dtype": str(df[c].dtype),
+            "sample": [str(x) for x in df[c].dropna().head(2).tolist()],
+        }
+        for c in df.columns[:35]
+    ]
+    prompt = (
+        "Classify this dataset into ONE Forge OS domain key from: "
+        + ", ".join(FORGE_DOMAINS)
+        + ".\nReturn JSON only: {\"domain\": \"...\", \"confidence\": 0-1}\n"
+        f"Columns: {json.dumps(schema)[:4000]}"
+    )
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=get_gemini_api_key())
+        model = genai.GenerativeModel(get_gemini_model())
+        resp = model.generate_content(prompt)
+        text = (getattr(resp, "text", None) or "").strip()
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            payload = json.loads(text[start:end])
+            gd = str(payload.get("domain", "")).strip()
+            if gd in FORGE_DOMAINS:
+                return gd, float(payload.get("confidence", 0.8))
+    except Exception:
+        pass
+    return None, 0.0
+
+
+def run_forge_detect(
+    df: pd.DataFrame,
+    *,
+    use_gemini: bool = True,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Detect column types + OS domain; cache in session unless force=True."""
+    import streamlit as st
+
+    fp = f"{len(df)}:{df.shape[1]}:{','.join(str(c) for c in df.columns[:8])}"
+    cached = st.session_state.get("forge_detect")
+    if (
+        not force
+        and isinstance(cached, dict)
+        and cached.get("fingerprint") == fp
+        and cached.get("column_types")
+    ):
+        return cached
+
+    ctypes = detect_column_types(df)
+    g_dom, g_conf = (None, 0.0)
+    gemini_error = None
+    if use_gemini:
+        g_dom, g_conf = _gemini_forge_domain(df)
+    result = detect_domain(df, ctypes, gemini_domain=g_dom, gemini_confidence=g_conf)
+    result["fingerprint"] = fp
+    result["gemini_domain"] = g_dom
+    result["gemini_error"] = gemini_error
+
+    st.session_state.column_types = ctypes
+    st.session_state.forge_detect = result
+    if st.session_state.get("domain_user_override"):
+        locked = str(st.session_state.get("forge_domain") or "generic")
+        if locked not in FORGE_DOMAINS:
+            locked = "generic"
+        result = dict(result)
+        result["detected_domain"] = result.get("domain")
+        result["domain"] = locked
+        result["label"] = FORGE_DOMAIN_LABELS.get(locked, locked)
+        result["app_domain"] = OS_TO_APP_DOMAIN.get(locked, "generic")
+        result["overridden"] = True
+        st.session_state.forge_detect = result
+        return result
+    st.session_state.forge_domain = result["domain"]
+    st.session_state.domain = result.get("app_domain") or OS_TO_APP_DOMAIN.get(result["domain"], "generic")
+    return result
+
+
+def render_detection_ui(df: pd.DataFrame, context: str = "upload") -> dict[str, Any]:
+    """Step 1 — column types table + detected domain."""
+    import streamlit as st
+
+    st.subheader("Step 1 — Detect")
+    st.caption("Column types and domain are inferred **before** mapping — Forge OS, not plant-only.")
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        st.caption("Upload a file to run detection.")
+        return {}
+
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        rerun = st.button("Re-run detection", key=f"redetect_{context}")
+    detect = run_forge_detect(df, use_gemini=bool(get_gemini_api_key()), force=rerun)
+
+    type_rows = []
+    for col, ctype in (detect.get("column_types") or {}).items():
+        sample = ""
+        if col in df.columns:
+            sample = str(df[col].dropna().iloc[0])[:40] if df[col].notna().any() else ""
+        type_rows.append({"column": col, "type": ctype, "dtype": str(df[col].dtype), "sample": sample})
+    if type_rows:
+        st.dataframe(pd.DataFrame(type_rows), use_container_width=True, hide_index=True)
+
+    conf = float(detect.get("confidence") or 0)
+    st.markdown(
+        f"**Detected domain:** {detect.get('label', 'Generic')} "
+        f"(`{detect.get('domain', 'generic')}`) — confidence **{conf * 100:.0f}%**"
+    )
+    if conf < DOMAIN_OVERRIDE_LOW_CONF:
+        st.caption("guess — override if wrong.")
+    reasons = detect.get("reasons") or []
+    if reasons:
+        st.caption("Why: " + " · ".join(str(r) for r in reasons[:8]))
+    if detect.get("gemini_domain"):
+        st.caption(f"Gemini also suggested `{detect['gemini_domain']}`.")
+    return detect
+
+
+def render_domain_selector(context: str = "upload") -> str:
+    """Always-visible domain pack. User pick always wins; Field must not overwrite it."""
+    import streamlit as st
+
+    st.subheader("Domain")
+    detect = st.session_state.get("forge_detect") or {}
+    detected = str(detect.get("detected_domain") or detect.get("domain") or st.session_state.get("forge_domain") or "generic")
+    if detected not in FORGE_DOMAINS:
+        detected = APP_TO_OS_DOMAIN.get(detected, "generic")
+        if detected not in FORGE_DOMAINS:
+            detected = "generic"
+    conf = float(detect.get("confidence") or 0)
+    if st.session_state.get("domain_user_override"):
+        st.caption("Your override — Field will not replace this.")
+    elif conf < DOMAIN_OVERRIDE_LOW_CONF:
+        st.caption("guess — override if wrong.")
+
+    widget_key = "forge_domain_override_pick"
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = detected
+
+    def _mark_override() -> None:
+        st.session_state.domain_user_override = True
+
+    picked = st.selectbox(
+        "Domain pack (override if wrong)",
+        FORGE_DOMAINS,
+        format_func=lambda d: FORGE_DOMAIN_LABELS.get(d, d),
+        key=widget_key,
+        on_change=_mark_override,
+    )
+    if picked not in FORGE_DOMAINS:
+        picked = "generic"
+    st.session_state.forge_domain = picked
+    st.session_state.domain = OS_TO_APP_DOMAIN.get(picked, "generic")
+    if picked != detected:
+        st.session_state.domain_user_override = True
+        st.caption(f"Overriding `{detected}` → `{picked}`.")
+    pack_roles = DOMAIN_ROLE_PACKS.get(picked, ())
+    if pack_roles:
+        st.caption(f"Extra roles for this pack: {', '.join(pack_roles)}")
+    return picked
+
+
+def reset_domain_pick_for_new_frame(df: pd.DataFrame) -> None:
+    """New upload fingerprint clears the domain widget so detection can re-seed."""
+    try:
+        import streamlit as st
+    except Exception:
+        return
+    if df is None or not isinstance(df, pd.DataFrame):
+        return
+    fp = f"{len(df)}:{df.shape[1]}:{','.join(str(c) for c in df.columns[:12])}"
+    if st.session_state.get("_domain_pick_fp") == fp:
+        return
+    st.session_state._domain_pick_fp = fp
+    st.session_state.domain_user_override = False
+    st.session_state.pop("forge_domain_override_pick", None)
+    st.session_state.pop("_field_detect_cache", None)
+    st.session_state.field_result = None
+    st.session_state.forge_detect = None
+    st.session_state.domain_meta = None
+
+
+def render_domain_hints(domain: Optional[str] = None) -> None:
+    """Lightweight routing hint after domain is known."""
+    import streamlit as st
+
+    dom = domain or st.session_state.get("forge_domain") or "generic"
+    hint = domain_pipeline_hint(dom)
+    st.info(hint)
+    if dom == "plant_oee":
+        st.caption(f"OEE Pulse (separate app): {OEE_PULSE_GITHUB}")
 
 
 def render_mapping_ui(df: pd.DataFrame, context: str = "upload") -> dict[str, str]:
     import streamlit as st
 
-    st.subheader("Column mapping")
+    st.subheader("Step 3 — Column mapping")
     st.caption(
-        "Save a named column → role map and reuse it on the next similar upload. "
-        "Stored in `.forge_sessions/` (ephemeral on Render deploys)."
+        "Detect → Map → **Ask** (LlamaIndex/Gemini on Ask page) or **Train** (Optuna on ML page). "
+        "Mappings saved with domain pack name in `.forge_sessions/` (ephemeral on Render deploys)."
     )
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         st.caption("Load a file to map columns.")
         return dict(st.session_state.get("column_roles") or {})
 
+    domain = str(st.session_state.get("forge_domain") or "generic")
+    ctypes = dict(st.session_state.get("column_types") or {})
     cols = [str(c) for c in df.columns]
     current = dict(st.session_state.get("column_roles") or {})
-    if not current:
-        current = suggest_roles(cols)
+    fp_domain = st.session_state.get("_role_suggest_domain")
+    if not current or fp_domain != domain:
+        current = suggest_roles(cols, domain=domain, column_types=ctypes, df=df)
+        st.session_state._role_suggest_domain = domain
 
     saved = list_named_mappings()
     names = [r["name"] for r in saved]
     c1, c2, c3 = st.columns([2, 2, 1])
-    map_name = c1.text_input("Mapping name", value="default", key=f"map_name_{context}")
+    default_map_name = f"{domain}_default"
+    map_name = c1.text_input("Mapping name", value=default_map_name, key=f"map_name_{context}")
     pick = c2.selectbox("Saved mappings", ["(none)"] + names, key=f"map_pick_{context}")
     if c3.button("Load", key=f"map_load_{context}") and pick != "(none)":
         loaded = load_named_mapping(pick)
         if loaded:
             applied = resolve_mapping_to_frame(cols, loaded)
             st.session_state.column_roles = applied
+            for rec in saved:
+                if rec["name"] == pick and rec.get("domain"):
+                    st.session_state.forge_domain = rec["domain"]
+                    st.session_state.domain = OS_TO_APP_DOMAIN.get(rec["domain"], "generic")
             st.success(f"Applied **{pick}** ({len(applied)} columns).")
             current = applied
         else:
             st.warning("That mapping is empty or missing.")
 
-    with st.expander("Assign roles", expanded=bool(current)):
+    role_opts = ["(skip)"] + roles_for_domain(domain)
+    with st.expander(f"Assign roles ({FORGE_DOMAIN_LABELS.get(domain, domain)} pack)", expanded=bool(current)):
         new_roles: dict[str, str] = {}
-        role_opts = ["(skip)"] + list(COLUMN_ROLES)
         show = cols[:24]
         for col in show:
             default = current.get(col, "(skip)")
@@ -840,9 +1111,14 @@ def render_mapping_ui(df: pd.DataFrame, context: str = "upload") -> dict[str, st
                 st.warning("Enter a mapping name.")
             else:
                 try:
-                    save_named_mapping(map_name.strip(), new_roles, source_columns=cols)
+                    save_named_mapping(
+                        map_name.strip(),
+                        new_roles,
+                        source_columns=cols,
+                        domain=domain,
+                    )
                     st.session_state.column_roles = new_roles
-                    st.success(f"Saved mapping **{map_name.strip()}**.")
+                    st.success(f"Saved mapping **{map_name.strip()}** (domain: `{domain}`).")
                 except OSError:
                     st.warning("Could not write mapping (cloud disk). Kept in this session only.")
                     st.session_state.column_roles = new_roles
@@ -880,44 +1156,65 @@ def estimate_dollar_impact(
     usd_per_hour: float = 0.0,
     usd_per_unit: float = 0.0,
     roles: Optional[dict[str, str]] = None,
+    domain: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Estimate $ from downtime/loss hours and/or scrap/qty — any domain."""
+    """Domain-aware $ estimate: plant downtime/scrap, sales revenue, etc."""
     empty = {
         "ok": False,
-        "reason": "Enter $/hour and/or $/unit, and map downtime / loss / qty columns.",
+        "reason": "Enter rates and map domain columns (downtime, revenue, scrap, …).",
         "hours": 0.0,
         "qty_loss": 0.0,
+        "revenue_total": 0.0,
         "downtime_usd": 0.0,
         "qty_usd": 0.0,
+        "revenue_usd": 0.0,
         "total_usd": 0.0,
         "hours_col": None,
         "qty_col": None,
+        "revenue_col": None,
+        "domain": domain or "generic",
     }
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         empty["reason"] = "No data."
         return empty
     roles = roles or {}
+    dom = domain or "generic"
     rate_h = float(usd_per_hour or 0.0)
     rate_u = float(usd_per_unit or 0.0)
-    if rate_h <= 0 and rate_u <= 0:
-        return empty
 
-    hours_col = (
-        _col_from_roles(df, roles, "downtime")
-        or _col_from_roles(df, roles, "loss")
-        or _find_col(df, "downtime_hours", "down_hours", "lost_hours", "idle_hours")
-        or _find_col(df, "downtime_minutes", "downtime_min", "down_min", "stop_minutes", "idle_min", "duration_min")
-        or _find_col(df, "downtime", "down_time", "idle_time", "lost_time")
-    )
-    qty_col = (
-        _col_from_roles(df, roles, "scrap")
-        or _col_from_roles(df, roles, "qty")
-        or _find_col(df, "scrap", "reject_count", "rejects", "defect_qty", "loss_qty", "waste_qty")
-    )
+    hours_col = None
+    qty_col = None
+    revenue_col = None
+
+    if dom in ("plant_oee", "quality", "generic", "predictive_maintenance"):
+        hours_col = (
+            _col_from_roles(df, roles, "downtime")
+            or _col_from_roles(df, roles, "loss")
+            or _find_col(df, "downtime_hours", "down_hours", "lost_hours", "idle_hours")
+            or _find_col(df, "downtime_minutes", "downtime_min", "down_min", "stop_minutes", "idle_min", "duration_min")
+            or _find_col(df, "downtime", "down_time", "idle_time", "lost_time")
+        )
+        qty_col = (
+            _col_from_roles(df, roles, "scrap")
+            or _col_from_roles(df, roles, "defect")
+            or _col_from_roles(df, roles, "qty")
+            or _find_col(df, "scrap", "reject_count", "rejects", "defect_qty", "loss_qty", "waste_qty")
+        )
+
+    if dom in ("sales", "forecasting", "generic"):
+        revenue_col = (
+            _col_from_roles(df, roles, "revenue")
+            or _col_from_roles(df, roles, "metric")
+            or _find_col(df, "revenue", "sales", "amount", "gmv", "net_sales", "total")
+        )
+
+    if rate_h <= 0 and rate_u <= 0 and revenue_col is None:
+        empty["reason"] = "Enter $/hour and/or $/unit, or map a revenue column for sales domains."
+        return empty
 
     hours = 0.0
     minutes_assumed = False
-    if hours_col:
+    if hours_col and rate_h > 0:
         series = pd.to_numeric(df[hours_col], errors="coerce").fillna(0)
         total = float(series.sum())
         name = str(hours_col).lower()
@@ -928,32 +1225,42 @@ def estimate_dollar_impact(
             hours = total
 
     qty_loss = 0.0
-    if qty_col:
+    if qty_col and rate_u > 0:
         qty_loss = float(pd.to_numeric(df[qty_col], errors="coerce").fillna(0).sum())
+
+    revenue_total = 0.0
+    if revenue_col:
+        revenue_total = float(pd.to_numeric(df[revenue_col], errors="coerce").fillna(0).sum())
 
     downtime_usd = round(max(hours, 0.0) * max(rate_h, 0.0), 2)
     qty_usd = round(max(qty_loss, 0.0) * max(rate_u, 0.0), 2)
-    total = round(downtime_usd + qty_usd, 2)
-    if total <= 0 and hours <= 0 and qty_loss <= 0:
+    revenue_usd = round(revenue_total, 2) if dom in ("sales", "forecasting") else 0.0
+    total = round(downtime_usd + qty_usd + revenue_usd, 2)
+
+    if total <= 0 and hours <= 0 and qty_loss <= 0 and revenue_total <= 0:
         empty["hours_col"] = hours_col
         empty["qty_col"] = qty_col
+        empty["revenue_col"] = revenue_col
         empty["reason"] = (
-            "Found no numeric downtime/loss/qty to price. "
-            "Map a downtime or scrap column, or check the file."
+            "Found no numeric columns to price. Map roles for your domain pack or enter rates."
         )
         return empty
     return {
         "ok": True,
         "hours": round(hours, 2),
         "qty_loss": round(qty_loss, 2),
+        "revenue_total": round(revenue_total, 2),
         "downtime_usd": downtime_usd,
         "qty_usd": qty_usd,
+        "revenue_usd": revenue_usd,
         "total_usd": total,
         "hours_col": hours_col,
         "qty_col": qty_col,
+        "revenue_col": revenue_col,
         "minutes_assumed": minutes_assumed,
         "usd_per_hour": rate_h,
         "usd_per_unit": rate_u,
+        "domain": dom,
         "label": "Management estimate",
     }
 
@@ -963,8 +1270,8 @@ def render_dollar_impact(df: pd.DataFrame, key_prefix: str = "kpi") -> dict[str,
 
     st.subheader("$ impact")
     st.caption(
-        "Generic estimate: $/hour × downtime/loss hours + $/unit × scrap/qty. "
-        "Not a finance system of record."
+        "Domain-aware: plant → $/hour × downtime + $/unit × scrap; "
+        "sales → summed revenue column when mapped. Not a finance system of record."
     )
     r1, r2 = st.columns(2)
     usd_h = r1.number_input(
@@ -984,18 +1291,32 @@ def render_dollar_impact(df: pd.DataFrame, key_prefix: str = "kpi") -> dict[str,
     st.session_state.usd_per_hour = float(usd_h)
     st.session_state.usd_per_unit = float(usd_u)
     roles = dict(st.session_state.get("column_roles") or {})
-    impact = estimate_dollar_impact(df, usd_per_hour=float(usd_h), usd_per_unit=float(usd_u), roles=roles)
+    forge_dom = str(st.session_state.get("forge_domain") or "generic")
+    impact = estimate_dollar_impact(
+        df,
+        usd_per_hour=float(usd_h),
+        usd_per_unit=float(usd_u),
+        roles=roles,
+        domain=forge_dom,
+    )
     if impact.get("ok"):
         m1, m2, m3 = st.columns(3)
-        m1.metric("Est. lost hours", f"{impact['hours']:.1f}")
-        m2.metric("Est. qty loss", f"{impact['qty_loss']:.0f}")
-        m3.metric("Est. $ impact", f"${impact['total_usd']:,.0f}")
+        if forge_dom in ("sales", "forecasting") and impact.get("revenue_total"):
+            m1.metric("Total revenue", f"${impact['revenue_total']:,.0f}")
+            m2.metric("Est. qty loss", f"{impact['qty_loss']:.0f}")
+            m3.metric("Est. $ impact", f"${impact['total_usd']:,.0f}")
+        else:
+            m1.metric("Est. lost hours", f"{impact['hours']:.1f}")
+            m2.metric("Est. qty loss", f"{impact['qty_loss']:.0f}")
+            m3.metric("Est. $ impact", f"${impact['total_usd']:,.0f}")
         bits = []
         if impact.get("hours_col"):
             bits.append(f"time from `{impact['hours_col']}`")
         if impact.get("qty_col"):
             bits.append(f"qty from `{impact['qty_col']}`")
-        st.caption(" · ".join(bits) + f" · {impact.get('label')}")
+        if impact.get("revenue_col"):
+            bits.append(f"revenue from `{impact['revenue_col']}`")
+        st.caption(" · ".join(bits) + f" · {impact.get('label')} · pack `{forge_dom}`")
     elif float(usd_h) > 0 or float(usd_u) > 0:
         st.info(impact.get("reason") or "No $ impact yet.")
     return impact

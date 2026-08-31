@@ -1,0 +1,24 @@
+name: Monday Report Cron
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'  # Every Monday 7:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  send-reports:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Install dependencies
+        run: pip install supabase python-dotenv requests
+      - name: Run Monday cron
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: python scripts/monday_cron.py
