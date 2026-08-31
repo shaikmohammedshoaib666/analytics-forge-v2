@@ -567,11 +567,13 @@ def main() -> int:
         from modules.url_ingest import (
             _duckdb_read,
             _duckdb_read_sql,
+            build_preset_sql,
             default_ingest_sql,
             detect_source_kind,
             extract_gdrive_file_id,
             extract_kaggle_slug,
             friendly_source_label,
+            list_ingest_presets,
             validate_ingest_sql,
         )
 
@@ -589,6 +591,14 @@ def main() -> int:
         validate_ingest_sql("SELECT 1")
         label = friendly_source_label({"kind": "google_drive", "gdrive_file_id": "x1"})
         assert label.startswith("gdrive:")
+        presets = list_ingest_presets(domain="predictive_maintenance")
+        assert len(presets) >= 5
+        machine_sql = build_preset_sql("filter_machine_id", {"machine_id": "M-001", "n": 4})
+        assert "{source}" in machine_sql
+        machine_slice = _duckdb_read_sql(str(sample), machine_sql)
+        assert len(machine_slice) == 4 and (machine_slice["machine_id"] == "M-001").all()
+        pdm_default = default_ingest_sql("predictive_maintenance")
+        assert "machine_id" in pdm_default and "{source}" in pdm_default
 
     check("url ingest helpers", url_ingest_helpers)
 

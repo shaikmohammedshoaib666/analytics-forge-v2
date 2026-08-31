@@ -158,8 +158,180 @@ def resolve_source_to_fetch_url(url: str) -> tuple[str, dict[str, Any]]:
     return raw, meta
 
 
-def default_ingest_sql() -> str:
-    """Starter DuckDB query — replace WHERE/LIMIT for 10M+ row cloud files."""
+# Plant / PdM SQL slice presets — templates use `{source}` for DuckDB read path.
+INGEST_SQL_PRESETS: dict[str, dict[str, Any]] = {
+    "last_n_rows": {
+        "label": "Last N rows",
+        "description": "Cap row count for quick explore on multi-GB sensor logs.",
+        "domains": None,
+        "params": [("n", "Row limit", 50000, "int")],
+        "template": (
+            "SELECT *\n"
+            "FROM read_csv_auto('{{source}}', header=true)\n"
+            "LIMIT {n}"
+        ),
+    },
+    "last_n_days": {
+        "label": "Last N days",
+        "description": "Time window ending today (requires a timestamp/date column).",
+        "domains": ("predictive_maintenance", "plant_oee", "energy_utilities"),
+        "params": [
+            ("n", "Days back", 30, "int"),
+            ("ts_col", "Timestamp column", "timestamp", "str"),
+        ],
+        "template": (
+            "SELECT *\n"
+            "FROM read_csv_auto('{{source}}', header=true)\n"
+            "WHERE try_cast({ts_col} AS TIMESTAMP) >= current_timestamp - INTERVAL '{n} days'\n"
+            "ORDER BY try_cast({ts_col} AS TIMESTAMP) DESC\n"
+            "LIMIT 500000"
+        ),
+    },
+    "filter_machine_id": {
+        "label": "Filter by machine_id",
+        "description": "Slice one asset from a plant-wide sensor export.",
+        "domains": ("predictive_maintenance", "plant_oee"),
+        "params": [
+            ("machine_id", "Machine ID", "M-001", "str"),
+            ("n", "Row limit (0 = no cap)", 100000, "int"),
+        ],
+        "template": (
+            "SELECT *\n"
+            "FROM read_csv_auto('{{source}}', header=true)\n"
+            "WHERE machine_id = '{machine_id}'\n"
+            "ORDER BY try_cast(timestamp AS TIMESTAMP) DESC NULLS LAST\n"
+            "{limit_clause}"
+        ),
+    },
+    "filter_asset_id": {
+        "label": "Filter by asset_id",
+        "description": "Slice one asset when the export uses asset_id instead of machine_id.",
+        "domains": ("predictive_maintenance", "plant_oee"),
+        "params": [
+            ("asset_id", "Asset ID", "ASSET-001", "str"),
+            ("n", "Row limit (0 = no cap)", 100000, "int"),
+        ],
+        "template": (
+            "SELECT *\n"
+            "FROM read_csv_auto('{{source}}', header=true)\n"
+            "WHERE asset_id = '{asset_id}'\n"
+            "ORDER BY try_cast(timestamp AS TIMESTAMP) DESC NULLS LAST\n"
+            "{limit_clause}"
+        ),
+    },
+    "date_range": {
+        "label": "Date range window",
+        "description": "Inclusive start, exclusive end on a timestamp column.",
+        "domains": None,
+        "params": [
+            ("start_date", "Start (YYYY-MM-DD)", "2024-01-01", "str"),
+            ("end_date", "End (YYYY-MM-DD)", "2024-06-01", "str"),
+            ("ts_col", "Timestamp column", "timestamp", "str"),
+            ("n", "Row limit (0 = no cap)", 200000, "int"),
+        ],
+        "template": (
+            "SELECT *\n"
+            "FROM read_csv_auto('{{source}}', header=true)\n"
+            "WHERE try_cast({ts_col} AS TIMESTAMP) >= TIMESTAMP '{start_date}'\n"
+            "  AND try_cast({ts_col} AS TIMESTAMP) < TIMESTAMP '{end_date}'\n"
+            "ORDER BY try_cast({ts_col} AS TIMESTAMP)\n"
+            "{limit_clause}"
+        ),
+    },
+    "sample_percent": {
+        "label": "Random sample %",
+        "description": "Explore a percentage of rows without loading the full file.",
+        "domains": None,
+        "params": [("sample_pct", "Sample percent (1–100)", 5, "float")],
+        "template": (
+            "SELECT *\n"
+            "FROM read_csv_auto('{{source}}', header=true)\n"
+            "WHERE random() < ({sample_pct} / 100.0)\n"
+            "LIMIT 500000"
+        ),
+    },
+    "pdm_failure_focus": {
+        "label": "PdM — failures + near-failure window",
+        "description": "Rows with failure=1 or low RUL for label QA / model training.",
+        "domains": ("predictive_maintenance",),
+        "params": [("rul_max", "Max RUL to include", 48, "int")],
+        "template": (
+            "SELECT *\n"
+            "FROM read_csv_auto('{{source}}', header=true)\n"
+            "WHERE COALESCE(try_cast(failure AS INTEGER), 0) = 1\n"
+            "   OR try_cast(rul AS DOUBLE) <= {rul_max}\n"
+            "ORDER BY try_cast(timestamp AS TIMESTAMP) DESC NULLS LAST\n"
+            "LIMIT 200000"
+        ),
+    },
+}
+
+
+def _coerce_preset_param(value: Any, kind: str) -> Any:
+    if kind == "int":
+        return int(value)
+    if kind == "float":
+        return float(value)
+    return str(value).replace("'", "''")
+
+
+def list_ingest_presets(domain: Optional[str] = None) -> list[dict[str, Any]]:
+    """Return preset metadata for UI picker (optionally filtered by app domain)."""
+    out: list[dict[str, Any]] = []
+    for preset_id, spec in INGEST_SQL_PRESETS.items():
+        domains = spec.get("domains")
+        if domain and domains and domain not in domains:
+            continue
+        out.append(
+            {
+                "id": preset_id,
+                "label": spec["label"],
+                "description": spec.get("description", ""),
+                "params": list(spec.get("params") or []),
+            }
+        )
+    return out
+
+
+def build_preset_sql(preset_id: str, params: Optional[dict[str, Any]] = None) -> str:
+    """Materialize a preset template into DuckDB SQL with `{source}` placeholder intact."""
+    if preset_id not in INGEST_SQL_PRESETS:
+        raise ValueError(f"Unknown ingest preset: {preset_id!r}")
+    spec = INGEST_SQL_PRESETS[preset_id]
+    merged: dict[str, Any] = {}
+    n_limit = 0
+    for name, _label, default, kind in spec.get("params") or []:
+        raw = (params or {}).get(name, default)
+        val = _coerce_preset_param(raw, kind)
+        if name == "n":
+            n_limit = int(val or 0)
+        else:
+            merged[name] = val
+
+    limit_clause = f"LIMIT {n_limit}" if n_limit > 0 else ""
+    template = spec["template"]
+    if "{limit_clause}" in template:
+        merged["limit_clause"] = limit_clause
+    elif n_limit > 0 and "LIMIT" not in template.upper():
+        template = template.rstrip() + f"\nLIMIT {n_limit}"
+
+    try:
+        return template.format(**merged)
+    except KeyError as exc:
+        raise ValueError(f"Missing preset parameter for {preset_id}: {exc}") from exc
+
+
+def default_ingest_sql(domain: Optional[str] = None) -> str:
+    """Starter DuckDB query — PdM-aware examples when domain is predictive_maintenance."""
+    if domain == "predictive_maintenance":
+        return (
+            "SELECT machine_id, timestamp, temperature, vibration, pressure, failure, rul\n"
+            "FROM read_csv_auto('{source}', header=true)\n"
+            "WHERE machine_id = 'M-001'\n"
+            "  AND try_cast(timestamp AS TIMESTAMP) >= TIMESTAMP '2024-01-01'\n"
+            "ORDER BY try_cast(timestamp AS TIMESTAMP) DESC\n"
+            "LIMIT 50000"
+        )
     return (
         "SELECT *\n"
         "FROM read_csv_auto('{source}', header=true)\n"
