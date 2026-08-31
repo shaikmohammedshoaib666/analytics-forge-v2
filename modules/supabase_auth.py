@@ -470,7 +470,12 @@ def render_auth_page() -> bool:
 
     oauth_url, oauth_error = get_google_oauth_url()
     if oauth_url:
-        st.markdown(f"[Sign in with Google (Choose account)]({oauth_url})")
+        st.link_button("Sign in with Google (choose account)", oauth_url, type="secondary")
+        if not APP_BASE_URL:
+            st.caption(
+                "Tip: set **APP_BASE_URL** to your Render URL "
+                "(e.g. `https://analytics-forge-v2.onrender.com`) so Google can return here after login."
+            )
     elif oauth_error:
         st.info(oauth_error)
 

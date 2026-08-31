@@ -24,3 +24,9 @@ services:
         sync: false
       - key: GEMINI_MODEL
         value: gemini-3.6-flash
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: APP_BASE_URL
+        value: https://analytics-forge-v2.onrender.com
