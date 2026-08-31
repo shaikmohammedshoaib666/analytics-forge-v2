@@ -12,3 +12,4 @@ llama-index-core>=0.10
 
 # Still NOT included (need special host / license — do not add here):
 #   gurobi, torch, pyspark
+kaggle>=1.6

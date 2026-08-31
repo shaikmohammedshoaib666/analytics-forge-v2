@@ -5,6 +5,7 @@ from __future__ import annotations
 import traceback
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
 
 class SS(dict):
@@ -252,6 +253,28 @@ def main() -> int:
                 os.environ["GEMINI_API_KEY"] = prev_key
 
     check("forge_os helpers", forge_os_helpers)
+
+    def url_ingest_helpers():
+        from modules.url_ingest import (
+            _duckdb_read,
+            detect_source_kind,
+            extract_gdrive_file_id,
+            extract_kaggle_slug,
+            friendly_source_label,
+        )
+
+        assert detect_source_kind("https://example.com/data.csv") == "https"
+        assert detect_source_kind("https://drive.google.com/file/d/abc123/view") == "google_drive"
+        assert detect_source_kind("https://www.kaggle.com/datasets/foo/bar") == "kaggle_page"
+        assert extract_gdrive_file_id("https://drive.google.com/file/d/FILEID99/view?usp=sharing") == "FILEID99"
+        assert extract_kaggle_slug("https://www.kaggle.com/datasets/acme/plant-sensors") == "acme/plant-sensors"
+        sample = Path(__file__).resolve().parent / "data" / "samples" / "sample_predictive_maintenance.csv"
+        preview = _duckdb_read(str(sample), row_limit=5)
+        assert len(preview) == 5 and "temperature" in preview.columns
+        label = friendly_source_label({"kind": "google_drive", "gdrive_file_id": "x1"})
+        assert label.startswith("gdrive:")
+
+    check("url ingest helpers", url_ingest_helpers)
 
     if errors:
         print(f"\n{len(errors)} FAILURE(S)")
