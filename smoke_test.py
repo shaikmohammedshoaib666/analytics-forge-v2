@@ -566,10 +566,13 @@ def main() -> int:
     def url_ingest_helpers():
         from modules.url_ingest import (
             _duckdb_read,
+            _duckdb_read_sql,
+            default_ingest_sql,
             detect_source_kind,
             extract_gdrive_file_id,
             extract_kaggle_slug,
             friendly_source_label,
+            validate_ingest_sql,
         )
 
         assert detect_source_kind("https://example.com/data.csv") == "https"
@@ -580,6 +583,10 @@ def main() -> int:
         sample = Path(__file__).resolve().parent / "data" / "samples" / "sample_predictive_maintenance.csv"
         preview = _duckdb_read(str(sample), row_limit=5)
         assert len(preview) == 5 and "temperature" in preview.columns
+        sql = default_ingest_sql().replace("LIMIT 100000", "LIMIT 3")
+        sliced = _duckdb_read_sql(str(sample), sql)
+        assert len(sliced) == 3
+        validate_ingest_sql("SELECT 1")
         label = friendly_source_label({"kind": "google_drive", "gdrive_file_id": "x1"})
         assert label.startswith("gdrive:")
 

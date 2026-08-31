@@ -158,6 +158,54 @@ def resolve_source_to_fetch_url(url: str) -> tuple[str, dict[str, Any]]:
     return raw, meta
 
 
+def default_ingest_sql() -> str:
+    """Starter DuckDB query — replace WHERE/LIMIT for 10M+ row cloud files."""
+    return (
+        "SELECT *\n"
+        "FROM read_csv_auto('{source}', header=true)\n"
+        "WHERE 1 = 1  -- e.g. machine_id = 'M1' AND timestamp >= '2024-01-01'\n"
+        "LIMIT 100000"
+    )
+
+
+def validate_ingest_sql(sql: str) -> str:
+    text = (sql or "").strip()
+    if not text:
+        raise ValueError("SQL query is empty.")
+    head = text.lstrip().split(None, 1)[0].upper()
+    if head not in {"SELECT", "WITH"}:
+        raise ValueError("Only SELECT (or WITH … SELECT) queries are allowed for ingest.")
+    # Block multi-statement / destructive keywords.
+    if ";" in text.rstrip().rstrip(";"):
+        raise ValueError("Only one SQL statement allowed.")
+    upper = text.upper()
+    for bad in (" DROP ", " DELETE ", " INSERT ", " UPDATE ", " CREATE ", " ATTACH ", " COPY "):
+        if bad in f" {upper} ":
+            raise ValueError(f"Disallowed SQL keyword in ingest query.")
+    return text
+
+
+def _sql_escape_path(path: str) -> str:
+    return path.replace("'", "''")
+
+
+def _duckdb_read_sql(path_or_url: str, sql_template: str) -> pd.DataFrame:
+    import duckdb
+
+    sql = validate_ingest_sql(sql_template)
+    if "{source}" not in sql:
+        raise ValueError("SQL must reference `{source}` (the resolved file path or URL).")
+    sql = sql.replace("{source}", _sql_escape_path(path_or_url))
+
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute("INSTALL httpfs;")
+        con.execute("LOAD httpfs;")
+    except Exception:
+        pass
+    return con.execute(sql).df()
+
+
 def _duckdb_read(path_or_url: str, *, row_limit: Optional[int] = None) -> pd.DataFrame:
     import duckdb
 
@@ -218,52 +266,61 @@ def load_from_url(
     cache_dir: Path,
     row_limit: Optional[int] = None,
     force_cache: bool = False,
+    sql_query: Optional[str] = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
     Load a tabular dataset from HTTPS, Google Drive, or Kaggle.
 
-  row_limit: cap rows (useful on Render free tier). 0/None = read all available rows.
+    row_limit: cap rows for simple mode (useful on Render free tier). 0/None = all rows.
+    sql_query: optional DuckDB SELECT using `{source}` placeholder for filters/slices on huge files.
     """
     fetch_target, meta = resolve_source_to_fetch_url(url)
     meta["row_limit"] = row_limit
+    meta["sql_query"] = sql_query
+
+    def _finish(df: pd.DataFrame, engine: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        meta["rows"] = len(df)
+        meta["columns"] = list(df.columns)
+        meta["engine"] = engine
+        return df, meta
+
+    use_sql = bool((sql_query or "").strip())
 
     # Kaggle path is always local after download.
     if meta.get("local_path"):
-        local = Path(meta["local_path"])
-        df = _duckdb_read(str(local), row_limit=row_limit)
-        meta["rows"] = len(df)
-        meta["columns"] = list(df.columns)
-        meta["engine"] = "duckdb"
-        return df, meta
+        local = str(Path(meta["local_path"]))
+        if use_sql:
+            return _finish(_duckdb_read_sql(local, sql_query or ""), "duckdb-sql")
+        df = _duckdb_read(local, row_limit=row_limit)
+        return _finish(df, "duckdb")
 
     is_remote = fetch_target.startswith("http://") or fetch_target.startswith("https://")
     read_path = fetch_target
 
-    if is_remote and (force_cache or meta.get("kind") == "google_drive"):
-        cached = _cache_remote_file(fetch_target, cache_dir)
-        meta["cached_path"] = str(cached)
-        read_path = str(cached)
+    # SQL slices on multi-GB files should use a local cache so DuckDB can scan efficiently.
+    if use_sql or force_cache or meta.get("kind") == "google_drive":
+        if is_remote:
+            cached = _cache_remote_file(fetch_target, cache_dir)
+            meta["cached_path"] = str(cached)
+            read_path = str(cached)
     elif is_remote:
-        # Try streaming read first; fall back to cache on failure.
         try:
+            if use_sql:
+                return _finish(_duckdb_read_sql(fetch_target, sql_query or ""), "duckdb-sql-httpfs")
             df = _duckdb_read(fetch_target, row_limit=row_limit)
-            meta["rows"] = len(df)
-            meta["columns"] = list(df.columns)
-            meta["engine"] = "duckdb-httpfs"
-            return df, meta
+            return _finish(df, "duckdb-httpfs")
         except Exception as stream_err:
             meta["stream_error"] = str(stream_err)
             cached = _cache_remote_file(fetch_target, cache_dir)
             meta["cached_path"] = str(cached)
             read_path = str(cached)
 
+    if use_sql:
+        return _finish(_duckdb_read_sql(read_path, sql_query or ""), "duckdb-sql")
     df = _duckdb_read(read_path, row_limit=row_limit)
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    meta["rows"] = len(df)
-    meta["columns"] = list(df.columns)
-    meta["engine"] = "duckdb"
-    return df, meta
+    return _finish(df, "duckdb")
 
 
 def friendly_source_label(meta: dict[str, Any]) -> str:

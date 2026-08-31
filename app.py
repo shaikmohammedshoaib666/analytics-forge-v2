@@ -65,7 +65,7 @@ from modules.domain_detect import APP_TO_OS_DOMAIN, OS_TO_APP_DOMAIN
 from modules.supabase_auth import render_auth_page, sign_out as supabase_sign_out, get_user, get_user_id, _supabase_available
 from modules.sap_connector import render_sap_page
 from modules.cron_manager import render_cron_settings
-from modules.url_ingest import friendly_source_label, load_from_url
+from modules.url_ingest import default_ingest_sql, friendly_source_label, load_from_url
 from modules.forge_os import (
     autosave_after_pipeline,
     gemini_issue_from_raw,
@@ -203,6 +203,8 @@ def init_state() -> None:
         "url_ingest_row_limit": 0,
         "url_ingest_force_cache": True,
         "url_ingest_meta": None,
+        "url_ingest_mode": "limit",
+        "url_ingest_sql": default_ingest_sql(),
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -3746,13 +3748,37 @@ def page_upload() -> None:
             placeholder="https://drive.google.com/file/d/…/view  or  https://www.kaggle.com/datasets/…",
             key="upload_url_input",
         )
-        row_limit = st.number_input(
-            "Row limit (0 = all rows — use a cap on free cloud hosts for multi-GB files)",
-            min_value=0,
-            value=int(st.session_state.get("url_ingest_row_limit") or 0),
-            step=1000,
-            key="upload_url_row_limit",
+        ingest_mode = st.radio(
+            "Ingest mode",
+            ["Row limit (simple)", "SQL slice (DuckDB)"],
+            index=1 if st.session_state.get("url_ingest_mode") == "sql" else 0,
+            horizontal=True,
+            key="upload_url_ingest_mode",
+            help="For 10M+ rows: use SQL slice to filter/limit before Clean/Field/ML.",
         )
+        st.session_state.url_ingest_mode = "sql" if ingest_mode.startswith("SQL") else "limit"
+
+        row_limit = 0
+        sql_query: Optional[str] = None
+        if st.session_state.url_ingest_mode == "limit":
+            row_limit = st.number_input(
+                "Row limit (0 = all rows — use a cap on free cloud hosts for multi-GB files)",
+                min_value=0,
+                value=int(st.session_state.get("url_ingest_row_limit") or 0),
+                step=1000,
+                key="upload_url_row_limit",
+            )
+        else:
+            sql_query = st.text_area(
+                "DuckDB SQL (use `{source}` for the resolved file path/URL)",
+                value=st.session_state.get("url_ingest_sql") or default_ingest_sql(),
+                height=160,
+                key="upload_url_sql",
+            )
+            st.caption(
+                "Example: `SELECT machine_id, temperature, vibration FROM read_csv_auto('{source}', header=true) "
+                "WHERE machine_id = 'M1' AND timestamp >= '2024-06-01' LIMIT 50000`"
+            )
         force_cache = st.checkbox(
             "Always download to disk first (recommended for Google Drive / files > 100 MB)",
             value=bool(st.session_state.get("url_ingest_force_cache", True)),
@@ -3765,11 +3791,13 @@ def page_upload() -> None:
                 try:
                     with st.spinner("Resolving link and loading via DuckDB…"):
                         limit = int(row_limit) if row_limit and row_limit > 0 else None
+                        sql = (sql_query or "").strip() if st.session_state.url_ingest_mode == "sql" else None
                         loaded, meta = load_from_url(
                             url_val.strip(),
                             cache_dir=UPLOAD_DIR,
                             row_limit=limit,
-                            force_cache=force_cache,
+                            force_cache=force_cache or bool(sql),
+                            sql_query=sql,
                         )
                     reset_domain_pick_for_new_frame(loaded)
                     label = friendly_source_label(meta)
@@ -3778,6 +3806,8 @@ def page_upload() -> None:
                     st.session_state.url_ingest_source = url_val.strip()
                     st.session_state.url_ingest_row_limit = int(row_limit or 0)
                     st.session_state.url_ingest_force_cache = force_cache
+                    if sql_query is not None:
+                        st.session_state.url_ingest_sql = sql_query
                     st.session_state.url_ingest_meta = meta
                     st.session_state.clean_df = None
                     st.session_state.clean_checks = None
