@@ -65,6 +65,7 @@ from modules.domain_detect import APP_TO_OS_DOMAIN, OS_TO_APP_DOMAIN
 from modules.supabase_auth import render_auth_page, sign_out as supabase_sign_out, get_user, get_user_id, _supabase_available
 from modules.sap_connector import render_sap_page
 from modules.cron_manager import render_cron_settings
+from modules.url_ingest import friendly_source_label, load_from_url
 from modules.forge_os import (
     autosave_after_pipeline,
     gemini_issue_from_raw,
@@ -198,6 +199,10 @@ def init_state() -> None:
         "forge_session_title": "",
         "last_gemini_error": "",
         "domain_user_override": False,
+        "url_ingest_source": "",
+        "url_ingest_row_limit": 0,
+        "url_ingest_force_cache": True,
+        "url_ingest_meta": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -3689,7 +3694,8 @@ Edit `config.yaml` → `LIVE_MODE.connection_type`.
 def page_upload() -> None:
     st.header("Upload")
     st.caption(
-        "MANUAL mode: choose cleaning engine (pandas / polars / pyspark) by size suggestion — never forced. "
+        "MANUAL mode: upload a file **or** paste a cloud link (Google Drive, Kaggle, direct HTTPS CSV). "
+        "Large files (e.g. 2 GB Drive exports) stream through DuckDB without loading everything into RAM. "
         "LIVE mode ignores upload and uses Modbus SCADA buffer."
     )
 
@@ -3700,31 +3706,108 @@ def page_upload() -> None:
     gemini_key_ui("upload")
     st.divider()
 
-    uploaded = st.file_uploader(
-        "Upload industrial / ERP / plant / healthcare / sales CSV or Excel",
-        type=["csv", "tsv", "txt", "xlsx", "xls", "xlsm", "json", "parquet"],
-    )
+    tab_file, tab_url = st.tabs(["📁 File upload", "🔗 URL / cloud link (DuckDB)"])
     df: Optional[pd.DataFrame] = None
-    if uploaded is not None:
-        try:
-            df = load_uploaded_file(uploaded)
-            reset_domain_pick_for_new_frame(df)
-            st.session_state.manual_df = df
-            st.session_state.manual_name = uploaded.name
-            st.session_state.clean_df = None
-            st.session_state.clean_checks = None
-            st.session_state.clean_report = None
-            st.session_state.field_result = None
-            st.success(f"Loaded **{uploaded.name}** — {len(df):,} rows × {df.shape[1]} cols")
-        except Exception as exc:
-            st.error(str(exc))
-            return
-    elif st.session_state.manual_df is not None:
+
+    with tab_file:
+        uploaded = st.file_uploader(
+            "Upload industrial / ERP / plant / healthcare / sales CSV or Excel",
+            type=["csv", "tsv", "txt", "xlsx", "xls", "xlsm", "json", "parquet"],
+            key="upload_file_picker",
+        )
+        if uploaded is not None:
+            try:
+                df = load_uploaded_file(uploaded)
+                reset_domain_pick_for_new_frame(df)
+                st.session_state.manual_df = df
+                st.session_state.manual_name = uploaded.name
+                st.session_state.url_ingest_meta = None
+                st.session_state.clean_df = None
+                st.session_state.clean_checks = None
+                st.session_state.clean_report = None
+                st.session_state.field_result = None
+                st.success(f"Loaded **{uploaded.name}** — {len(df):,} rows × {df.shape[1]} cols")
+            except Exception as exc:
+                st.error(str(exc))
+                return
+        elif st.session_state.manual_df is not None and not st.session_state.get("url_ingest_meta"):
+            df = st.session_state.manual_df
+            st.write(f"Current file: **{st.session_state.manual_name}** — {len(df):,} × {df.shape[1]}")
+
+    with tab_url:
+        st.caption(
+            "Paste a **direct HTTPS CSV/Parquet** link, a **Google Drive** share URL "
+            "(Anyone with the link), or a **Kaggle** dataset page / `kaggle://owner/dataset/file.csv`. "
+            "Kaggle needs `KAGGLE_USERNAME` + `KAGGLE_KEY` in secrets."
+        )
+        url_val = st.text_input(
+            "Cloud data URL",
+            value=st.session_state.get("url_ingest_source", ""),
+            placeholder="https://drive.google.com/file/d/…/view  or  https://www.kaggle.com/datasets/…",
+            key="upload_url_input",
+        )
+        row_limit = st.number_input(
+            "Row limit (0 = all rows — use a cap on free cloud hosts for multi-GB files)",
+            min_value=0,
+            value=int(st.session_state.get("url_ingest_row_limit") or 0),
+            step=1000,
+            key="upload_url_row_limit",
+        )
+        force_cache = st.checkbox(
+            "Always download to disk first (recommended for Google Drive / files > 100 MB)",
+            value=bool(st.session_state.get("url_ingest_force_cache", True)),
+            key="upload_url_force_cache",
+        )
+        if st.button("Load from URL", key="upload_url_load", type="primary"):
+            if not (url_val or "").strip():
+                st.warning("Paste a URL first.")
+            else:
+                try:
+                    with st.spinner("Resolving link and loading via DuckDB…"):
+                        limit = int(row_limit) if row_limit and row_limit > 0 else None
+                        loaded, meta = load_from_url(
+                            url_val.strip(),
+                            cache_dir=UPLOAD_DIR,
+                            row_limit=limit,
+                            force_cache=force_cache,
+                        )
+                    reset_domain_pick_for_new_frame(loaded)
+                    label = friendly_source_label(meta)
+                    st.session_state.manual_df = loaded
+                    st.session_state.manual_name = label
+                    st.session_state.url_ingest_source = url_val.strip()
+                    st.session_state.url_ingest_row_limit = int(row_limit or 0)
+                    st.session_state.url_ingest_force_cache = force_cache
+                    st.session_state.url_ingest_meta = meta
+                    st.session_state.clean_df = None
+                    st.session_state.clean_checks = None
+                    st.session_state.clean_report = None
+                    st.session_state.field_result = None
+                    df = loaded
+                    eng = meta.get("engine", "duckdb")
+                    cached = meta.get("cached_path")
+                    extra = f" · cached `{Path(cached).name}`" if cached else ""
+                    st.success(
+                        f"Loaded **{label}** via **{eng}** — {len(loaded):,} rows × {loaded.shape[1]} cols{extra}"
+                    )
+                    if meta.get("stream_error"):
+                        st.caption(f"Stream read fell back to disk cache: {meta['stream_error'][:120]}")
+                except Exception as exc:
+                    st.error(str(exc))
+
+        if st.session_state.get("url_ingest_meta") and st.session_state.manual_df is not None:
+            meta = st.session_state.url_ingest_meta
+            df = st.session_state.manual_df
+            st.write(
+                f"Current URL source: **{st.session_state.get('manual_name', 'url')}** — "
+                f"{len(df):,} × {df.shape[1]} · kind `{meta.get('kind')}`"
+            )
+
+    if df is None and st.session_state.manual_df is not None:
         df = st.session_state.manual_df
-        st.write(f"Current file: **{st.session_state.manual_name}** — {len(df):,} × {df.shape[1]}")
 
     if df is None:
-        st.info("Upload a file to enable engine selection + field preview.")
+        st.info("Upload a file or load from a URL to enable engine selection + field preview.")
         return
 
     detect = render_detection_ui(df, context="upload")

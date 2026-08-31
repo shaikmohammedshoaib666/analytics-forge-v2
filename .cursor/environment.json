@@ -1,0 +1,24 @@
+{
+  "name": "Analytics Forge v2",
+  "user": "ubuntu",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "install": "bash ./.cursor/install.sh",
+  "terminals": [
+    {
+      "name": "streamlit",
+      "description": "Analytics Forge v2 Streamlit app on port 8501.",
+      "command": ". .venv/bin/activate && streamlit run app.py --server.port=8501 --server.address=0.0.0.0 --server.headless=true"
+    },
+    {
+      "name": "gateway",
+      "description": "LIVE SCADA FastAPI gateway (gateway.py) on port 8088.",
+      "command": ". .venv/bin/activate && uvicorn gateway:app --host 0.0.0.0 --port 8088"
+    }
+  ],
+  "ports": [
+    { "name": "streamlit", "port": 8501 },
+    { "name": "gateway", "port": 8088 }
+  ]
+}
