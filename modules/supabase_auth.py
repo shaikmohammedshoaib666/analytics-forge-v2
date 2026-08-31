@@ -9,7 +9,7 @@ import logging
 import os
 import warnings
 from importlib import import_module
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 import streamlit as st
@@ -149,30 +149,202 @@ def supabase_status_message() -> str:
     return "Set SUPABASE_URL + SUPABASE_KEY env vars for real auth."
 
 
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    """Read a field from a pydantic model, plain object, or dict."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    value = getattr(obj, name, default)
+    if value is not None:
+        return value
+    model_dump = getattr(obj, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return model_dump().get(name, default)
+        except Exception:
+            pass
+    return default
+
+
+def _parse_auth_response(res: Any) -> tuple[Any, Any]:
+    """Extract user/session from AuthResponse across supabase-py versions."""
+    if res is None:
+        return None, None
+    if isinstance(res, dict):
+        return res.get("user"), res.get("session")
+    user = _field(res, "user")
+    session = _field(res, "session")
+    if user is None and session is None:
+        model_dump = getattr(res, "model_dump", None)
+        if callable(model_dump):
+            try:
+                dumped = model_dump()
+                if isinstance(dumped, dict):
+                    user = dumped.get("user")
+                    session = dumped.get("session")
+            except Exception:
+                pass
+    return user, session
+
+
+def _normalize_user(user: Any) -> Optional[dict]:
+    if not user:
+        return None
+    user_id = _field(user, "id")
+    if not user_id:
+        return None
+    return {"id": str(user_id), "email": _field(user, "email") or ""}
+
+
+def _user_is_confirmed(user: Any) -> bool:
+    return bool(_field(user, "email_confirmed_at") or _field(user, "confirmed_at"))
+
+
+def _session_tokens(session: Any) -> tuple[Optional[str], Optional[str]]:
+    if not session:
+        return None, None
+    access = _field(session, "access_token")
+    refresh = _field(session, "refresh_token")
+    return (
+        str(access).strip() if access else None,
+        str(refresh).strip() if refresh else None,
+    )
+
+
+def _format_auth_error(exc: Exception) -> str:
+    """Map supabase-py / GoTrue errors to user-friendly messages."""
+    message = str(exc).strip()
+    lowered = message.lower()
+    code = getattr(exc, "code", None)
+    status = getattr(exc, "status", None)
+    name = getattr(exc, "name", "") or exc.__class__.__name__
+
+    if name == "AuthInvalidCredentialsError":
+        return "Invalid email or password."
+    if name == "AuthWeakPasswordError":
+        return message or "Password is too weak. Use at least 6 characters with mixed characters."
+
+    if code in ("email_not_confirmed", "user_not_confirmed") or "email not confirmed" in lowered:
+        return "Please confirm your email before signing in. Check your inbox for the confirmation link."
+    if code in ("invalid_credentials", "invalid_grant") or "invalid login credentials" in lowered:
+        return "Invalid email or password."
+    if code == "user_already_registered" or "already registered" in lowered or "already been registered" in lowered:
+        return "An account with this email already exists. Try signing in instead."
+    if code == "signup_disabled" or "signups not allowed" in lowered:
+        return "New registrations are disabled in Supabase Auth settings."
+    if status == 429 or "rate limit" in lowered or "too many requests" in lowered:
+        return "Too many attempts. Please wait a few minutes and try again."
+    if "provider is not enabled" in lowered or "unsupported provider" in lowered:
+        return (
+            "Google sign-in is not enabled in Supabase Auth. "
+            "Enable the Google provider and add your Render URL to redirect URLs."
+        )
+    if "invalid api key" in lowered or "invalid jwt" in lowered:
+        return "Supabase API key appears invalid. Use the anon/publishable key from Project Settings → API."
+    if message:
+        return message
+    return "Authentication failed. Please try again."
+
+
+def _auth_action_failure(action: str, res: Any) -> str:
+    user, session = _parse_auth_response(res)
+    if user and not session:
+        if action == "sign-up":
+            return (
+                "Account may have been created, but no session was returned. "
+                "If email confirmation is enabled, check your inbox and confirm before signing in."
+            )
+        if not _user_is_confirmed(user):
+            return "Please confirm your email before signing in."
+        return f"{action.title()} succeeded but no session was returned. Check Supabase Auth settings."
+    return f"{action.title()} failed. No user was returned from Supabase."
+
+
+def _supabase_package_version() -> str:
+    try:
+        module = import_module("supabase")
+        return str(getattr(module, "__version__", "unknown"))
+    except Exception:
+        return "not installed"
+
+
+def auth_health_diagnostic() -> dict:
+    """Safe auth health snapshot for troubleshooting (no secrets)."""
+    normalized = normalize_supabase_url(SUPABASE_URL)
+    host = urlparse(normalized).netloc if normalized else ""
+    key_hint = "missing"
+    if SUPABASE_KEY:
+        if _is_likely_service_role_key(SUPABASE_KEY):
+            key_hint = "service_role (invalid for browser auth)"
+        else:
+            key_hint = "anon_or_publishable"
+    client_ready = init_supabase_client() is not None
+    return {
+        "supabase_env_configured": _supabase_available(),
+        "client_ready": client_ready,
+        "client_error": _client_error or None,
+        "supabase_host": host or None,
+        "url_had_api_path_suffix": _looks_like_invalid_supabase_path(SUPABASE_URL),
+        "app_base_url_set": bool(APP_BASE_URL),
+        "app_base_url_host": urlparse(APP_BASE_URL).netloc if APP_BASE_URL else None,
+        "key_type_hint": key_hint,
+        "supabase_py_version": _supabase_package_version(),
+        "last_auth_error": st.session_state.get("_last_auth_error"),
+    }
+
+
 def sign_up(email: str, password: str) -> dict:
     client = init_supabase_client()
     if not client:
-        return {"error": "Supabase not configured"}
+        err = _client_error or "Supabase auth client failed to initialize."
+        st.session_state["_last_auth_error"] = err
+        return {"error": err}
     try:
         res = client.auth.sign_up({"email": email, "password": password})
-        if _set_signed_in_user(getattr(res, "user", None), getattr(res, "session", None)):
-            return {"user": res.user}
-        return {"error": "Sign-up failed"}
-    except Exception as e:
-        return {"error": str(e)}
+        user, session = _parse_auth_response(res)
+        if user and session and _set_signed_in_user(user, session):
+            st.session_state["_last_auth_error"] = None
+            return {"user": _normalize_user(user), "signed_in": True}
+        if user and not session:
+            st.session_state["_last_auth_error"] = None
+            return {
+                "user": _normalize_user(user),
+                "needs_confirmation": not _user_is_confirmed(user),
+                "signed_in": False,
+                "message": (
+                    "Account created. Check your email for a confirmation link, "
+                    "then return here to sign in."
+                ),
+            }
+        err = _auth_action_failure("sign-up", res)
+        st.session_state["_last_auth_error"] = err
+        return {"error": err}
+    except Exception as exc:
+        err = _format_auth_error(exc)
+        st.session_state["_last_auth_error"] = err
+        return {"error": err}
 
 
 def sign_in(email: str, password: str) -> dict:
     client = init_supabase_client()
     if not client:
-        return {"error": "Supabase not configured"}
+        err = _client_error or "Supabase auth client failed to initialize."
+        st.session_state["_last_auth_error"] = err
+        return {"error": err}
     try:
         res = client.auth.sign_in_with_password({"email": email, "password": password})
-        if _set_signed_in_user(getattr(res, "user", None), getattr(res, "session", None)):
-            return {"user": res.user}
-        return {"error": "Sign-in failed"}
-    except Exception as e:
-        return {"error": str(e)}
+        user, session = _parse_auth_response(res)
+        if user and session and _set_signed_in_user(user, session):
+            st.session_state["_last_auth_error"] = None
+            return {"user": _normalize_user(user), "signed_in": True}
+        err = _auth_action_failure("sign-in", res)
+        st.session_state["_last_auth_error"] = err
+        return {"error": err}
+    except Exception as exc:
+        err = _format_auth_error(exc)
+        st.session_state["_last_auth_error"] = err
+        return {"error": err}
 
 
 def sign_out():
@@ -238,28 +410,30 @@ def get_google_oauth_url() -> tuple[Optional[str], Optional[str]]:
         else:
             payload["options"] = {"query_params": {"prompt": "select_account"}}
         res = client.auth.sign_in_with_oauth(payload)
-        oauth_url = getattr(res, "url", None) if res else None
+        oauth_url = _field(res, "url")
         if oauth_url:
-            return _ensure_authorize_url_params(oauth_url), None
+            return _ensure_authorize_url_params(str(oauth_url)), None
     except Exception as exc:
-        message = str(exc)
-        if "provider is not enabled" in message.lower() or "unsupported provider" in message.lower():
-            return None, (
-                "Google provider is not enabled in Supabase Auth. "
-                "Enable Google provider and configure redirect URL in Supabase dashboard."
-            )
+        message = _format_auth_error(exc)
+        st.session_state["_last_auth_error"] = message
+        if "google" in message.lower() or "provider" in message.lower():
+            return None, message
 
     # Fallback for environments where library response does not include URL.
     return _build_google_authorize_fallback_url(), None
 
 
-def _set_signed_in_user(user, session) -> bool:
-    if not user:
+def _set_signed_in_user(user, session, *, require_session: bool = False) -> bool:
+    normalized = _normalize_user(user)
+    if not normalized:
         return False
-    st.session_state["supabase_user"] = {"id": user.id, "email": user.email}
+    access_token, refresh_token = _session_tokens(session)
+    if require_session and not (access_token and refresh_token):
+        return False
+    st.session_state["supabase_user"] = normalized
     st.session_state["supabase_session"] = session
-    st.session_state["supabase_access_token"] = getattr(session, "access_token", None) if session else None
-    st.session_state["supabase_refresh_token"] = getattr(session, "refresh_token", None) if session else None
+    st.session_state["supabase_access_token"] = access_token
+    st.session_state["supabase_refresh_token"] = refresh_token
     st.session_state["signed_in"] = True
     return True
 
@@ -274,19 +448,18 @@ def _restore_signed_in_user(client) -> bool:
     if access_token and refresh_token:
         try:
             res = client.auth.set_session(access_token, refresh_token)
-            user = getattr(res, "user", None) if res else None
-            session = getattr(res, "session", None) if res else None
-            if _set_signed_in_user(user, session):
+            user, session = _parse_auth_response(res)
+            if _set_signed_in_user(user, session, require_session=True):
                 return True
         except Exception:
             pass
 
     try:
         session_res = client.auth.get_session()
-        session = getattr(session_res, "session", None) if session_res else None
+        session = _field(session_res, "session")
         user_res = client.auth.get_user()
-        user = getattr(user_res, "user", None) if user_res else None
-        if _set_signed_in_user(user, session):
+        user = _field(user_res, "user")
+        if _set_signed_in_user(user, session, require_session=True):
             return True
     except Exception:
         pass
@@ -369,22 +542,24 @@ def _handle_oauth_callback(client) -> tuple[bool, Optional[str]]:
             return True, None
         try:
             res = _exchange_auth_code(client, code)
-            user = getattr(res, "user", None) if res else None
-            session = getattr(res, "session", None) if res else None
-            if _set_signed_in_user(user, session):
+            user, session = _parse_auth_response(res)
+            if _set_signed_in_user(user, session, require_session=True):
                 st.session_state["_last_oauth_code"] = code
                 st.session_state["_oauth_failed_code"] = None
                 st.session_state["_oauth_failed_error"] = None
+                st.session_state["_last_auth_error"] = None
                 _clear_auth_query_params()
                 return True, None
             error_message = "Google sign-in callback was received, but no user session was returned."
             st.session_state["_oauth_failed_code"] = code
             st.session_state["_oauth_failed_error"] = error_message
+            st.session_state["_last_auth_error"] = error_message
             return False, error_message
         except Exception as exc:
-            error_message = f"Google sign-in failed. The callback may be expired. ({exc})"
+            error_message = f"Google sign-in failed: {_format_auth_error(exc)}"
             st.session_state["_oauth_failed_code"] = code
             st.session_state["_oauth_failed_error"] = error_message
+            st.session_state["_last_auth_error"] = error_message
             return False, error_message
 
     access_token = (params.get("access_token") or "").strip()
@@ -392,9 +567,8 @@ def _handle_oauth_callback(client) -> tuple[bool, Optional[str]]:
     if access_token and refresh_token:
         try:
             res = client.auth.set_session(access_token, refresh_token)
-            user = getattr(res, "user", None) if res else None
-            session = getattr(res, "session", None) if res else None
-            if _set_signed_in_user(user, session):
+            user, session = _parse_auth_response(res)
+            if _set_signed_in_user(user, session, require_session=True):
                 _clear_auth_query_params()
                 return True, None
         except Exception:
@@ -407,6 +581,11 @@ def _handle_oauth_callback(client) -> tuple[bool, Optional[str]]:
             "Google callback tokens were not readable server-side. Please retry Google sign-in to complete code exchange.",
         )
     return False, None
+
+
+def _render_auth_diagnostic():
+    with st.expander("Auth diagnostic (no secrets)", expanded=False):
+        st.json(auth_health_diagnostic())
 
 
 def render_auth_page() -> bool:
@@ -426,15 +605,16 @@ def render_auth_page() -> bool:
             st.rerun()
         if callback_error:
             st.error(callback_error)
+            _render_auth_diagnostic()
 
     if st.session_state.get("signed_in") and get_user():
         return True
 
     st.title("🔐 Analytics Forge v2")
     st.markdown("Sign in or create an account to continue.")
-    st.caption("Fallback available: use the **Sign In** tab to continue with email and password.")
 
     tab_login, tab_register = st.tabs(["Sign In", "Register"])
+    auth_error_shown = False
 
     with tab_login:
         email = st.text_input("Email", key="login_email")
@@ -444,6 +624,7 @@ def render_auth_page() -> bool:
                 res = sign_in(email, password)
                 if "error" in res:
                     st.error(res["error"])
+                    auth_error_shown = True
                 else:
                     st.rerun()
             else:
@@ -458,15 +639,19 @@ def render_auth_page() -> bool:
                 st.warning("Fill all fields")
             elif reg_pw != reg_pw2:
                 st.error("Passwords don't match")
+                auth_error_shown = True
             elif len(reg_pw) < 6:
                 st.error("Password must be at least 6 characters")
+                auth_error_shown = True
             else:
                 res = sign_up(reg_email, reg_pw)
                 if "error" in res:
                     st.error(res["error"])
-                else:
-                    st.success("Account created! Check email for confirmation.")
+                    auth_error_shown = True
+                elif res.get("signed_in"):
                     st.rerun()
+                else:
+                    st.success(res.get("message") or "Account created! Check your email for confirmation.")
 
     oauth_url, oauth_error = get_google_oauth_url()
     if oauth_url:
@@ -478,5 +663,9 @@ def render_auth_page() -> bool:
             )
     elif oauth_error:
         st.info(oauth_error)
+        auth_error_shown = True
+
+    if auth_error_shown or st.session_state.get("_last_auth_error"):
+        _render_auth_diagnostic()
 
     return False
