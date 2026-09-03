@@ -4517,7 +4517,9 @@ def render_scaler_controls(raw_df: pd.DataFrame) -> None:
     with st.expander("Feature Scaling (Standard / Robust / MinMax)", expanded=False):
         st.caption(
             "Scaling runs after the DWDM clean, so every downstream page "
-            "(Field · KPIs · Charts · ML Studio · Dashboard) reads the scaled table."
+            "(Field · KPIs · Charts · ML Studio · Dashboard) reads the scaled table. "
+            "The preview below is computed on the raw file — the run also covers engineered "
+            "columns the clean step adds."
         )
         current = str(st.session_state.get("clean_scaler") or "None")
         choice = st.radio(
@@ -4571,7 +4573,8 @@ def render_iqr_controls(raw_df: pd.DataFrame) -> None:
     with st.expander("Outlier Removal (IQR)", expanded=False):
         st.caption(
             "Tukey fence per numeric column: rows outside Q1 − k·IQR … Q3 + k·IQR are dropped "
-            "before the quality report is rebuilt."
+            "before the quality report is rebuilt. The table below previews the raw file — the "
+            "filter runs on the cleaned frame, so the final count can differ."
         )
         enabled = st.checkbox(
             "Remove IQR outlier rows during clean",
@@ -4752,8 +4755,11 @@ def _fs_score_chart(table: pd.DataFrame, top_k: int, title: str, score_col: str 
 
 
 def _fs_stage(features: list[str], method: str) -> None:
-    st.session_state.fs_staged = [str(f) for f in features]
+    """Stage a method's picks — the review multiselect renders later in this run."""
+    picks = [str(f) for f in features]
+    st.session_state.fs_staged = picks
     st.session_state.fs_staged_method = method
+    st.session_state["fs_final_pick"] = picks
 
 
 def render_advanced_feature_selection(df: pd.DataFrame) -> None:
@@ -4936,6 +4942,11 @@ def render_advanced_feature_selection(df: pd.DataFrame) -> None:
 
         st.divider()
         staged = [c for c in (st.session_state.get("fs_staged") or []) if c in candidates]
+        if "fs_final_pick" in st.session_state:
+            # keep the picker valid after a redundancy drop or a target switch
+            st.session_state["fs_final_pick"] = [
+                c for c in (st.session_state["fs_final_pick"] or []) if c in candidates
+            ]
         chosen = st.multiselect(
             "Features to train on",
             candidates,
@@ -4943,7 +4954,6 @@ def render_advanced_feature_selection(df: pd.DataFrame) -> None:
             key="fs_final_pick",
             help="Staged from any tab above, or hand-picked. Apply to make ML Studio use exactly these.",
         )
-        applied = st.session_state.get("selected_features_meta") or {}
         c1, c2 = st.columns(2)
         with c1:
             if st.button("Apply Selection", type="primary", key="fs_apply"):
@@ -4965,6 +4975,7 @@ def render_advanced_feature_selection(df: pd.DataFrame) -> None:
                 st.session_state.selected_features = None
                 st.session_state.selected_features_meta = None
                 st.info("Selection cleared — ML falls back to all usable columns.")
+        applied = st.session_state.get("selected_features_meta") or {}
         if applied.get("features"):
             st.caption(
                 f"Active selection ({applied.get('n_selected')} features via {applied.get('method')}"
