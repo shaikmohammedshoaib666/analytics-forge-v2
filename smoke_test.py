@@ -763,6 +763,24 @@ def main() -> int:
         assert EX.shap_summary_figure({"ok": False}) is None
         assert EX.shap_waterfall_figure(None) is None
 
+        # graceful fallback when shap is not installed on the host
+        import sys
+
+        saved = sys.modules.get("shap", "absent")
+        sys.modules["shap"] = None
+        try:
+            installed, message = EX.shap_available()
+            assert not installed and "shap not installed" in message
+            blocked = EX.compute_shap(model, X, max_rows=20)
+            assert not blocked["ok"] and blocked.get("missing_shap")
+            # native importance still works without shap
+            assert EX.model_feature_importance(model, X.columns)["ok"]
+        finally:
+            if saved == "absent":
+                sys.modules.pop("shap", None)
+            else:
+                sys.modules["shap"] = saved
+
     check("explainability helpers", explainability_helpers)
 
     def ml_result_is_explainable():
