@@ -28,6 +28,7 @@ duckdb>=0.9
 supabase>=2.0
 lightgbm>=4.0
 ydata-profiling>=4.0
+shap>=0.44  # optional: Explainability expander degrades gracefully without it
 
 # Skip on free Cloud (install locally / Docker full image instead):
 # pyspark, great-expectations, fastapi, uvicorn

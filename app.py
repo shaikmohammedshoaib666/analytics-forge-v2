@@ -62,6 +62,16 @@ from modules.dwdm_labs import (
     numeric_columns as lab_numeric_columns,
 )
 from modules.domain_detect import APP_TO_OS_DOMAIN, OS_TO_APP_DOMAIN
+from modules.preprocessing import (
+    SCALER_CHOICES,
+    SCALER_HELP,
+    apply_scaling,
+    iqr_outlier_mask,
+    remove_iqr_outliers,
+    scalable_columns,
+)
+from modules import explainability as forge_explain
+from modules import feature_selection as forge_fs
 from modules.supabase_auth import render_auth_page, sign_out as supabase_sign_out, get_user, get_user_id, _supabase_available
 from modules.sap_connector import render_sap_page
 from modules.cron_manager import render_cron_settings
@@ -214,6 +224,19 @@ def init_state() -> None:
         "url_ingest_preset": "last_n_rows",
         "url_ingest_preset_params": {},
         "maintenance_table_attached": None,
+        "clean_scaler": "None",
+        "clean_scaler_suffix": False,
+        "clean_iqr_enabled": False,
+        "clean_iqr_multiplier": 1.5,
+        "clean_preprocess_log": [],
+        "selected_features": None,
+        "selected_features_meta": None,
+        "fs_dropped_features": [],
+        "fs_results": {},
+        "fs_staged": [],
+        "fs_staged_method": "",
+        "ml_explain": None,
+        "shap_payload": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1326,14 +1349,74 @@ def build_quality_report(df: pd.DataFrame) -> dict[str, Any]:
     return {"checks": checks, "ge": ge, "ydata": yd, "cleanlab": cl, "pca": pca, "domain_flags": domain_flags, "association": assoc}
 
 
-def clean_data(df: pd.DataFrame, engine: Optional[str] = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+def apply_preprocessing(
+    df: pd.DataFrame,
+    scaler: str = "None",
+    scaler_suffix: bool = False,
+    iqr_enabled: bool = False,
+    iqr_multiplier: float = 1.5,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Optional post-clean preprocessing: IQR row filter first, then scaling.
+
+    Both steps are opt-in; with defaults the frame comes back untouched so existing
+    KPI / chart / ML behaviour is unchanged.
+    """
+    out = df
+    meta: dict[str, Any] = {"log": [], "scaler": {}, "iqr": {}}
+    if iqr_enabled:
+        out, iqr_meta = remove_iqr_outliers(out, multiplier=float(iqr_multiplier))
+        meta["iqr"] = iqr_meta
+        meta["log"].extend(iqr_meta.get("log") or [])
+        if iqr_meta.get("error") and not iqr_meta.get("ok"):
+            meta["log"].append(f"IQR filter skipped: {iqr_meta['error']}")
+    if str(scaler or "None").lower() != "none":
+        out, scale_meta = apply_scaling(out, scaler, suffix="_scaled" if scaler_suffix else None)
+        meta["scaler"] = scale_meta
+        meta["log"].extend(scale_meta.get("log") or [])
+        if scale_meta.get("error"):
+            meta["log"].append(f"Scaling skipped: {scale_meta['error']}")
+    return out, meta
+
+
+def clean_data(
+    df: pd.DataFrame,
+    engine: Optional[str] = None,
+    scaler: Optional[str] = None,
+    scaler_suffix: Optional[bool] = None,
+    iqr_enabled: Optional[bool] = None,
+    iqr_multiplier: Optional[float] = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     engine = engine or st.session_state.get("clean_engine") or "pandas"
     clean_df, engine_logs = _engine_clean(df, engine)
+    scaler = st.session_state.get("clean_scaler", "None") if scaler is None else scaler
+    scaler_suffix = (
+        bool(st.session_state.get("clean_scaler_suffix", False)) if scaler_suffix is None else bool(scaler_suffix)
+    )
+    iqr_enabled = (
+        bool(st.session_state.get("clean_iqr_enabled", False)) if iqr_enabled is None else bool(iqr_enabled)
+    )
+    iqr_multiplier = (
+        float(st.session_state.get("clean_iqr_multiplier", 1.5)) if iqr_multiplier is None else float(iqr_multiplier)
+    )
+    clean_df, pre_meta = apply_preprocessing(
+        clean_df,
+        scaler=scaler,
+        scaler_suffix=scaler_suffix,
+        iqr_enabled=iqr_enabled,
+        iqr_multiplier=iqr_multiplier,
+    )
+    engine_logs = list(engine_logs) + list(pre_meta.get("log") or [])
+    st.session_state.clean_preprocess_log = pre_meta
     report = build_quality_report(clean_df)
     table = pd.DataFrame(report["checks"])
     st.session_state.clean_df = clean_df
     st.session_state.clean_checks = table
-    st.session_state.clean_report = {**report, "engine_logs": engine_logs, "engine": engine}
+    st.session_state.clean_report = {
+        **report,
+        "engine_logs": engine_logs,
+        "engine": engine,
+        "preprocessing": pre_meta,
+    }
     try:
         autosave_after_pipeline(title=f"Clean · {st.session_state.get('manual_name') or 'session'}")
     except Exception:
@@ -2891,7 +2974,40 @@ def _ml_pick_features(df: pd.DataFrame, target: str) -> list[str]:
             if df[c].nunique(dropna=True) > min(40, max(15, int(n * 0.4))):
                 continue
         feats.append(c)
-    return feats
+    return _apply_selected_features(feats, target)
+
+
+def _apply_selected_features(feats: list[str], target: Optional[str] = None) -> list[str]:
+    """Honour an applied Advanced Feature Selection (Field page) when it fits this frame."""
+    selected = st.session_state.get("selected_features")
+    if not selected:
+        return feats
+    keep = [c for c in feats if c in set(selected) and c != target]
+    return keep or feats
+
+
+def _remember_explainable_model(
+    estimator: Any,
+    X: pd.DataFrame,
+    y: Any,
+    model_id: str,
+    task: str,
+    target: Optional[str],
+) -> None:
+    """Keep the last fitted supervised model so the Dashboard can run SHAP on it."""
+    try:
+        sample = X.head(300).copy()
+        st.session_state.ml_explain = {
+            "estimator": estimator,
+            "X": sample,
+            "y": pd.Series(y).head(300),
+            "features": list(sample.columns),
+            "model_id": model_id,
+            "task": task,
+            "target": target,
+        }
+    except Exception:
+        pass
 
 
 def run_forge_model(
@@ -3089,6 +3205,7 @@ def run_forge_model(
             metrics["cv_score"] = round(cv_score, 4)
 
     preview = pd.DataFrame({"y_true": list(y_test)[:40], "y_pred": list(preds)[:40]})
+    _remember_explainable_model(est, X_test, y_test, model_id=model_id, task=task, target=tgt)
     briefing = build_manager_briefing({"ok": True, "model_id": model_id, "task": task, "target": tgt, "metrics": metrics})
     return {
         "ok": True, "model_id": model_id, "task": task, "target": tgt, "features": feats[:20],
@@ -4395,6 +4512,128 @@ def _render_quality_subreports(report: dict[str, Any]) -> None:
             st.error(flag)
 
 
+def render_scaler_controls(raw_df: pd.DataFrame) -> None:
+    """Scaler picker for the Clean page — feeds `clean_data()` on the next run."""
+    with st.expander("Feature Scaling (Standard / Robust / MinMax)", expanded=False):
+        st.caption(
+            "Scaling runs after the DWDM clean, so every downstream page "
+            "(Field · KPIs · Charts · ML Studio · Dashboard) reads the scaled table."
+        )
+        current = str(st.session_state.get("clean_scaler") or "None")
+        choice = st.radio(
+            "Scaler",
+            SCALER_CHOICES,
+            index=SCALER_CHOICES.index(current) if current in SCALER_CHOICES else 0,
+            horizontal=True,
+            key="clean_scaler_pick",
+            help="Robust scales by median / IQR — the safe pick when outliers dominate the sensor range.",
+        )
+        st.caption(SCALER_HELP.get(choice, ""))
+        keep_raw = st.checkbox(
+            "Keep raw columns and add `_scaled` copies",
+            value=bool(st.session_state.get("clean_scaler_suffix")),
+            key="clean_scaler_suffix_pick",
+            help="Off = rescale in place (KPIs switch to scaled units). On = raw units stay intact.",
+        )
+        st.session_state.clean_scaler = choice
+        st.session_state.clean_scaler_suffix = bool(keep_raw)
+
+        cols = scalable_columns(raw_df)
+        if choice == "None":
+            st.info("Scaling off — Clean keeps raw units (default behaviour).")
+            return
+        if not cols:
+            st.warning("No scalable numeric columns detected (ids, flags and constants are skipped).")
+            return
+        st.caption(
+            f"{len(cols)} numeric columns will be scaled: "
+            + ", ".join(cols[:8])
+            + (" …" if len(cols) > 8 else "")
+        )
+        preview_cols = cols[:5]
+        scaled, meta = apply_scaling(raw_df, choice, columns=preview_cols)
+        if meta.get("ok"):
+            before = raw_df[preview_cols].describe().loc[["mean", "std", "min", "max"]].round(3)
+            after = scaled[preview_cols].describe().loc[["mean", "std", "min", "max"]].round(3)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.caption("Before (raw units)")
+                st.dataframe(before, use_container_width=True)
+            with c2:
+                st.caption(f"After ({choice} scaler)")
+                st.dataframe(after, use_container_width=True)
+        else:
+            st.warning(f"Preview unavailable: {meta.get('error')}")
+
+
+def render_iqr_controls(raw_df: pd.DataFrame) -> None:
+    """IQR outlier filter for the Clean page — feeds `clean_data()` on the next run."""
+    with st.expander("Outlier Removal (IQR)", expanded=False):
+        st.caption(
+            "Tukey fence per numeric column: rows outside Q1 − k·IQR … Q3 + k·IQR are dropped "
+            "before the quality report is rebuilt."
+        )
+        enabled = st.checkbox(
+            "Remove IQR outlier rows during clean",
+            value=bool(st.session_state.get("clean_iqr_enabled")),
+            key="clean_iqr_toggle",
+        )
+        multiplier = st.slider(
+            "Sensitivity multiplier (k)",
+            min_value=0.5,
+            max_value=5.0,
+            value=float(st.session_state.get("clean_iqr_multiplier") or 1.5),
+            step=0.1,
+            key="clean_iqr_mult",
+            help="1.5 = classic Tukey fence. Lower = stricter (drops more), higher = more permissive.",
+        )
+        st.session_state.clean_iqr_enabled = bool(enabled)
+        st.session_state.clean_iqr_multiplier = float(multiplier)
+
+        mask, report = iqr_outlier_mask(raw_df, multiplier=multiplier)
+        if report.empty:
+            st.info("No numeric columns with enough rows to compute an IQR fence.")
+            return
+        hits = int(mask.sum()) if len(mask) else 0
+        st.caption(
+            f"At k={multiplier:.1f}, **{hits}** of {len(raw_df):,} raw rows "
+            f"({hits / max(1, len(raw_df)) * 100:.1f}%) fall outside the fence."
+        )
+        st.dataframe(report, use_container_width=True)
+        if not enabled:
+            st.caption("Preview only — switch the toggle on, then run the clean to apply it.")
+
+
+def render_preprocessing_summary() -> None:
+    """Show which optional preprocessing steps the last clean actually applied."""
+    meta = st.session_state.get("clean_preprocess_log") or {}
+    if not isinstance(meta, dict):
+        return
+    iqr = meta.get("iqr") or {}
+    scaler = meta.get("scaler") or {}
+    if not iqr and not scaler:
+        return
+    bits: list[str] = []
+    if iqr:
+        if iqr.get("ok"):
+            bits.append(
+                f"IQR filter k={iqr.get('multiplier')} → removed {iqr.get('removed', 0)} rows "
+                f"({iqr.get('rows_before')} → {iqr.get('rows_after')})"
+            )
+        else:
+            bits.append(f"IQR filter not applied — {iqr.get('error')}")
+    if scaler:
+        if scaler.get("ok") and str(scaler.get("scaler")).lower() != "none":
+            bits.append(
+                f"{scaler.get('scaler')} scaler → {len(scaler.get('columns') or [])} columns"
+                + (f" (suffix `{scaler.get('suffix')}`)" if scaler.get("suffix") else " (in place)")
+            )
+        elif scaler.get("error"):
+            bits.append(f"Scaling not applied — {scaler.get('error')}")
+    if bits:
+        st.success("Preprocessing applied: " + " · ".join(bits))
+
+
 def page_clean() -> None:
     st.header("Clean")
     st.caption(
@@ -4430,6 +4669,9 @@ def page_clean() -> None:
     )
     st.session_state.clean_engine = engine
 
+    render_scaler_controls(df)
+    render_iqr_controls(df)
+
     run = st.button("Run industrial clean + 15+ quality checks", type="primary")
     if run or st.session_state.clean_df is None:
         with st.spinner(f"Cleaning with {engine} + DWDM / GE / Cleanlab..."):
@@ -4438,6 +4680,8 @@ def page_clean() -> None:
     else:
         clean_df = st.session_state.clean_df
         checks = st.session_state.clean_checks
+
+    render_preprocessing_summary()
 
     st.subheader("Quality report (15+ checks)")
     st.dataframe(checks, use_container_width=True)
@@ -4470,6 +4714,262 @@ def page_clean() -> None:
         st.subheader("Clean head (engineered cols)")
         st.dataframe(clean_df.head(30), use_container_width=True)
 
+
+
+def _fs_cache_key(df: pd.DataFrame, target: str, method: str) -> str:
+    return f"{method}|{target}|{_df_fingerprint(df)}"
+
+
+def _fs_store(df: pd.DataFrame, target: str, method: str, payload: dict[str, Any]) -> None:
+    cache = dict(st.session_state.get("fs_results") or {})
+    cache[method] = {"key": _fs_cache_key(df, target, method), "payload": payload}
+    st.session_state.fs_results = cache
+
+
+def _fs_load(df: pd.DataFrame, target: str, method: str) -> Optional[dict[str, Any]]:
+    entry = (st.session_state.get("fs_results") or {}).get(method)
+    if not entry or entry.get("key") != _fs_cache_key(df, target, method):
+        return None
+    return entry.get("payload")
+
+
+def _fs_score_chart(table: pd.DataFrame, top_k: int, title: str, score_col: str = "score") -> None:
+    """Horizontal bar chart of the top-k scored features."""
+    if not isinstance(table, pd.DataFrame) or table.empty:
+        st.info("No scores to plot.")
+        return
+    head = table.head(max(1, int(top_k))).iloc[::-1]
+    fig = px.bar(
+        head,
+        x=score_col,
+        y="feature",
+        orientation="h",
+        title=title,
+        text=head[score_col].round(4),
+    )
+    fig.update_layout(height=max(260, 34 * len(head) + 120), margin=dict(l=140, r=30, t=60, b=40))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _fs_stage(features: list[str], method: str) -> None:
+    st.session_state.fs_staged = [str(f) for f in features]
+    st.session_state.fs_staged_method = method
+
+
+def render_advanced_feature_selection(df: pd.DataFrame) -> None:
+    """Field page expander: ANOVA · MI · correlation · tree importance · RFE · PCA.
+
+    Works for every domain pack — scoring is driven by the chosen target, not by
+    hard-coded column names.
+    """
+    with st.expander("Advanced Feature Selection", expanded=False):
+        st.caption(
+            "Rank the mapped/engineered columns before ML: ANOVA F-test, mutual information, "
+            "correlation redundancy, RandomForest importance, RFE and PCA. "
+            "Applied selections are reused by ML Studio and the Field bake-off."
+        )
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            st.info("Load data first.")
+            return
+
+        dropped = [c for c in (st.session_state.get("fs_dropped_features") or []) if c in df.columns]
+        domain = str(st.session_state.get("domain") or "generic")
+        cols = list(df.columns)
+        auto_target = domain_default_target(df, domain)
+        target = st.selectbox(
+            "Target for scoring",
+            cols,
+            index=cols.index(auto_target) if auto_target in cols else len(cols) - 1,
+            key="fs_target",
+            help="Feature scores measure how well each column separates / predicts this target.",
+        )
+        candidates = [c for c in forge_fs.candidate_features(df, target) if c not in dropped]
+        if not candidates:
+            st.warning("No usable candidate features for this target (ids, dates and constants are skipped).")
+            return
+        st.caption(f"{len(candidates)} candidate features" + (f" · {len(dropped)} dropped as redundant" if dropped else ""))
+
+        tabs = st.tabs(
+            ["ANOVA F-test", "Mutual Info", "Correlation drop", "Tree importance", "RFE", "PCA"]
+        )
+
+        with tabs[0]:
+            if st.button("Run ANOVA F-test", key="fs_run_anova"):
+                with st.spinner("Scoring class separation..."):
+                    _fs_store(df, target, "anova", forge_fs.anova_scores(df, target, candidates))
+            res = _fs_load(df, target, "anova")
+            if res is None:
+                st.caption("Ranks features by between-group variance (f_classif / f_regression).")
+            elif not res.get("ok"):
+                st.warning(res.get("error"))
+            else:
+                table = res["table"]
+                k = st.slider("Top-K features", 1, len(table), min(5, len(table)), key="fs_k_anova")
+                _fs_score_chart(table, k, f"ANOVA F-score vs `{target}` ({res['task']})")
+                st.dataframe(table, use_container_width=True)
+                if st.button(f"Stage top-{k} from ANOVA", key="fs_pick_anova"):
+                    _fs_stage(forge_fs.top_k_features(table, k), "ANOVA F-test")
+                    st.success(f"Staged {k} features from ANOVA.")
+
+        with tabs[1]:
+            if st.button("Run Mutual Information", key="fs_run_mi"):
+                with st.spinner("Estimating non-linear dependency..."):
+                    _fs_store(df, target, "mi", forge_fs.mutual_info_scores(df, target, candidates))
+            res = _fs_load(df, target, "mi")
+            if res is None:
+                st.caption("Catches non-linear relationships that the F-test misses.")
+            elif not res.get("ok"):
+                st.warning(res.get("error"))
+            else:
+                table = res["table"]
+                k = st.slider("Top-K features", 1, len(table), min(5, len(table)), key="fs_k_mi")
+                _fs_score_chart(table, k, f"Mutual information vs `{target}` ({res['task']})")
+                st.dataframe(table, use_container_width=True)
+                if st.button(f"Stage top-{k} from MI", key="fs_pick_mi"):
+                    _fs_stage(forge_fs.top_k_features(table, k), "Mutual information")
+                    st.success(f"Staged {k} features from mutual information.")
+
+        with tabs[2]:
+            threshold = st.slider(
+                "Correlation threshold",
+                0.80,
+                0.99,
+                float(forge_fs.CORR_DEFAULT_THRESHOLD),
+                0.01,
+                key="fs_corr_thr",
+            )
+            res = forge_fs.correlation_pairs(df, candidates, threshold=threshold, target=target)
+            if not res.get("ok"):
+                st.warning(res.get("error"))
+            elif res["table"].empty:
+                st.success(f"No feature pair exceeds |r| > {threshold:.2f} — no redundancy to drop.")
+            else:
+                st.dataframe(res["table"], use_container_width=True)
+                st.caption("Redundant candidates: " + ", ".join(res["redundant"]))
+                if st.button("Drop redundant", key="fs_drop_corr"):
+                    merged = list(dict.fromkeys(list(dropped) + list(res["redundant"])))
+                    st.session_state.fs_dropped_features = merged
+                    staged = [c for c in (st.session_state.get("fs_staged") or []) if c not in merged]
+                    st.session_state.fs_staged = staged
+                    st.success(f"Dropped {len(res['redundant'])} redundant columns from the candidate pool.")
+                    st.rerun()
+            if dropped:
+                if st.button("Restore dropped columns", key="fs_restore_corr"):
+                    st.session_state.fs_dropped_features = []
+                    st.rerun()
+
+        with tabs[3]:
+            if st.button("Fit RandomForest importance", key="fs_run_tree"):
+                with st.spinner("Fitting RandomForest..."):
+                    _fs_store(df, target, "tree", forge_fs.tree_importance(df, target, candidates))
+            res = _fs_load(df, target, "tree")
+            if res is None:
+                st.caption("Quick RandomForest fit → impurity-based `feature_importances_`.")
+            elif not res.get("ok"):
+                st.warning(res.get("error"))
+            else:
+                table = res["table"]
+                k = st.slider("Top-K features", 1, len(table), min(5, len(table)), key="fs_k_tree")
+                _fs_score_chart(table, k, f"{res.get('model_name')} importance for `{target}`")
+                st.dataframe(table, use_container_width=True)
+                if st.button(f"Stage top-{k} from tree importance", key="fs_pick_tree"):
+                    _fs_stage(forge_fs.top_k_features(table, k), "Tree importance")
+                    st.success(f"Staged {k} features from tree importance.")
+
+        with tabs[4]:
+            st.caption("Recursive Feature Elimination refits the model at several sizes — slower, most rigorous.")
+            run_rfe = st.checkbox("Enable RFE (slower)", value=False, key="fs_rfe_toggle")
+            if run_rfe and st.button("Run RFE", key="fs_run_rfe"):
+                with st.spinner("Eliminating features recursively..."):
+                    _fs_store(df, target, "rfe", forge_fs.rfe_ranking(df, target, candidates))
+            res = _fs_load(df, target, "rfe")
+            if res is None:
+                st.caption("Enable the toggle, then run to see the elimination curve.")
+            elif not res.get("ok"):
+                st.warning(res.get("error"))
+            else:
+                curve = res["curve"]
+                fig = px.line(
+                    curve,
+                    x="n_features",
+                    y="cv_score",
+                    markers=True,
+                    title=f"RFE elimination curve ({res['scoring']} CV) — best at {res['best_n']} features",
+                )
+                fig.update_layout(height=340, margin=dict(l=60, r=30, t=60, b=40))
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(res["ranking"], use_container_width=True)
+                st.caption(
+                    f"Best CV {res['scoring']} = {res['best_score']:.4f} with: " + ", ".join(res["best_features"])
+                )
+                if st.button(f"Stage RFE best {res['best_n']} features", key="fs_pick_rfe"):
+                    _fs_stage(res["best_features"], "RFE")
+                    st.success(f"Staged {res['best_n']} features from RFE.")
+
+        with tabs[5]:
+            max_comp = max(2, min(len(candidates), 20))
+            n_comp = st.slider("PCA components", 2, max_comp, min(3, max_comp), key="fs_pca_n")
+            res = forge_fs.pca_variance(df, candidates, n_components=n_comp, target=target)
+            if not res.get("ok"):
+                st.warning(res.get("error"))
+            else:
+                table = res["table"]
+                fig = go.Figure()
+                fig.add_bar(x=table["component"], y=table["explained_variance"], name="explained")
+                fig.add_scatter(
+                    x=table["component"],
+                    y=table["cumulative_variance"],
+                    name="cumulative",
+                    mode="lines+markers",
+                    yaxis="y",
+                )
+                fig.update_layout(
+                    title=f"PCA explained variance — {res['total_explained'] * 100:.1f}% captured by {res['n_components']} components",
+                    height=360,
+                    margin=dict(l=60, r=30, t=60, b=40),
+                    yaxis_title="variance ratio",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(table, use_container_width=True)
+                with st.expander("Component loadings"):
+                    st.dataframe(res["loadings"], use_container_width=True)
+
+        st.divider()
+        staged = [c for c in (st.session_state.get("fs_staged") or []) if c in candidates]
+        chosen = st.multiselect(
+            "Features to train on",
+            candidates,
+            default=staged or candidates,
+            key="fs_final_pick",
+            help="Staged from any tab above, or hand-picked. Apply to make ML Studio use exactly these.",
+        )
+        applied = st.session_state.get("selected_features_meta") or {}
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Apply Selection", type="primary", key="fs_apply"):
+                if not chosen:
+                    st.warning("Pick at least one feature before applying.")
+                else:
+                    st.session_state.selected_features = list(chosen)
+                    st.session_state.selected_features_meta = forge_fs.selection_summary(
+                        chosen,
+                        dropped,
+                        st.session_state.get("fs_staged_method") or "manual",
+                        target,
+                    )
+                    st.success(
+                        f"Applied {len(chosen)} features — ML Studio and the Field bake-off will train on them."
+                    )
+        with c2:
+            if st.button("Clear applied selection", key="fs_clear"):
+                st.session_state.selected_features = None
+                st.session_state.selected_features_meta = None
+                st.info("Selection cleared — ML falls back to all usable columns.")
+        if applied.get("features"):
+            st.caption(
+                f"Active selection ({applied.get('n_selected')} features via {applied.get('method')}"
+                f" · target `{applied.get('target')}`): " + ", ".join(applied["features"][:12])
+            )
 
 
 def page_field() -> None:
@@ -4542,6 +5042,7 @@ def page_field() -> None:
         )
         if conf and conf < 0.7:
             st.caption("guess — override if wrong.")
+        render_advanced_feature_selection(df)
         return
     meta, explain, card = res["meta"], res["explain"], res.get("model_card") or {}
     show_gemini_issue(meta.get("gemini_error"))
@@ -4576,6 +5077,7 @@ def page_field() -> None:
             st.caption("Skipped: " + " | ".join(card["skipped"][:2]))
 
     st.info(explain.get("explanation", ""))
+    render_advanced_feature_selection(df)
     c1, c2 = st.columns(2)
     with c1:
         if isinstance(meta.get("scoreboard"), pd.DataFrame):
@@ -4939,6 +5441,151 @@ def page_ask() -> None:
         )
 
 
+def _explain_bundle_signature(bundle: dict[str, Any]) -> str:
+    X = bundle.get("X")
+    rows = len(X) if isinstance(X, pd.DataFrame) else 0
+    return f"{bundle.get('model_id')}|{bundle.get('target')}|{rows}|{','.join(bundle.get('features') or [])}"
+
+
+def _shap_payload_for(bundle: dict[str, Any], max_rows: int) -> dict[str, Any]:
+    """Compute (and session-cache) SHAP values for the last trained model."""
+    signature = f"{_explain_bundle_signature(bundle)}|{max_rows}"
+    cached = st.session_state.get("shap_payload")
+    if isinstance(cached, dict) and cached.get("signature") == signature:
+        return cached["payload"]
+    payload = forge_explain.compute_shap(bundle.get("estimator"), bundle.get("X"), max_rows=max_rows)
+    st.session_state.shap_payload = {"signature": signature, "payload": payload}
+    return payload
+
+
+def _render_importance_chart(bundle: dict[str, Any]) -> None:
+    imp = forge_explain.model_feature_importance(bundle.get("estimator"), bundle.get("features") or [])
+    if not imp.get("ok"):
+        st.caption(f"{imp.get('error')} — falling back to permutation importance.")
+        imp = forge_explain.permutation_importance_table(
+            bundle.get("estimator"), bundle.get("X"), bundle.get("y")
+        )
+    if not imp.get("ok"):
+        st.warning(imp.get("error"))
+        return
+    table = imp["table"].head(15).iloc[::-1]
+    fig = px.bar(
+        table,
+        x="importance",
+        y="feature",
+        orientation="h",
+        title=f"{imp.get('model_name')} feature importance ({imp.get('source')})",
+        text=table["importance"].round(4),
+    )
+    fig.update_layout(height=max(280, 30 * len(table) + 120), margin=dict(l=150, r=30, t=60, b=40))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_explainability(df: pd.DataFrame) -> None:
+    """Dashboard expander: SHAP waterfall / summary + model feature importance."""
+    with st.expander("Explainability", expanded=False):
+        st.caption(
+            "Why the model predicts what it predicts — SHAP per-prediction waterfall, global "
+            "SHAP summary and the trained model's own feature importance."
+        )
+        shap_ok, shap_msg = forge_explain.shap_available()
+        bundle = st.session_state.get("ml_explain")
+
+        if not bundle or bundle.get("estimator") is None:
+            st.info(
+                "No trained model in this session yet. Run a model in **ML Studio**, the **Field** "
+                "bake-off, or fit a quick RandomForest here."
+            )
+            cols = list(df.columns)
+            auto_target = domain_default_target(df, str(st.session_state.get("domain") or "generic"))
+            target = st.selectbox(
+                "Target for the quick model",
+                cols,
+                index=cols.index(auto_target) if auto_target in cols else len(cols) - 1,
+                key="explain_quick_target",
+            )
+            if st.button("Fit quick RandomForest for explainability", key="explain_quick_fit"):
+                with st.spinner("Fitting RandomForest..."):
+                    res = forge_fs.tree_importance(df, target)
+                if not res.get("ok"):
+                    st.warning(res.get("error"))
+                else:
+                    _remember_explainable_model(
+                        res["model"],
+                        res["X"],
+                        res["y"],
+                        model_id=f"{res.get('model_name')} (quick)",
+                        task=res.get("task", ""),
+                        target=target,
+                    )
+                    st.session_state.shap_payload = None
+                    st.rerun()
+            return
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Model", str(bundle.get("model_id")))
+        m2.metric("Target", str(bundle.get("target")))
+        m3.metric("Explained rows", len(bundle.get("X")) if isinstance(bundle.get("X"), pd.DataFrame) else 0)
+
+        _render_importance_chart(bundle)
+
+        if not shap_ok:
+            st.warning(
+                f"{shap_msg} — showing model feature importance only. "
+                "Add `shap` to requirements to unlock waterfall / beeswarm plots."
+            )
+            return
+
+        st.caption(shap_msg)
+        max_rows = st.slider(
+            "Rows to explain with SHAP",
+            20,
+            int(min(forge_explain.MAX_SHAP_ROWS, max(20, len(bundle["X"])))),
+            int(min(100, max(20, len(bundle["X"])))),
+            step=10,
+            key="explain_shap_rows",
+        )
+        if st.button("Compute SHAP values", key="explain_shap_run"):
+            with st.spinner("Computing SHAP values..."):
+                _shap_payload_for(bundle, max_rows)
+        cached = st.session_state.get("shap_payload") or {}
+        payload = cached.get("payload") if cached.get("signature", "").startswith(_explain_bundle_signature(bundle)) else None
+        if payload is None:
+            st.caption("Click **Compute SHAP values** to build the waterfall and summary plots.")
+            return
+        if not payload.get("ok"):
+            st.warning(payload.get("error"))
+            return
+
+        st.caption(f"Explainer: `{payload.get('mode')}`" + (f" · class {payload.get('class_index')}" if payload.get("class_index") is not None else ""))
+        sample = payload["X"]
+        top_rows = forge_explain.top_prediction_rows(bundle.get("estimator"), sample, k=min(5, len(sample)))
+        labels = {i: f"row {i} (index {sample.index[i]})" for i in top_rows}
+        pick = st.selectbox(
+            "Prediction to explain (highest scoring first)",
+            top_rows,
+            format_func=lambda i: labels.get(i, str(i)),
+            key="explain_shap_row",
+        )
+        wf = forge_explain.shap_waterfall_figure(payload, row=int(pick))
+        if wf is not None:
+            st.pyplot(wf, use_container_width=True)
+        else:
+            st.caption("Waterfall unavailable for this model — see the SHAP summary below.")
+
+        kind = st.radio(
+            "Global SHAP summary",
+            ["bar", "beeswarm"],
+            horizontal=True,
+            key="explain_shap_kind",
+            help="bar = mean |SHAP| per feature · beeswarm = per-row impact distribution",
+        )
+        summary = forge_explain.shap_summary_figure(payload, kind=kind)
+        if summary is not None:
+            st.pyplot(summary, use_container_width=True)
+        st.dataframe(forge_explain.shap_importance_table(payload), use_container_width=True)
+
+
 def page_dashboard() -> None:
     st.header("Dashboard")
     st.caption(
@@ -4999,6 +5646,8 @@ def page_dashboard() -> None:
         core_specs = render_core_charts(filtered, roles=roles, domain=forge_domain)
 
     extended_specs = render_extended_charts(filtered, roles=roles, domain=forge_domain)
+
+    render_explainability(filtered)
 
     charts = list(st.session_state.get("dashboard_charts") or [])
     st.subheader("Pinned charts")

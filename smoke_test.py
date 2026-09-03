@@ -602,6 +602,186 @@ def main() -> int:
 
     check("url ingest helpers", url_ingest_helpers)
 
+    fs_frame = pdm.copy()
+    fs_frame["temp_copy"] = fs_frame["temperature"] * 1.0001 + 0.002
+
+    def feature_selection_helpers():
+        from modules import feature_selection as FS
+
+        cands = FS.candidate_features(fs_frame, "failure")
+        assert "temperature" in cands and "timestamp" not in cands and "failure" not in cands
+
+        anova = FS.anova_scores(fs_frame, "failure")
+        assert anova["ok"] and anova["task"] == "classification"
+        assert set(["feature", "score", "p_value"]).issubset(anova["table"].columns)
+        assert len(FS.top_k_features(anova["table"], 3)) == 3
+
+        mi = FS.mutual_info_scores(fs_frame, "failure")
+        assert mi["ok"] and (mi["table"]["score"] >= 0).all()
+
+        reg = FS.anova_scores(fs_frame, "rul")
+        assert reg["ok"] and reg["task"] == "regression"
+
+        corr = FS.correlation_pairs(fs_frame, target="failure", threshold=0.95)
+        assert corr["ok"] and not corr["table"].empty
+        assert "temp_copy" in corr["redundant"] and "temperature" not in corr["redundant"]
+
+        tree = FS.tree_importance(fs_frame, "failure", n_estimators=40)
+        assert tree["ok"] and abs(float(tree["table"]["score"].sum()) - 1.0) < 0.05
+        assert tree["model"] is not None and not tree["X"].empty
+
+        rfe = FS.rfe_ranking(fs_frame, "failure", max_points=3, n_estimators=20)
+        assert rfe["ok"] and len(rfe["curve"]) >= 2 and rfe["best_n"] >= 1
+        assert set(rfe["best_features"]).issubset(set(rfe["ranking"]["feature"]))
+
+        pca = FS.pca_variance(fs_frame, n_components=3, target="failure")
+        assert pca["ok"] and len(pca["table"]) == 3
+        assert pca["table"]["cumulative_variance"].iloc[-1] <= 1.0001
+
+        # Every domain, not just PdM
+        sales_anova = FS.anova_scores(sales, "revenue")
+        assert sales_anova["ok"], sales_anova.get("error")
+        bad = FS.anova_scores(fs_frame, "not_a_column")
+        assert not bad["ok"] and "not_a_column" in bad["error"]
+
+    check("feature selection helpers", feature_selection_helpers)
+
+    def preprocessing_helpers():
+        from modules import preprocessing as PP
+
+        cols = PP.scalable_columns(pdm)
+        assert "temperature" in cols and "failure" not in cols  # binary flag stays raw
+
+        for kind in ("Standard", "Robust", "MinMax"):
+            scaled, meta = PP.apply_scaling(pdm, kind)
+            assert meta["ok"] and meta["scaler"] == kind and meta["columns"]
+            assert len(scaled) == len(pdm) and list(scaled.columns) == list(pdm.columns)
+            assert abs(float(scaled["temperature"].mean())) < 5
+        std_scaled, _ = PP.apply_scaling(pdm, "Standard")
+        assert abs(float(std_scaled["temperature"].std(ddof=0)) - 1.0) < 1e-6
+        mm_scaled, _ = PP.apply_scaling(pdm, "MinMax")
+        assert abs(float(mm_scaled["temperature"].min())) < 1e-9
+        assert abs(float(mm_scaled["temperature"].max()) - 1.0) < 1e-9
+        rob_scaled, _ = PP.apply_scaling(pdm, "Robust")
+        assert abs(float(rob_scaled["temperature"].median())) < 1e-9
+        untouched, meta_off = PP.apply_scaling(pdm, "None")
+        assert meta_off["ok"] and untouched["temperature"].equals(pdm["temperature"])
+        suffixed, meta_sfx = PP.apply_scaling(pdm, "Robust", suffix="_scaled")
+        assert meta_sfx["ok"] and "temperature_scaled" in suffixed.columns
+        assert suffixed["temperature"].equals(pdm["temperature"])
+
+        spiky = pdm.copy()
+        spiky.loc[0, "temperature"] = 900.0
+        spiky.loc[1, "vibration"] = 12.0
+        filtered, fmeta = PP.remove_iqr_outliers(spiky, multiplier=1.5)
+        assert fmeta["ok"] and fmeta["removed"] >= 2 and len(filtered) == len(spiky) - fmeta["removed"]
+        assert float(filtered["temperature"].max()) < 900.0
+        loose, lmeta = PP.remove_iqr_outliers(spiky, multiplier=5.0)
+        assert lmeta["ok"] and lmeta["removed"] <= fmeta["removed"]
+        _, smeta = PP.remove_iqr_outliers(spiky, multiplier=0.01)
+        assert not smeta["ok"] and "skipped" in smeta["error"]  # refuses to gut the dataset
+
+    check("preprocessing helpers", preprocessing_helpers)
+
+    def clean_preprocessing_pipeline():
+        reset()
+        A.st.session_state.manual_df = pdm
+        A.st.session_state.prefer_clean_df = True
+        A.st.session_state.clean_scaler = "Robust"
+        A.st.session_state.clean_iqr_enabled = True
+        A.st.session_state.clean_iqr_multiplier = 1.5
+        cleaned, checks = A.clean_data(pdm, engine="pandas")
+        assert len(checks) >= 15
+        pre = A.st.session_state.clean_report["preprocessing"]
+        assert pre["scaler"]["ok"] and pre["scaler"]["scaler"] == "Robust"
+        assert pre["iqr"]["ok"] and pre["iqr"]["rows_after"] <= pre["iqr"]["rows_before"]
+        assert abs(float(cleaned["temperature"].median())) < 1e-6  # robust-scaled in place
+        # downstream pages read the scaled/filtered frame through get_data()
+        downstream = A.get_data()
+        assert len(downstream) == len(cleaned)
+        assert abs(float(downstream["temperature"].median())) < 1e-6
+
+        reset()
+        A.st.session_state.manual_df = pdm
+        default_clean, _ = A.clean_data(pdm, engine="pandas")
+        assert abs(float(default_clean["temperature"].median()) - float(pdm["temperature"].median())) < 5
+        assert len(default_clean) == len(pdm)  # defaults leave the pipeline untouched
+
+    check("clean scaling + IQR pipeline", clean_preprocessing_pipeline)
+
+    def selected_features_drive_ml():
+        reset()
+        A.st.session_state.manual_df = pdm
+        wide = A._ml_pick_features(pdm, "rul")
+        assert len(wide) > 2
+        A.st.session_state.selected_features = ["temperature", "vibration"]
+        narrow = A._ml_pick_features(pdm, "rul")
+        assert narrow == ["temperature", "vibration"]
+        result = A.run_forge_model(pdm, "RandomForestRegressor", target="rul")
+        assert result["ok"] and set(result["features"]) == {"temperature", "vibration"}
+        # a selection from another dataset must not starve the model
+        A.st.session_state.selected_features = ["column_from_other_file"]
+        assert A._ml_pick_features(pdm, "rul") == wide
+        A.st.session_state.selected_features = None
+        assert A._ml_pick_features(pdm, "rul") == wide
+
+    check("selected features drive ML", selected_features_drive_ml)
+
+    def explainability_helpers():
+        from modules import explainability as EX
+        from modules import feature_selection as FS
+
+        available, msg = EX.shap_available()
+        assert isinstance(available, bool) and msg
+
+        fit = FS.tree_importance(pdm, "failure", n_estimators=40)
+        assert fit["ok"], fit.get("error")
+        model, X, y = fit["model"], fit["X"], fit["y"]
+
+        imp = EX.model_feature_importance(model, X.columns)
+        assert imp["ok"] and imp["source"] == "feature_importances_" and len(imp["table"]) == X.shape[1]
+        assert not EX.model_feature_importance(None, X.columns)["ok"]
+
+        rows = EX.top_prediction_rows(model, X, k=3)
+        assert len(rows) == 3 and all(0 <= r < len(X) for r in rows)
+
+        perm = EX.permutation_importance_table(model, X, y, n_repeats=2)
+        assert perm["ok"] and perm["source"] == "permutation_importance"
+
+        payload = EX.compute_shap(model, X, max_rows=40)
+        if available:
+            assert payload["ok"], payload.get("error")
+            assert len(payload["X"]) == 40 and payload["mode"]
+            table = EX.shap_importance_table(payload)
+            assert len(table) == X.shape[1] and (table["mean_abs_shap"] >= 0).all()
+            assert EX.shap_waterfall_figure(payload, row=rows[0]) is not None
+            assert EX.shap_summary_figure(payload, kind="bar") is not None
+            assert EX.shap_summary_figure(payload, kind="beeswarm") is not None
+        else:
+            assert not payload["ok"] and payload.get("missing_shap")
+        # graceful with no SHAP payload at all
+        assert EX.shap_summary_figure({"ok": False}) is None
+        assert EX.shap_waterfall_figure(None) is None
+
+    check("explainability helpers", explainability_helpers)
+
+    def ml_result_is_explainable():
+        reset()
+        A.st.session_state.manual_df = pdm
+        result = A.run_forge_model(pdm, "RandomForestClassifier", target="failure")
+        assert result["ok"], result.get("error")
+        bundle = A.st.session_state.ml_explain
+        assert bundle and bundle["estimator"] is not None
+        assert bundle["target"] == "failure" and bundle["features"]
+        assert isinstance(bundle["X"], pd.DataFrame) and not bundle["X"].empty
+
+        from modules import explainability as EX
+
+        imp = EX.model_feature_importance(bundle["estimator"], bundle["features"])
+        assert imp["ok"] and not imp["table"].empty
+
+    check("ML result feeds explainability", ml_result_is_explainable)
+
     if errors:
         print(f"\n{len(errors)} FAILURE(S)")
         for e in errors:
